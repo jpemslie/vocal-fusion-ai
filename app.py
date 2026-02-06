@@ -1,338 +1,407 @@
 #!/usr/bin/env python3
 """
-VOCAL FUSION AI - SINGLE FILE PROTOTYPE
-
-This is the entire system in one file.
-We'll extract to modules only when this hits 1000+ lines.
-
-GITHUB: https://github.com/[your-username]/vocal-fusion-ai
-DEEPSEEK: I can read this file via GitHub link
+VOCAL FUSION AI - WITH REAL AUDIO LOADING
 """
 
 import os
 import json
+import traceback
 from pathlib import Path
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, send_file
+
+app = Flask(__name__)
 
 # ============================================================================
-# 1. INITIALIZATION
+# 1. VOCAL FUSION AI ENGINE
 # ============================================================================
 class VocalFusionAI:
-    """Complete vocal fusion system in one class."""
+    """Complete vocal fusion system with real audio loading."""
     
     def __init__(self):
         self.setup_directories()
         self.status = "ready"
-        self.current_job = None
         
     def setup_directories(self):
-        """Create minimal directory structure following our architecture."""
+        """Create directory structure."""
         dirs = [
-            'data/raw',           # Original uploads
-            'data/stems',         # Separated stems
-            'data/analysis',      # Analysis JSON files
-            'data/outputs',       # Final fused tracks
-            'data/temp'          # Temporary processing
+            'data/raw',
+            'data/stems',
+            'data/analysis',
+            'data/outputs',
+            'test_audio'
         ]
         for d in dirs:
             Path(d).mkdir(parents=True, exist_ok=True)
-            # Add .gitkeep to preserve empty directories
-            (Path(d) / '.gitkeep').touch(exist_ok=True)
     
-    # ============================================================================
-    # 2. PLACEHOLDER FUNCTIONS (To be replaced one by one)
-    # ============================================================================
-    
+    # REAL AUDIO LOADING FUNCTION
     def load_audio(self, file_path):
-        """TODO: Replace with actual librosa loading."""
-        print(f"🔊 [PLACEHOLDER] Loading audio: {file_path}")
-        return {
-            'file': file_path,
-            'duration': 180.5,
-            'sample_rate': 44100,
-            'channels': 2,
-            'status': 'loaded'
-        }
-    
-    def separate_stems(self, audio_data):
-        """TODO: Replace with actual Demucs separation."""
-        print("🎚️ [PLACEHOLDER] Separating stems...")
-        return {
-            'vocals': {'path': 'data/stems/vocals.wav', 'confidence': 0.95},
-            'drums': {'path': 'data/stems/drums.wav', 'confidence': 0.92},
-            'bass': {'path': 'data/stems/bass.wav', 'confidence': 0.90},
-            'other': {'path': 'data/stems/other.wav', 'confidence': 0.88}
-        }
-    
-    def analyze_vocal(self, vocal_path):
-        """TODO: Replace with deep vocal analysis."""
-        print("🎤 [PLACEHOLDER] Analyzing vocal...")
-        return {
-            'pitch': {'min': 80.0, 'max': 400.0, 'median': 220.0},
-            'key': 'C# minor',
-            'tempo': 120.0,
-            'energy': 0.75,
-            'phrases': [
-                {'start': 0.0, 'end': 4.0, 'text': 'placeholder phrase'}
-            ]
-        }
-    
-    def check_compatibility(self, vocal1, vocal2):
-        """TODO: Replace with intelligent compatibility analysis."""
-        print("🔗 [PLACEHOLDER] Checking compatibility...")
-        return {
-            'compatible': True,
-            'key_match': True,
-            'tempo_match': True,
-            'score': 0.85,
-            'suggestions': ['Transpose +2 semitones', 'Time stretch 1.05x']
-        }
-    
-    def create_fusion(self, stems1, stems2, analysis1, analysis2):
-        """TODO: Replace with intelligent fusion logic."""
-        print("🎵 [PLACEHOLDER] Creating fusion arrangement...")
-        return {
-            'arrangement': [
-                {'time': 0, 'track': 'intro', 'source': 'song1'},
-                {'time': 16, 'track': 'verse', 'source': 'song1_vocals'},
-                {'time': 32, 'track': 'chorus', 'source': 'both_vocals'}
-            ],
-            'mix_settings': {
-                'vocals1_volume': -3.0,
-                'vocals2_volume': -3.0,
-                'panning': {'vocals1': -0.2, 'vocals2': 0.2}
-            }
-        }
-    
-    def render_output(self, arrangement):
-        """TODO: Replace with actual audio rendering."""
-        print("🎚️ [PLACEHOLDER] Rendering output...")
-        output_path = 'data/outputs/fusion_001.wav'
-        return {
-            'path': output_path,
-            'duration': 180.0,
-            'size_mb': 25.6,
-            'formats': ['wav', 'mp3']
-        }
-    
-    # ============================================================================
-    # 3. MAIN PIPELINE (This stays as orchestrator)
-    # ============================================================================
-    
-    def fuse_songs(self, song1_path, song2_path, options=None):
-        """Main fusion pipeline - orchestrates everything."""
-        print(f"\n{'='*60}")
-        print(f"🎭 FUSION PIPELINE: {song1_path} + {song2_path}")
-        print(f"{'='*60}")
-        
-        # Track progress
-        progress = {
-            'step': 1, 'total_steps': 6,
-            'status': 'starting',
-            'details': {}
-        }
-        
+        """Load audio file using librosa with proper error handling."""
         try:
-            # Step 1: Load audio
-            progress['step'] = 1
-            progress['status'] = 'loading_audio'
-            song1 = self.load_audio(song1_path)
-            song2 = self.load_audio(song2_path)
+            import librosa
+            import soundfile as sf
+            import numpy as np
             
-            # Step 2: Separate stems
-            progress['step'] = 2
-            progress['status'] = 'separating_stems'
-            stems1 = self.separate_stems(song1)
-            stems2 = self.separate_stems(song2)
+            print(f"🔊 Loading audio: {file_path}")
             
-            # Step 3: Analyze vocals
-            progress['step'] = 3
-            progress['status'] = 'analyzing_vocals'
-            analysis1 = self.analyze_vocal(stems1['vocals']['path'])
-            analysis2 = self.analyze_vocal(stems2['vocals']['path'])
+            # Check if file exists
+            if not Path(file_path).exists():
+                raise FileNotFoundError(f"Audio file not found: {file_path}")
             
-            # Step 4: Check compatibility
-            progress['step'] = 4
-            progress['status'] = 'checking_compatibility'
-            compatibility = self.check_compatibility(analysis1, analysis2)
+            # Get file info
+            info = sf.info(file_path)
             
-            # Step 5: Create fusion
-            progress['step'] = 5
-            progress['status'] = 'creating_fusion'
-            arrangement = self.create_fusion(stems1, stems2, analysis1, analysis2)
+            # Load audio
+            audio, sample_rate = librosa.load(
+                file_path,
+                sr=None,
+                mono=False,
+                duration=None
+            )
             
-            # Step 6: Render output
-            progress['step'] = 6
-            progress['status'] = 'rendering_output'
-            output = self.render_output(arrangement)
+            # Convert to numpy array
+            if isinstance(audio, list):
+                audio = np.array(audio)
             
-            print(f"\n✅ FUSION COMPLETE!")
-            print(f"   Output: {output['path']}")
-            print(f"   Duration: {output['duration']}s")
+            # Get duration
+            duration = librosa.get_duration(y=audio, sr=sample_rate)
+            
+            # Get channels
+            if audio.ndim == 1:
+                channels = 1
+                audio = audio.reshape(1, -1)
+            else:
+                channels = audio.shape[0]
+            
+            # Calculate statistics
+            rms = np.sqrt(np.mean(audio**2))
+            peak = np.max(np.abs(audio))
+            
+            print(f"   ✓ Sample rate: {sample_rate} Hz")
+            print(f"   ✓ Duration: {duration:.2f} seconds")
+            print(f"   ✓ Channels: {channels}")
+            print(f"   ✓ Shape: {audio.shape}")
             
             return {
-                'success': True,
-                'output': output,
-                'analysis': {
-                    'song1': analysis1,
-                    'song2': analysis2,
-                    'compatibility': compatibility
+                'file_path': file_path,
+                'audio': audio,
+                'sample_rate': sample_rate,
+                'duration': duration,
+                'channels': channels,
+                'shape': audio.shape,
+                'rms': float(rms),
+                'peak': float(peak),
+                'original_info': {
+                    'samplerate': info.samplerate,
+                    'frames': info.frames,
+                    'sections': info.sections,
+                    'format': str(info.format)
                 },
-                'progress': progress
+                'status': 'loaded'
             }
             
         except Exception as e:
-            print(f"\n❌ FUSION FAILED: {str(e)}")
+            print(f"❌ Error: {str(e)}")
+            traceback.print_exc()
+            return {
+                'file_path': file_path,
+                'error': str(e),
+                'status': 'error'
+            }
+    
+    # Other functions remain as placeholders for now
+    def separate_stems(self, audio_data):
+        """TODO: Replace with Demucs."""
+        print("🎚️ [PLACEHOLDER] Stem separation placeholder")
+        return {'status': 'placeholder'}
+    
+    def analyze_vocal(self, vocal_path):
+        """TODO: Replace with real analysis."""
+        print("🎤 [PLACEHOLDER] Vocal analysis placeholder")
+        return {'status': 'placeholder'}
+    
+    def fuse_songs(self, song1_path, song2_path):
+        """Main fusion pipeline."""
+        print(f"\n🎭 Fusing: {song1_path} + {song2_path}")
+        
+        # Load both songs
+        song1 = self.load_audio(song1_path)
+        song2 = self.load_audio(song2_path)
+        
+        if song1['status'] != 'loaded' or song2['status'] != 'loaded':
             return {
                 'success': False,
-                'error': str(e),
-                'progress': progress
+                'error': 'Failed to load audio files',
+                'song1_status': song1.get('status'),
+                'song2_status': song2.get('status')
             }
+        
+        return {
+            'success': True,
+            'song1': {
+                'duration': song1['duration'],
+                'sample_rate': song1['sample_rate'],
+                'channels': song1['channels']
+            },
+            'song2': {
+                'duration': song2['duration'],
+                'sample_rate': song2['sample_rate'],
+                'channels': song2['channels']
+            },
+            'message': 'Audio loaded successfully! Next: stem separation'
+        }
 
-# ============================================================================
-# 4. WEB INTERFACE (Simple but functional)
-# ============================================================================
-
-app = Flask(__name__)
+# Initialize engine
 ai_engine = VocalFusionAI()
 
-# HTML template for the web interface
+# ============================================================================
+# 2. WEB INTERFACE
+# ============================================================================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
     <title>Vocal Fusion AI</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-        .container { background: #f5f5f5; padding: 20px; border-radius: 10px; }
-        .step { margin: 20px 0; padding: 15px; background: white; border-radius: 5px; }
-        .status { padding: 10px; margin: 10px 0; border-radius: 5px; }
-        .ready { background: #d4edda; }
-        .processing { background: #fff3cd; }
-        .complete { background: #d1ecf1; }
-        .error { background: #f8d7da; }
+        body { font-family: Arial, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .container { background: #f5f5f5; padding: 30px; border-radius: 15px; }
+        .card { background: white; padding: 20px; margin: 20px 0; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .success { color: #10B981; }
+        .error { color: #EF4444; }
+        .warning { color: #F59E0B; }
+        .step { display: flex; align-items: center; margin: 10px 0; }
+        .step-number { background: #3B82F6; color: white; width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin-right: 15px; }
+        .test-link { display: inline-block; background: #3B82F6; color: white; padding: 10px 20px; border-radius: 5px; text-decoration: none; margin: 10px 0; }
+        .test-link:hover { background: #2563EB; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🎵 Vocal Fusion AI</h1>
-        <p>Upload two songs to create an intelligent fusion</p>
+        <p>Step 1: Audio Loading ✓ Implemented</p>
         
-        <div class="step">
-            <h3>Step 1: Upload Songs</h3>
+        <div class="card">
+            <h2>📊 System Status</h2>
+            <div class="step">
+                <div class="step-number">1</div>
+                <div><strong>Audio Loading (librosa):</strong> <span class="success">✅ IMPLEMENTED</span></div>
+            </div>
+            <div class="step">
+                <div class="step-number">2</div>
+                <div><strong>Stem Separation (Demucs):</strong> <span class="warning">⚠️ PENDING</span></div>
+            </div>
+            <div class="step">
+                <div class="step-number">3</div>
+                <div><strong>Vocal Analysis:</strong> <span class="warning">⚠️ PENDING</span></div>
+            </div>
+            <div class="step">
+                <div class="step-number">4</div>
+                <div><strong>Fusion Engine:</strong> <span class="warning">⚠️ PENDING</span></div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>🧪 Test Audio Loading</h2>
+            <p>Test the implemented audio loading functionality:</p>
+            <a class="test-link" href="/test/audio">Test Audio Loading</a>
+            <a class="test-link" href="/create/test/audio">Create Test Tone</a>
+            <a class="test-link" href="/test/upload">Test File Upload</a>
+        </div>
+        
+        <div class="card">
+            <h2>🎵 Upload Songs</h2>
             <form action="/upload" method="post" enctype="multipart/form-data">
-                <p>Song 1: <input type="file" name="song1" accept=".mp3,.wav,.flac"></p>
-                <p>Song 2: <input type="file" name="song2" accept=".mp3,.wav,.flac"></p>
-                <button type="submit">Upload & Start Fusion</button>
+                <p><strong>Song 1:</strong> <input type="file" name="song1" accept=".mp3,.wav,.flac"></p>
+                <p><strong>Song 2:</strong> <input type="file" name="song2" accept=".mp3,.wav,.flac"></p>
+                <button type="submit" style="background: #10B981; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer;">
+                    🎭 Start Fusion
+                </button>
             </form>
         </div>
         
-        {% if job_id %}
-        <div class="step">
-            <h3>Step 2: Monitor Progress</h3>
-            <div id="progress" class="status processing">
-                Job ID: {{ job_id }}<br>
-                Status: <span id="status">processing</span><br>
-                Step: <span id="step">1</span>/6
-            </div>
-            <button onclick="checkProgress('{{ job_id }}')">Refresh Status</button>
-            <div id="result"></div>
-        </div>
-        {% endif %}
-        
-        <div class="step">
-            <h3>System Status</h3>
-            <div class="status {{ 'ready' if system_status == 'ready' else 'processing' }}">
-                {{ system_status|upper }}
-            </div>
-            <p>Placeholder functions will be replaced with real AI modules.</p>
+        <div class="card">
+            <h2>📝 Next Steps</h2>
+            <ol>
+                <li><strong>Done:</strong> Install librosa and soundfile</li>
+                <li><strong>Done:</strong> Implement load_audio() function</li>
+                <li><strong>Next:</strong> Install Demucs for stem separation</li>
+                <li><strong>Then:</strong> Implement separate_stems() function</li>
+            </ol>
         </div>
     </div>
-    
-    <script>
-    function checkProgress(jobId) {
-        fetch('/progress/' + jobId)
-            .then(response => response.json())
-            .then(data => {
-                document.getElementById('status').textContent = data.status;
-                document.getElementById('step').textContent = data.step;
-                
-                if (data.complete) {
-                    document.getElementById('result').innerHTML = 
-                        '<h4>✅ Fusion Complete!</h4>' +
-                        '<p>Download: <a href="' + data.download_url + '">' + data.filename + '</a></p>';
-                }
-            });
-    }
-    </script>
 </body>
 </html>
 '''
 
 @app.route('/')
-def index():
-    """Main web interface."""
-    return render_template_string(HTML_TEMPLATE, 
-                                 system_status=ai_engine.status,
-                                 job_id=None)
+def home():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/test/audio')
+def test_audio():
+    """Test audio loading functionality."""
+    test_file = 'test_audio/test_tone.wav'
+    
+    if not Path(test_file).exists():
+        return '''
+        <h1>Test Audio Not Found</h1>
+        <p>Create a test tone first:</p>
+        <a href="/create/test/audio">Create Test Tone</a>
+        '''
+    
+    # Load the audio
+    result = ai_engine.load_audio(test_file)
+    
+    # Format as HTML
+    html = f'''
+    <div style="max-width: 800px; margin: 0 auto; padding: 20px;">
+        <h1>🎵 Audio Loading Test</h1>
+        <p><a href="/">← Back</a></p>
+        
+        <div style="background: white; padding: 20px; border-radius: 10px; margin: 20px 0;">
+            <h2>File: {result['file_path']}</h2>
+            <p><strong>Status:</strong> <span style="color: {'green' if result['status'] == 'loaded' else 'red'}">{result['status']}</span></p>
+            
+            {f'''
+            <h3>Audio Properties:</h3>
+            <ul>
+                <li><strong>Sample Rate:</strong> {result['sample_rate']} Hz</li>
+                <li><strong>Duration:</strong> {result['duration']:.2f} seconds</li>
+                <li><strong>Channels:</strong> {result['channels']}</li>
+                <li><strong>Shape:</strong> {result['shape']}</li>
+                <li><strong>RMS Level:</strong> {result['rms']:.4f}</li>
+                <li><strong>Peak Level:</strong> {result['peak']:.4f}</li>
+            </ul>
+            
+            <h3>Original File Info:</h3>
+            <pre style="background: #f5f5f5; padding: 10px; border-radius: 5px;">
+            Sample Rate: {result['original_info']['samplerate']} Hz
+            Frames: {result['original_info']['frames']}
+            Format: {result['original_info']['format']}
+            </pre>
+            ''' if result['status'] == 'loaded' else f'''
+            <h3>Error:</h3>
+            <p style="color: red;">{result.get('error', 'Unknown error')}</p>
+            '''}
+        </div>
+        
+        <p><a href="/play/test/audio">▶️ Play Test Audio</a></p>
+    </div>
+    '''
+    
+    return html
+
+@app.route('/create/test/audio')
+def create_test_audio():
+    """Create a test audio file."""
+    import numpy as np
+    import soundfile as sf
+    
+    # Create test tone
+    sample_rate = 44100
+    duration = 3.0
+    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+    
+    # Create a melody
+    freqs = [440, 523.25, 659.25, 783.99]  # A4, C5, E5, G5
+    audio = np.zeros_like(t)
+    
+    for i, freq in enumerate(freqs):
+        start = i * duration / len(freqs)
+        end = (i + 1) * duration / len(freqs)
+        mask = (t >= start) & (t < end)
+        audio[mask] = 0.2 * np.sin(2 * np.pi * freq * t[mask])
+    
+    # Make stereo
+    audio_stereo = np.vstack([audio, audio * 0.8]).T
+    
+    # Save
+    sf.write('test_audio/test_tone.wav', audio_stereo, sample_rate)
+    
+    return '''
+    <h1>✅ Test Audio Created!</h1>
+    <p>Created: test_audio/test_tone.wav</p>
+    <p><a href="/test/audio">Test Audio Loading</a> | <a href="/">← Back</a></p>
+    '''
+
+@app.route('/play/test/audio')
+def play_test_audio():
+    """Play the test audio file."""
+    return '''
+    <h1>🎵 Play Test Audio</h1>
+    <audio controls autoplay>
+        <source src="/static/test_tone.wav" type="audio/wav">
+        Your browser does not support the audio element.
+    </audio>
+    <p><a href="/test/audio">← Back to Test</a></p>
+    '''
+
+@app.route('/test/upload')
+def test_upload():
+    """Test file upload page."""
+    return '''
+    <h1>Test File Upload</h1>
+    <form action="/upload/test" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".mp3,.wav,.flac">
+        <button type="submit">Upload Test</button>
+    </form>
+    <p><a href="/">← Back</a></p>
+    '''
 
 @app.route('/upload', methods=['POST'])
-def upload_and_fuse():
-    """Handle song uploads and start fusion process."""
-    # For now, just simulate a job
-    song1 = request.files.get('song1')
-    song2 = request.files.get('song2')
-    
-    # Generate a fake job ID
-    import uuid
-    job_id = str(uuid.uuid4())[:8]
-    
-    # In a real system, we'd save files and start background job
-    print(f"🎬 Starting fusion job: {job_id}")
-    
-    return render_template_string(HTML_TEMPLATE,
-                                 system_status='processing',
-                                 job_id=job_id)
+def upload_songs():
+    """Handle song uploads."""
+    try:
+        song1 = request.files.get('song1')
+        song2 = request.files.get('song2')
+        
+        if not song1 or not song2:
+            return jsonify({'error': 'Please upload both songs'}), 400
+        
+        # Save files
+        song1_path = f"data/raw/song1_{song1.filename}"
+        song2_path = f"data/raw/song2_{song2.filename}"
+        
+        song1.save(song1_path)
+        song2.save(song2_path)
+        
+        # Start fusion process
+        result = ai_engine.fuse_songs(song1_path, song2_path)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/progress/<job_id>')
-def progress(job_id):
-    """Check progress of a fusion job."""
-    # Simulate progress
-    import random
+@app.route('/health')
+def health():
     return jsonify({
-        'job_id': job_id,
-        'status': 'processing',
-        'step': random.randint(1, 6),
-        'complete': False,
-        'download_url': '#',
-        'filename': 'fusion_result.wav'
+        'status': 'healthy',
+        'service': 'vocal-fusion-ai',
+        'audio_loading': 'implemented',
+        'next_step': 'install_demucs'
     })
 
 # ============================================================================
-# 5. MAIN EXECUTION
+# 3. MAIN EXECUTION
 # ============================================================================
 if __name__ == '__main__':
     print(f"""
     {'='*60}
-    🎵 VOCAL FUSION AI - SINGLE FILE PROTOTYPE
+    🎵 VOCAL FUSION AI - STEP 1 COMPLETE
     {'='*60}
     
-    GitHub Repo: https://github.com/[YOUR_USERNAME]/vocal-fusion-ai
+    ✅ Audio loading implemented with librosa
+    ✅ Web interface running
     
-    Status:
-      • Directory structure: ✅ Created
-      • Web interface: ✅ Running on http://localhost:5000
-      • Core engine: ⚠️ Placeholder functions (need implementation)
-      • AI models: ❌ Not yet integrated
-      
     Next Steps:
-      1. Replace load_audio() with librosa
-      2. Replace separate_stems() with Demucs
-      3. Replace analyze_vocal() with real analysis
-      4. etc.
-      
-    I (DeepSeek) can read your code via GitHub link!
-    Share: https://github.com/[YOUR_USERNAME]/vocal-fusion-ai/blob/main/app.py
+    1. Test audio loading: http://localhost:5000/test/audio
+    2. Create test tone: http://localhost:5000/create/test/audio
+    3. Install Demucs for stem separation
+    
+    To install Demucs (next step):
+    pip install demucs==4.0.0
+    pip install torch==2.1.0
+    
     {'='*60}
     """)
     
