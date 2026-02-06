@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.pytest_cache/
+
+# Audio files
+*.mp3
+*.wav
+*.flac
+*.m4a
+
+# Data (we'll store large files here)
+data/raw/*
+data/stems/*
+data/outputs/*
+
+# Except keep the folder structure
+!data/raw/.gitkeep
+!data/stems/.gitkeep
+!data/outputs/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
