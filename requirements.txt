@@ -1,64 +1,16 @@
-# Web & API
-Flask==3.0.0
-Flask-SocketIO==5.3.6
-Flask-CORS==4.0.0
-python-dotenv==1.0.0
-celery==5.3.4
-redis==5.0.1
+# Core audio processing
+numpy>=1.21.0
+scipy>=1.8.0
+librosa>=0.10.0
+soundfile>=0.12.0
 
-# Core Audio Processing
-numpy>=1.24.0
-librosa==0.10.1
-soundfile==0.12.1
-pydub==0.25.1
-resampy==0.4.2
-audioread==3.0.1
+# Deep learning (stem separation)
+torch>=2.0.0
+torchaudio>=2.0.0
+demucs>=4.0.0
 
-# Stem Separation - Professional Demucs with proper integration
-demucs @ git+https://github.com/facebookresearch/demucs.git
-torch==2.2.0
-torchaudio==2.2.0
-# Note: CUDA support if available
-# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Web server
+flask>=2.0.0
 
-# Music Information Retrieval - Professional MIR suite
-essentia==2.1b6
-madmom==0.18.0
-msaf==0.1.8  # Music Structure Analysis
-mir_eval==0.7.1
-
-# Pitch & Vocal Analysis - Professional tools
-parselmouth==0.4.3  # Praat-based (most reliable)
-pyworld==0.3.4  # WORLD vocoder for vocal analysis
-pysptk==0.2.0  # Speech signal processing
-webrtcvad==2.0.10  # Voice activity detection
-
-# Music Transcription (optional - heavy)
-openunmix==1.2.1  # Music source separation
-# whisper @ git+https://github.com/openai/whisper.git  # For lyrics (optional)
-
-# Audio Processing & Mixing
-pedalboard==0.7.1  # Spotify's audio effects
-soxr==0.3.7  # High-quality resampling
-sounddevice==0.4.6  # Real-time audio
-pyloudnorm==0.1.0  # Loudness normalization
-noisereduce==2.0.1  # Noise reduction
-
-# Data Science & ML
-scipy==1.13.0
-scikit-learn==1.5.0
-pandas==2.2.1
-numba==0.59.1  # JIT compilation for audio processing
-joblib==1.4.2
-
-# Visualization
-matplotlib==3.9.0
-seaborn==0.13.2
-plotly==5.22.0
-
-# Utilities
-tqdm==4.66.3
-pyyaml==6.0.1
-pydantic==2.6.0
-colorama==0.4.6
-python-magic==0.4.27  # File type detection
+# Optional extras (used by legacy analysis paths)
+matplotlib>=3.7.0
