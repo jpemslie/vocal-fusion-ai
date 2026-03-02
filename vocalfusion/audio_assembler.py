@@ -15,6 +15,7 @@ Key principles:
 
 import numpy as np
 import librosa
+import pyrubberband as pyrb
 from typing import Dict, Optional, Tuple
 
 from vocalfusion.dsp import EnhancedDSP
@@ -75,7 +76,7 @@ class AudioAssembler:
         if vox_audio is not None and abs(stretch_ratio - 1.0) > 0.02:
             print(f"    Stretching vocals: {stretch_ratio:.3f}x "
                   f"({vox_tempo:.0f}→{beat_tempo:.0f} BPM)")
-            vox_audio = librosa.effects.time_stretch(vox_audio, rate=stretch_ratio)
+            vox_audio = pyrb.time_stretch(vox_audio, self.sr, stretch_ratio)
         elif vox_audio is not None:
             print(f"    Vocals: no stretch needed")
 
@@ -84,8 +85,7 @@ class AudioAssembler:
             vox_audio, self._make_inst(beat_stems))
         if vox_audio is not None and best_shift != 0:
             print(f"    Key shifting vocals: {best_shift:+d} semitones")
-            vox_audio = librosa.effects.pitch_shift(
-                vox_audio, sr=self.sr, n_steps=best_shift)
+            vox_audio = pyrb.pitch_shift(vox_audio, self.sr, best_shift)
         timeline.key_shift = best_shift
 
         # Build the beat instrumental (untouched)
@@ -277,7 +277,7 @@ class AudioAssembler:
             if shift == 0:
                 sig = v
             else:
-                sig = librosa.effects.pitch_shift(v, sr=self.sr, n_steps=shift)
+                sig = pyrb.pitch_shift(v, self.sr, shift)
 
             sig_chroma = np.mean(
                 librosa.feature.chroma_cqt(y=sig, sr=self.sr), axis=1)

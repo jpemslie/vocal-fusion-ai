@@ -21,6 +21,7 @@ Every test is a 10-15 second clip scored by all 8 quality dimensions.
 
 import numpy as np
 import librosa
+import pyrubberband as pyrb
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, field
 
@@ -235,7 +236,7 @@ class AIDJ:
 
         # Only stretch vocals — NEVER stretch the beat (keeps it crisp)
         if abs(stretch - 1.0) > 0.02:
-            vox_raw = librosa.effects.time_stretch(vox_raw, rate=stretch)
+            vox_raw = pyrb.time_stretch(vox_raw, self.sr, stretch)
 
         # Key: test all 12 shifts, score each
         best_shift = 0
@@ -250,8 +251,8 @@ class AIDJ:
             else:
                 # Only test on short clip for speed
                 clip_len = min(8 * self.sr, len(vox_raw))
-                test_vox_clip = librosa.effects.pitch_shift(
-                    vox_raw[:clip_len], sr=self.sr, n_steps=shift)
+                test_vox_clip = pyrb.pitch_shift(
+                    vox_raw[:clip_len], self.sr, shift)
                 test_inst_clip = inst[:clip_len] if inst is not None else np.zeros(clip_len)
                 test_mix = self._quick_mix(test_vox_clip, test_inst_clip)
                 score = self._quick_score(test_mix, test_vox_clip)
@@ -271,8 +272,7 @@ class AIDJ:
 
         # Apply best key shift
         if best_shift != 0:
-            vox_raw = librosa.effects.pitch_shift(
-                vox_raw, sr=self.sr, n_steps=best_shift)
+            vox_raw = pyrb.pitch_shift(vox_raw, self.sr, best_shift)
 
         # Score the full direction
         inst = self._sum_stems(beat_d, beat_b, beat_o)
