@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from vocalfusion.dsp import EnhancedDSP
 from vocalfusion.mix_intelligence import MixIntelligence
 from vocalfusion.song_dna import SongDNA
+from vocalfusion.harmonic_mixer import HarmonicMixer
+from vocalfusion.vocal_enhancer import VocalEnhancer
 
 
 # Minimal timeline structures for compatibility with orchestrator
@@ -72,6 +74,8 @@ class AIDJ:
         self.sr = sample_rate
         self.dsp = EnhancedDSP(sample_rate)
         self.ears = MixIntelligence(sample_rate)
+        self.harmonic = HarmonicMixer()
+        self.enhancer = VocalEnhancer(sample_rate)
         self.test_duration = 12  # seconds per test clip
 
     def create_mashup(self, stems_a: Dict[str, np.ndarray],
@@ -238,34 +242,37 @@ class AIDJ:
         if abs(stretch - 1.0) > 0.02:
             vox_raw = pyrb.time_stretch(vox_raw, self.sr, stretch)
 
-        # Key: test all 12 shifts, score each
+        # Key: use circle-of-fifths (Camelot wheel) to find compatible shifts.
+        # Only test musically justified candidates — avoids the circular scoring
+        # problem where the key-clash penalty penalises non-zero shifts even when
+        # a shift genuinely improves the mashup.
+        if direction == 'a_vocals':
+            vocal_key = dna_a.key
+            beat_key = dna_b.key
+        else:
+            vocal_key = dna_b.key
+            beat_key = dna_a.key
+
+        candidate_shifts = self.harmonic.get_compatible_shifts(vocal_key, beat_key, n=5)
+        print(f"    Key: vocals={vocal_key!r} beat={beat_key!r}")
+        print(f"    Candidates: {candidate_shifts}")
+
         best_shift = 0
         best_key_score = -1
 
         # Build quick instrumental for key testing
         inst = self._sum_stems(beat_d, beat_b, beat_o)
+        clip_len = min(8 * self.sr, len(vox_raw))
 
-        for shift in range(-6, 6):
+        for shift in candidate_shifts:
             if shift == 0:
-                test_vox = vox_raw
+                test_vox_clip = vox_raw[:clip_len]
             else:
-                # Only test on short clip for speed
-                clip_len = min(8 * self.sr, len(vox_raw))
-                test_vox_clip = pyrb.pitch_shift(
-                    vox_raw[:clip_len], self.sr, shift)
-                test_inst_clip = inst[:clip_len] if inst is not None else np.zeros(clip_len)
-                test_mix = self._quick_mix(test_vox_clip, test_inst_clip)
-                score = self._quick_score(test_mix, test_vox_clip)
-                if score > best_key_score:
-                    best_key_score = score
-                    best_shift = shift
-                continue
-
-            # Test shift=0
-            clip_len = min(8 * self.sr, len(vox_raw))
-            test_mix = self._quick_mix(test_vox[:clip_len],
-                                        inst[:clip_len] if inst is not None else np.zeros(clip_len))
-            score = self._quick_score(test_mix, test_vox[:clip_len])
+                test_vox_clip = pyrb.pitch_shift(vox_raw[:clip_len], self.sr, shift)
+            test_inst_clip = inst[:clip_len] if inst is not None else np.zeros(clip_len)
+            test_mix = self._quick_mix(test_vox_clip, test_inst_clip)
+            score = self._quick_score(test_mix, test_vox_clip)
+            print(f"      shift={shift:+d}: {self.harmonic.describe_shift(vocal_key, beat_key, shift)} score={score:.3f}")
             if score > best_key_score:
                 best_key_score = score
                 best_shift = shift
@@ -634,26 +641,15 @@ class AIDJ:
             out_bass[:fade_in] *= fade
             out_other[:fade_in] *= fade
 
-        # HPF vocals (just remove rumble, nothing else)
-        if np.any(out_vocals != 0):
-            out_vocals = self.dsp.highpass(out_vocals, 80)
-
         # Apply scored levels
         out_vocals = self._set_rms(out_vocals, vox_rms)
         out_drums = self._set_rms(out_drums, inst_rms * 1.0)
         out_bass = self._set_rms(out_bass, inst_rms * 0.7)
         out_other = self._set_rms(out_other, inst_rms * 0.5)
 
-        # Light sidechain — just enough to create space, not enough to muffle
-        if np.any(out_vocals != 0):
-            out_drums = self.dsp.sidechain_duck(
-                out_drums, out_vocals,
-                threshold_db=-24, ratio=1.5,
-                attack_ms=10, release_ms=200, amount=0.12)
-            out_bass = self.dsp.sidechain_duck(
-                out_bass, out_vocals,
-                threshold_db=-24, ratio=1.8,
-                attack_ms=8, release_ms=150, amount=0.15)
+        # VocalEnhancer: EQ carving + presence boost + strong sidechain
+        out_vocals, out_drums, out_bass, out_other = self.enhancer.process(
+            out_vocals, out_drums, out_bass, out_other)
 
         full_mix = out_vocals + out_drums + out_bass + out_other
 

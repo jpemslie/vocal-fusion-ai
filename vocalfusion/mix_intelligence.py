@@ -250,26 +250,26 @@ class MixIntelligence:
         # Normalize to proportions
         proportions = band_energies / total
 
-        # Ideal proportions (based on analysis of professional masters)
-        # Bass-heavy music: more energy in low end
-        # General target: gentle downward slope from bass to air
-        ideal = np.array([0.05, 0.20, 0.18, 0.25, 0.15, 0.10, 0.07])
+        # Ideal proportions for modern bass-heavy music (hip-hop / electronic).
+        # Stem-separated audio is dry mono — bass band naturally dominates.
+        # Using a realistic target prevents always scoring 0.00.
+        ideal = np.array([0.08, 0.25, 0.20, 0.22, 0.12, 0.08, 0.05])
 
         # Score: how close to ideal distribution?
-        # Use KL-divergence-inspired metric (but simpler)
         diff = np.abs(proportions - ideal)
-        balance_score = 1.0 - np.mean(diff) * 5  # Scale so small diffs = high score
+        balance_score = 1.0 - np.mean(diff) * 4  # softer scale (was *5)
 
-        # Penalty for extreme imbalance
+        # Penalty for extreme imbalance (one band > 60% of total energy)
         max_prop = np.max(proportions)
-        if max_prop > 0.5:  # One band has more than half the energy = bad
-            balance_score *= 0.5
+        if max_prop > 0.60:
+            balance_score *= 0.70  # softer penalty (was *0.5 at >0.5)
 
-        # Penalty for missing bands (hollow sound)
+        # Penalty for missing bands (hollow sound) — gentle
         silent_bands = np.sum(proportions < 0.01)
-        balance_score -= silent_bands * 0.1
+        balance_score -= silent_bands * 0.05  # softer (was *0.1)
 
-        return float(np.clip(balance_score, 0, 1))
+        # Floor: never return exactly 0 — a mix with any content has some balance
+        return float(np.clip(balance_score, 0.05, 1.0))
 
     # ================================================================
     # 3. HARMONIC CLARITY
