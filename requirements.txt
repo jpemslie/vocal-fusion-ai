@@ -12,5 +12,17 @@ demucs>=4.0.0
 # Web server
 flask>=2.0.0
 
-# Optional extras (used by legacy analysis paths)
+# Professional audio effects (Spotify/JUCE engine — same as pro DAWs)
+pedalboard>=0.9.0
+
+# Spectral noise reduction (clean up Demucs stem bleed before processing)
+noisereduce>=3.0.0
+
+# Reference mastering (match output loudness/EQ to a professional reference)
+matchering>=2.0.0
+
+# High-quality time-stretching and pitch-shifting
+pyrubberband>=0.3.0
+
+# Optional extras
 matplotlib>=3.7.0

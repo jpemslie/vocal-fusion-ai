@@ -1,39 +1,77 @@
 """
-VocalFusion AI — VocalEnhancer
-================================
+VocalFusion AI — VocalEnhancer (pedalboard edition)
+====================================================
 
-EQ and dynamics processing to make vocals cut through the mix clearly.
+Uses Spotify's `pedalboard` library (JUCE C++ engine — same as pro DAWs)
+for vocal processing. Much cleaner than scipy filters.
 
-Techniques applied:
-  1. High-pass filter vocals at 100Hz  (remove sub-bass rumble)
-  2. Cut 300Hz from vocals             (reduce muddy low-mids)
-  3. Boost 2.5kHz on vocals            (presence / intelligibility)
-  4. Boost 8kHz on vocals              (air / openness)
-  5. Cut 2.5kHz from "other" stem      (EQ carve — creates a pocket for vocals)
-  6. Cut 2.5kHz from bass stem         (bass shouldn't fight vocal clarity)
-  7. Sidechain compression: drums, bass, other duck when vocals are active
-     (stronger than the old light sidechain — creates real space)
+Chain applied to vocals:
+  1. noisereduce  — spectral gate removes Demucs stem bleed
+  2. NoiseGate    — kills silence between phrases
+  3. HighpassFilter 100Hz — remove sub-bass rumble
+  4. LowShelfFilter 250Hz -3dB — reduce muddiness
+  5. PeakFilter 400Hz -2dB — cut honky/boxy resonance
+  6. PeakFilter 3000Hz +3dB — presence / intelligibility (this is the money)
+  7. HighShelfFilter 10kHz +2dB — air / openness
+  8. Compressor — gentle glue, keeps loudness even
+  9. Limiter — safety ceiling
 
-The single biggest improvement for buried vocals is #5 (EQ carving).
-Cutting 4-6dB at 2.5kHz in the instrumental creates a frequency "pocket"
-that the vocals occupy. This is standard professional mixing practice.
+EQ carving on instruments:
+  - "other" stem: cut 3kHz with PeakFilter to create pocket for vocals
+  - "bass" stem: minor cut at 3kHz (bass doesn't need the presence band)
+
+Sidechain:
+  - Stronger than before: drums 0.22, bass 0.28, other 0.18
 """
 
 import numpy as np
+import noisereduce as nr
+
+from pedalboard import (
+    Pedalboard,
+    NoiseGate,
+    HighpassFilter,
+    LowShelfFilter,
+    PeakFilter,
+    HighShelfFilter,
+    Compressor,
+    Limiter,
+)
 from vocalfusion.dsp import EnhancedDSP
 
 
 class VocalEnhancer:
     """
-    Processes vocals and instrument stems to maximise vocal clarity.
-
-    Call process() after gain staging — it expects stems already at
-    their target RMS levels.
+    Professional vocal processing using Spotify's pedalboard (JUCE engine).
     """
 
     def __init__(self, sample_rate: int = 44100):
         self.sr = sample_rate
         self.dsp = EnhancedDSP(sample_rate)
+
+        # Vocal chain — built once, reused
+        self._vocal_board = Pedalboard([
+            NoiseGate(threshold_db=-42, ratio=2.0,
+                      attack_ms=2.0, release_ms=200.0),
+            HighpassFilter(cutoff_frequency_hz=100.0),
+            LowShelfFilter(cutoff_frequency_hz=250.0, gain_db=-3.0),
+            PeakFilter(cutoff_frequency_hz=400.0, gain_db=-2.0, q=1.0),
+            PeakFilter(cutoff_frequency_hz=3000.0, gain_db=3.0, q=1.2),
+            HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=2.0),
+            Compressor(threshold_db=-18.0, ratio=3.0,
+                       attack_ms=10.0, release_ms=100.0),
+            Limiter(threshold_db=-1.0, release_ms=100.0),
+        ])
+
+        # Carving chain for "other" instruments — cuts where vocals live
+        self._other_board = Pedalboard([
+            PeakFilter(cutoff_frequency_hz=3000.0, gain_db=-5.0, q=0.9),
+        ])
+
+        # Minor carve for bass
+        self._bass_board = Pedalboard([
+            PeakFilter(cutoff_frequency_hz=3000.0, gain_db=-3.0, q=1.0),
+        ])
 
     def process(self,
                 vocals: np.ndarray,
@@ -43,70 +81,66 @@ class VocalEnhancer:
         """
         Enhance vocals and carve space in the instrumental stems.
 
-        Args:
-            vocals: vocal stem (mono, at target RMS level)
-            drums:  drum stem
-            bass:   bass stem
-            other:  melodic/harmonic instruments stem
-
-        Returns:
-            (vocals, drums, bass, other) — all enhanced
+        Returns: (vocals, drums, bass, other)
         """
         has_vocals = vocals is not None and np.any(vocals != 0)
 
-        # Step 1 — Process vocals
+        # Step 1 — denoise + EQ vocals with pedalboard
         if has_vocals:
             vocals = self._process_vocals(vocals)
 
-        # Step 2 — EQ-carve instruments to make a pocket for vocals
-        if other is not None:
-            other = self._carve_other(other)
-        if bass is not None:
-            bass = self._carve_bass(bass)
+        # Step 2 — EQ-carve instruments
+        if other is not None and np.any(other != 0):
+            other = self._process_other(other)
+        if bass is not None and np.any(bass != 0):
+            bass = self._process_bass(bass)
 
         # Step 3 — Sidechain: instruments duck when vocals are active
         if has_vocals:
             if drums is not None:
                 drums = self.dsp.sidechain_duck(
                     drums, vocals,
-                    threshold_db=-22, ratio=2.5,
-                    attack_ms=8, release_ms=180, amount=0.20)
+                    threshold_db=-22, ratio=3.0,
+                    attack_ms=8, release_ms=180, amount=0.22)
             if bass is not None:
                 bass = self.dsp.sidechain_duck(
                     bass, vocals,
-                    threshold_db=-22, ratio=2.5,
-                    attack_ms=6, release_ms=120, amount=0.25)
+                    threshold_db=-22, ratio=3.0,
+                    attack_ms=6, release_ms=120, amount=0.28)
             if other is not None:
                 other = self.dsp.sidechain_duck(
                     other, vocals,
-                    threshold_db=-22, ratio=2.0,
-                    attack_ms=10, release_ms=200, amount=0.15)
+                    threshold_db=-22, ratio=2.5,
+                    attack_ms=10, release_ms=200, amount=0.18)
 
         return vocals, drums, bass, other
 
     # ----------------------------------------------------------------
 
     def _process_vocals(self, vocals: np.ndarray) -> np.ndarray:
-        """Vocal EQ chain: clean, then add presence"""
-        # Remove sub-bass rumble and proximity effect
-        vocals = self.dsp.highpass(vocals, 100)
-        # Cut boomy low-mids that make vocals sound thick / honky
-        vocals = self.dsp.parametric_eq(vocals, 300, -1.5, q=0.8)
-        # Presence boost — the 2-3kHz range is where intelligibility lives
-        vocals = self.dsp.parametric_eq(vocals, 2500, 2.0, q=1.2)
-        # Air boost — adds openness without harshness
-        vocals = self.dsp.parametric_eq(vocals, 8000, 1.5, q=0.8)
-        return vocals
+        """Denoise → pedalboard EQ/compression chain"""
+        # Spectral noise reduction first — cleans up Demucs separation bleed
+        # Use non-stationary mode (adapts over time — better for singing)
+        try:
+            vocals = nr.reduce_noise(
+                y=vocals, sr=self.sr,
+                stationary=False,
+                prop_decrease=0.70,       # Reduce 70% of noise (leave some warmth)
+                freq_mask_smooth_hz=300,
+                time_mask_smooth_ms=50,
+            )
+        except Exception:
+            pass  # If noisereduce fails, continue without it
 
-    def _carve_other(self, other: np.ndarray) -> np.ndarray:
-        """Cut the vocal presence band from melodic instruments.
+        # pedalboard expects shape (channels, samples) or (samples,)
+        # Our stems are mono 1D arrays
+        processed = self._vocal_board(vocals.astype(np.float32), self.sr)
+        return processed.astype(np.float64)
 
-        This is the most effective technique for making vocals cut through:
-        remove 4-6dB at 2.5kHz from the instruments so the vocal boost at
-        the same frequency has uncontested space.
-        """
-        return self.dsp.parametric_eq(other, 2500, -5.0, q=0.9)
+    def _process_other(self, other: np.ndarray) -> np.ndarray:
+        processed = self._other_board(other.astype(np.float32), self.sr)
+        return processed.astype(np.float64)
 
-    def _carve_bass(self, bass: np.ndarray) -> np.ndarray:
-        """Minor presence cut from bass — bass doesn't need 2-4kHz anyway"""
-        return self.dsp.parametric_eq(bass, 2500, -3.0, q=1.0)
+    def _process_bass(self, bass: np.ndarray) -> np.ndarray:
+        processed = self._bass_board(bass.astype(np.float32), self.sr)
+        return processed.astype(np.float64)
