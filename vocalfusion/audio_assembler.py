@@ -68,15 +68,22 @@ class AudioAssembler:
 
         # Step 1: Stretch ONLY vocals to match beat tempo
         stretch_ratio = beat_tempo / vox_tempo
-        # Check half/double time
-        candidates = [stretch_ratio, stretch_ratio * 2, stretch_ratio / 2]
-        stretch_ratio = min(candidates, key=lambda r: abs(r - 1.0))
+        # Correct for half/double-time detection errors only
+        if 1.85 <= stretch_ratio <= 2.15:
+            stretch_ratio = stretch_ratio / 2
+        elif 0.47 <= stretch_ratio <= 0.54:
+            stretch_ratio = stretch_ratio * 2
+        # Cap at ±25% — beyond that, skip stretching (sounds worse than no stretch)
+        if stretch_ratio > 1.25 or stretch_ratio < 0.80:
+            print(f"    Tempo gap too large ({stretch_ratio:.2f}x) — skipping stretch")
+            stretch_ratio = 1.0
 
         vox_audio = vox_stems.get('vocals')
         if vox_audio is not None and abs(stretch_ratio - 1.0) > 0.02:
             print(f"    Stretching vocals: {stretch_ratio:.3f}x "
                   f"({vox_tempo:.0f}→{beat_tempo:.0f} BPM)")
-            vox_audio = pyrb.time_stretch(vox_audio, self.sr, stretch_ratio)
+            vox_audio = pyrb.time_stretch(vox_audio, self.sr, stretch_ratio,
+                                          rbargs=["--fine"])
         elif vox_audio is not None:
             print(f"    Vocals: no stretch needed")
 
@@ -85,7 +92,7 @@ class AudioAssembler:
             vox_audio, self._make_inst(beat_stems))
         if vox_audio is not None and best_shift != 0:
             print(f"    Key shifting vocals: {best_shift:+d} semitones")
-            vox_audio = pyrb.pitch_shift(vox_audio, self.sr, best_shift)
+            vox_audio = pyrb.pitch_shift(vox_audio, self.sr, best_shift, rbargs=["--formant"])
         timeline.key_shift = best_shift
 
         # Build the beat instrumental (untouched)
@@ -277,7 +284,7 @@ class AudioAssembler:
             if shift == 0:
                 sig = v
             else:
-                sig = pyrb.pitch_shift(v, self.sr, shift)
+                sig = pyrb.pitch_shift(v, self.sr, shift, rbargs=["--formant"])
 
             sig_chroma = np.mean(
                 librosa.feature.chroma_cqt(y=sig, sr=self.sr), axis=1)

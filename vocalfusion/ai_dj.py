@@ -233,14 +233,25 @@ class AIDJ:
         if vox_raw is None:
             return 0.0, None
 
-        # Tempo: find best stretch (split difference if large)
+        # Tempo matching: correct for half/double-time detection errors,
+        # then cap at ±25% — beyond that, stretching destroys vocal quality.
         stretch = beat_tempo / vox_tempo
-        candidates = [stretch, stretch * 2, stretch / 2]
-        stretch = min(candidates, key=lambda r: abs(r - 1.0))
+        # Only adjust for half/double time when the ratio is very close to 2x or 0.5x
+        # (i.e. librosa detected the wrong octave for one song)
+        if 1.85 <= stretch <= 2.15:
+            stretch = stretch / 2
+        elif 0.47 <= stretch <= 0.54:
+            stretch = stretch * 2
+        # Cap: if still outside ±25%, skip stretching entirely.
+        # A 45% stretch sounds like a dying robot; no stretch sounds better.
+        if stretch > 1.25 or stretch < 0.80:
+            print(f"    Tempo gap too large ({stretch:.2f}x) — skipping stretch")
+            stretch = 1.0
 
         # Only stretch vocals — NEVER stretch the beat (keeps it crisp)
         if abs(stretch - 1.0) > 0.02:
-            vox_raw = pyrb.time_stretch(vox_raw, self.sr, stretch)
+            vox_raw = pyrb.time_stretch(vox_raw, self.sr, stretch,
+                                        rbargs=["--fine"])
 
         # Key: use circle-of-fifths (Camelot wheel) to find compatible shifts.
         # Only test musically justified candidates — avoids the circular scoring
@@ -268,7 +279,7 @@ class AIDJ:
             if shift == 0:
                 test_vox_clip = vox_raw[:clip_len]
             else:
-                test_vox_clip = pyrb.pitch_shift(vox_raw[:clip_len], self.sr, shift)
+                test_vox_clip = pyrb.pitch_shift(vox_raw[:clip_len], self.sr, shift, rbargs=["--formant"])
             test_inst_clip = inst[:clip_len] if inst is not None else np.zeros(clip_len)
             test_mix = self._quick_mix(test_vox_clip, test_inst_clip)
             score = self._quick_score(test_mix, test_vox_clip)
@@ -279,7 +290,7 @@ class AIDJ:
 
         # Apply best key shift
         if best_shift != 0:
-            vox_raw = pyrb.pitch_shift(vox_raw, self.sr, best_shift)
+            vox_raw = pyrb.pitch_shift(vox_raw, self.sr, best_shift, rbargs=["--formant"])
 
         # Score the full direction
         inst = self._sum_stems(beat_d, beat_b, beat_o)
