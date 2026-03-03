@@ -120,27 +120,38 @@ class VocalEnhancer:
     def _process_vocals(self, vocals: np.ndarray) -> np.ndarray:
         """Denoise → pedalboard EQ/compression chain"""
         # Spectral noise reduction first — cleans up Demucs separation bleed
-        # Use non-stationary mode (adapts over time — better for singing)
         try:
-            vocals = nr.reduce_noise(
+            denoised = nr.reduce_noise(
                 y=vocals, sr=self.sr,
                 stationary=False,
-                prop_decrease=0.70,       # Reduce 70% of noise (leave some warmth)
+                prop_decrease=0.70,
                 freq_mask_smooth_hz=300,
                 time_mask_smooth_ms=50,
             )
+            if np.all(np.isfinite(denoised)):
+                vocals = denoised
         except Exception:
-            pass  # If noisereduce fails, continue without it
+            pass  # If noisereduce fails, continue with original
 
-        # pedalboard expects shape (channels, samples) or (samples,)
-        # Our stems are mono 1D arrays
-        processed = self._vocal_board(vocals.astype(np.float32), self.sr)
-        return processed.astype(np.float64)
+        try:
+            processed = self._vocal_board(vocals.astype(np.float32), self.sr)
+            processed = np.nan_to_num(processed, nan=0.0, posinf=0.0, neginf=0.0)
+            return processed.astype(np.float64)
+        except Exception:
+            return vocals
 
     def _process_other(self, other: np.ndarray) -> np.ndarray:
-        processed = self._other_board(other.astype(np.float32), self.sr)
-        return processed.astype(np.float64)
+        try:
+            processed = self._other_board(other.astype(np.float32), self.sr)
+            processed = np.nan_to_num(processed, nan=0.0, posinf=0.0, neginf=0.0)
+            return processed.astype(np.float64)
+        except Exception:
+            return other
 
     def _process_bass(self, bass: np.ndarray) -> np.ndarray:
-        processed = self._bass_board(bass.astype(np.float32), self.sr)
-        return processed.astype(np.float64)
+        try:
+            processed = self._bass_board(bass.astype(np.float32), self.sr)
+            processed = np.nan_to_num(processed, nan=0.0, posinf=0.0, neginf=0.0)
+            return processed.astype(np.float64)
+        except Exception:
+            return bass

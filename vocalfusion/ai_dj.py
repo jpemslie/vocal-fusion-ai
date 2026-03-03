@@ -653,6 +653,10 @@ class AIDJ:
 
         full_mix = out_vocals + out_drums + out_bass + out_other
 
+        # Sanitize — pedalboard can introduce NaN/Inf on pathological audio
+        full_mix = np.nan_to_num(full_mix, nan=0.0, posinf=0.0, neginf=0.0)
+        out_vocals = np.nan_to_num(out_vocals, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Light master
         full_mix = self._light_master(full_mix)
 
