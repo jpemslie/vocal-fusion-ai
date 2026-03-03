@@ -83,7 +83,7 @@ class AudioAssembler:
             print(f"    Stretching vocals: {stretch_ratio:.3f}x "
                   f"({vox_tempo:.0f}→{beat_tempo:.0f} BPM)")
             vox_audio = pyrb.time_stretch(vox_audio, self.sr, stretch_ratio,
-                                          rbargs=["--fine"])
+                                          rbargs={"--fine": ""})
         elif vox_audio is not None:
             print(f"    Vocals: no stretch needed")
 
@@ -92,7 +92,7 @@ class AudioAssembler:
             vox_audio, self._make_inst(beat_stems))
         if vox_audio is not None and best_shift != 0:
             print(f"    Key shifting vocals: {best_shift:+d} semitones")
-            vox_audio = pyrb.pitch_shift(vox_audio, self.sr, best_shift, rbargs=["--formant"])
+            vox_audio = pyrb.pitch_shift(vox_audio, self.sr, best_shift, rbargs={"--formant": ""})
         timeline.key_shift = best_shift
 
         # Build the beat instrumental (untouched)
@@ -284,7 +284,7 @@ class AudioAssembler:
             if shift == 0:
                 sig = v
             else:
-                sig = pyrb.pitch_shift(v, self.sr, shift, rbargs=["--formant"])
+                sig = pyrb.pitch_shift(v, self.sr, shift, rbargs={"--formant": ""})
 
             sig_chroma = np.mean(
                 librosa.feature.chroma_cqt(y=sig, sr=self.sr), axis=1)

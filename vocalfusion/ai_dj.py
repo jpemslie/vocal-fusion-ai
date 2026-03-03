@@ -251,7 +251,7 @@ class AIDJ:
         # Only stretch vocals — NEVER stretch the beat (keeps it crisp)
         if abs(stretch - 1.0) > 0.02:
             vox_raw = pyrb.time_stretch(vox_raw, self.sr, stretch,
-                                        rbargs=["--fine"])
+                                        rbargs={"--fine": ""})
 
         # Key: use circle-of-fifths (Camelot wheel) to find compatible shifts.
         # Only test musically justified candidates — avoids the circular scoring
@@ -279,7 +279,7 @@ class AIDJ:
             if shift == 0:
                 test_vox_clip = vox_raw[:clip_len]
             else:
-                test_vox_clip = pyrb.pitch_shift(vox_raw[:clip_len], self.sr, shift, rbargs=["--formant"])
+                test_vox_clip = pyrb.pitch_shift(vox_raw[:clip_len], self.sr, shift, rbargs={"--formant": ""})
             test_inst_clip = inst[:clip_len] if inst is not None else np.zeros(clip_len)
             test_mix = self._quick_mix(test_vox_clip, test_inst_clip)
             score = self._quick_score(test_mix, test_vox_clip)
@@ -290,7 +290,7 @@ class AIDJ:
 
         # Apply best key shift
         if best_shift != 0:
-            vox_raw = pyrb.pitch_shift(vox_raw, self.sr, best_shift, rbargs=["--formant"])
+            vox_raw = pyrb.pitch_shift(vox_raw, self.sr, best_shift, rbargs={"--formant": ""})
 
         # Score the full direction
         inst = self._sum_stems(beat_d, beat_b, beat_o)
