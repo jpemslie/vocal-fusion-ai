@@ -12,18 +12,21 @@ import sys
 import json
 import argparse
 import threading
+import queue
 import uuid
 import numpy as np
 import librosa
 import soundfile as sf
 from pathlib import Path
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, render_template_string
+from flask import Flask, request, jsonify, send_from_directory, render_template
 
-from vocalfusion.professional_separation import ProfessionalSeparator
-from vocalfusion.song_dna import SongAnalyzer
-from vocalfusion.mixing_v2 import MixingEngineV2
-from vocalfusion.mix_intelligence import MixIntelligence
+from audio.professional_separation import ProfessionalSeparator
+from analysis.song_dna import SongAnalyzer
+from core.mixing_v2 import MixingEngineV2
+from analysis.mix_intelligence import MixIntelligence
+from ai.mert_embedder import MertEmbedder
+from ai.mix_predictor import MixPredictor
 
 DATA_DIR = Path("vf_data")
 SAMPLE_RATE = 44100
@@ -52,9 +55,66 @@ def safe_serialize(obj):
     if hasattr(obj, 'value'):  # Enum
         return obj.value
     if hasattr(obj, '__dict__'):
-        return {k: safe_serialize(v) for k, v in obj.__dict__.items()
-                if not k.startswith('_')}
+        d = {k: safe_serialize(v) for k, v in obj.__dict__.items()
+             if not k.startswith('_')}
+        # Include @property values that aren't stored in __dict__ (e.g. MixScore.overall)
+        for prop in ('overall',):
+            if prop not in d and hasattr(type(obj), prop):
+                try:
+                    d[prop] = safe_serialize(getattr(obj, prop))
+                except Exception:
+                    pass
+        return d
     return str(obj)
+
+
+# ============================================================================
+# LOG BROADCASTER — captures stdout and fans out to SSE subscribers
+# ============================================================================
+
+class _LogBroadcaster:
+    """Wraps sys.stdout; every print() is mirrored to all SSE subscribers."""
+
+    def __init__(self):
+        self._queues = []
+        self._lock = threading.Lock()
+        self._real = sys.stdout
+
+    def install(self):
+        sys.stdout = self
+
+    def write(self, text):
+        self._real.write(text)
+        self._real.flush()
+        if text.strip():
+            with self._lock:
+                dead = []
+                for q in self._queues:
+                    try:
+                        q.put_nowait(text.rstrip('\n'))
+                    except queue.Full:
+                        dead.append(q)
+                for q in dead:
+                    self._queues.remove(q)
+
+    def flush(self):
+        self._real.flush()
+
+    def subscribe(self):
+        q = queue.Queue(maxsize=500)
+        with self._lock:
+            self._queues.append(q)
+        return q
+
+    def unsubscribe(self, q):
+        with self._lock:
+            try:
+                self._queues.remove(q)
+            except ValueError:
+                pass
+
+
+_broadcaster = _LogBroadcaster()
 
 
 # ============================================================================
@@ -71,7 +131,11 @@ class VocalFusion:
         self.analyzer = SongAnalyzer(self.sr)
         self.mixing_engine = MixingEngineV2(sample_rate=self.sr, ir_path=ir_path)
         self.intelligence = MixIntelligence(self.sr)
-        print("VocalFusion AI initialized (v10.0 — AI DJ)")
+        self.embedder = MertEmbedder(
+            cache_dir=self.base_dir / "embeddings",
+            sample_rate=self.sr)
+        self.predictor = MixPredictor(data_dir=self.base_dir)
+        print("VocalFusion AI initialized (v10.0 — AI DJ + Learning)")
 
     # ------------------------------------------------------------------
     # PROCESS (separate + analyze + save)
@@ -100,11 +164,18 @@ class VocalFusion:
         print("Step 2: Loading stems...")
         stems = self._stems_from_paths(stem_paths)
 
-        # Step 3: Deep analysis
-        print("Step 3: Analyzing song DNA...")
+        # Step 3: Generate audio embedding (cached)
+        print("Step 3: Generating song embedding...")
+        try:
+            self.embedder.embed_song(song_id, stems)
+        except Exception as e:
+            print(f"  Warning: Embedding failed: {e}")
+
+        # Step 4: Deep analysis
+        print("Step 4: Analyzing song DNA...")
         dna = self.analyzer.analyze(stems)
 
-        # Step 4: Save analysis to JSON
+        # Step 5: Save analysis to JSON
         voice_type = self._estimate_voice_type(stems.get('vocals'))
         analysis_data = {
             'song_id': song_id,
@@ -214,16 +285,40 @@ class VocalFusion:
             )
             key_compat = float(np.clip((best_corr + 0.5) / 1.5, 0, 1))
 
-        overall = float(np.clip(tempo_compat * 0.4 + key_compat * 0.4 + 0.1, 0, 1))
+        # Timbre compatibility: cosine similarity of MFCC-based spectral centroid
+        mfcc_a = np.array(data_a.get('key_chroma', []))
+        mfcc_b = np.array(data_b.get('key_chroma', []))
+        if len(mfcc_a) > 0 and len(mfcc_b) > 0 and len(mfcc_a) == len(mfcc_b):
+            dot = float(np.dot(mfcc_a, mfcc_b))
+            norm = float(np.linalg.norm(mfcc_a) * np.linalg.norm(mfcc_b) + 1e-10)
+            timbre_compat = float(np.clip((dot / norm + 1) / 2, 0, 1))
+        else:
+            timbre_compat = 0.6
+
+        # Range compatibility: RMS energy similarity
+        energy_a = float(data_a.get('overall_energy', 0.5))
+        energy_b = float(data_b.get('overall_energy', 0.5))
+        range_compat = float(np.clip(1.0 - abs(energy_a - energy_b), 0, 1))
+
+        # Structure compatibility: section count similarity
+        secs_a = data_a.get('sections', [])
+        secs_b = data_b.get('sections', [])
+        n_a, n_b = max(len(secs_a), 1), max(len(secs_b), 1)
+        structure_compat = float(np.clip(1.0 - abs(n_a - n_b) / max(n_a, n_b), 0, 1))
+
+        overall = float(np.clip(
+            tempo_compat * 0.35 + key_compat * 0.35 +
+            timbre_compat * 0.15 + range_compat * 0.10 + 0.05,
+            0, 1))
         blend = float(np.clip(key_compat * 0.6 + tempo_compat * 0.4, 0, 1))
 
         return {
             'overall_score': overall,
             'key_compatibility': key_compat,
             'tempo_compatibility': tempo_compat,
-            'range_compatibility': 0.7,
-            'timbre_compatibility': 0.6,
-            'structure_compatibility': 0.65,
+            'range_compatibility': range_compat,
+            'timbre_compatibility': timbre_compat,
+            'structure_compatibility': structure_compat,
             'vocal_blend_score': blend,
         }
 
@@ -245,14 +340,59 @@ class VocalFusion:
         if not stems_b:
             raise RuntimeError(f"No stems for '{song_b_id}'. Run 'analyze' first.")
 
+        mix_id = str(uuid.uuid4())
         mix_dir = self.base_dir / "mixes" / f"{song_a_id}_{song_b_id}"
         mix_dir.mkdir(parents=True, exist_ok=True)
 
+        # Load song embeddings for learning — compute from stems if not cached yet
+        emb_a = self.embedder.load_cached(song_a_id)
+        if emb_a is None:
+            emb_a = self.embedder.embed_song(song_a_id, stems_a)
+        emb_b = self.embedder.load_cached(song_b_id)
+        if emb_b is None:
+            emb_b = self.embedder.embed_song(song_b_id, stems_b)
+
+        # Ask predictor if it has a direction suggestion
+        predicted_params = {}
+        direction_suggestion = self.predictor.suggest_direction(song_a_id, song_b_id)
+        if direction_suggestion:
+            predicted_params['direction'] = direction_suggestion
+
         print("Step 2: AI mixing (v10.0)...")
-        mix_result = self.mixing_engine.create_mix(stems_a, stems_b, {}, {})
+        mix_result = self.mixing_engine.create_mix(
+            stems_a, stems_b, {}, {}, predicted_params=predicted_params)
 
         print("Step 3: Saving output...")
         quality_scores = mix_result.pop('quality_scores', None)
+        params_used = mix_result.pop('params_used', {})
+
+        # Save mix params so the predictor can learn from user rating
+        if emb_a is not None and emb_b is not None:
+            try:
+                self.predictor.save_mix_params(
+                    mix_id=mix_id,
+                    song_a=song_a_id,
+                    song_b=song_b_id,
+                    direction=params_used.get('direction', 'a_vocals'),
+                    key_shift=params_used.get('key_shift', 0),
+                    vox_rms=params_used.get('vox_rms', 0.14),
+                    inst_rms=params_used.get('inst_rms', 0.05),
+                    emb_a=emb_a,
+                    emb_b=emb_b,
+                )
+                # Auto-rate using the AI quality score so the predictor learns
+                # from every mix, not just the ones the user manually rates.
+                # User ratings (1-5 stars) will override this if they rate later.
+                if quality_scores is not None:
+                    qs = safe_serialize(quality_scores)
+                    overall = qs.get('overall') if isinstance(qs, dict) else None
+                    if overall is not None:
+                        auto_rating = max(1, min(5, round(float(overall) * 4 + 1)))
+                        self.predictor.add_rating(mix_id, auto_rating)
+                        print(f"  Auto-rated mix: {auto_rating}/5 (quality={float(overall):.2f})")
+            except Exception as e:
+                print(f"  Warning: Could not save mix params: {e}")
+
         for name, audio in mix_result.items():
             if audio is not None and isinstance(audio, np.ndarray) and len(audio) > 0:
                 path = mix_dir / f"{name}.wav"
@@ -260,8 +400,10 @@ class VocalFusion:
                 print(f"  {name}.wav ({len(audio)/self.sr:.1f}s)")
 
         report = {
+            'mix_id': mix_id,
             'song_a_id': song_a_id,
             'song_b_id': song_b_id,
+            'params_used': params_used,
             'quality_scores': safe_serialize(quality_scores),
             'created_at': datetime.now().isoformat(),
         }
@@ -270,221 +412,199 @@ class VocalFusion:
 
         print(f"\nDone! Output: {mix_dir}")
         return {
+            'mix_id': mix_id,
             'song_a_id': song_a_id,
             'song_b_id': song_b_id,
             'quality_scores': safe_serialize(quality_scores),
             'paths': {'mixes': str(mix_dir)},
         }
 
+    # ------------------------------------------------------------------
+    # AUTOMATION HELPERS
+    # ------------------------------------------------------------------
+
+    def _list_analyzed_ids(self):
+        """Return all song_ids that have been fully analyzed."""
+        analysis_dir = self.base_dir / "analysis"
+        if not analysis_dir.exists():
+            return []
+        return [d.name for d in sorted(analysis_dir.iterdir())
+                if d.is_dir() and (d / "analysis.json").exists()]
+
+    def find_best_match(self, song_id):
+        """Return the song_id whose MERT embedding is most similar to this one."""
+        emb = self.embedder.load_cached(song_id)
+        if emb is None:
+            return None
+        best_id, best_sim = None, -1.0
+        for sid in self._list_analyzed_ids():
+            if sid == song_id:
+                continue
+            other = self.embedder.load_cached(sid)
+            if other is None:
+                continue
+            sim = float(np.dot(emb, other))   # both L2-normalised
+            if sim > best_sim:
+                best_sim, best_id = sim, sid
+        if best_id:
+            print(f"  Best match for {song_id}: {best_id} (similarity={best_sim:.3f})")
+        return best_id
+
+    def _find_top_pairs(self, song_ids, top_n=3):
+        """Return top_n (a, b, similarity) pairs by MERT cosine similarity."""
+        embeddings = {}
+        for sid in song_ids:
+            emb = self.embedder.load_cached(sid)
+            if emb is not None:
+                embeddings[sid] = emb
+        ids = list(embeddings.keys())
+        pairs = []
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = ids[i], ids[j]
+                sim = float(np.dot(embeddings[a], embeddings[b]))
+                pairs.append((a, b, sim))
+        pairs.sort(key=lambda x: x[2], reverse=True)
+        return pairs[:top_n]
+
+    def batch_process(self, folder, auto_fuse=True, top_n=3):
+        """
+        Analyze every audio file in folder, then fuse the top_n most
+        MERT-compatible pairs.  Already-analyzed songs are skipped.
+        """
+        import time
+        folder = Path(folder)
+        AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg'}
+        files = sorted(f for f in folder.iterdir()
+                       if f.suffix.lower() in AUDIO_EXTS)
+        if not files:
+            print(f"No audio files found in {folder}")
+            return
+
+        print(f"\nBatch: found {len(files)} audio file(s) in {folder}")
+
+        analyzed = []
+        for f in files:
+            song_id = f.stem
+            if (self.base_dir / "analysis" / song_id / "analysis.json").exists():
+                print(f"  Skipping {song_id} (already analyzed)")
+                analyzed.append(song_id)
+                continue
+            try:
+                self.process_single_song(f, song_id)
+                analyzed.append(song_id)
+            except Exception as e:
+                print(f"  Error analyzing {f.name}: {e}")
+
+        if not auto_fuse or len(analyzed) < 2:
+            print(f"\nBatch analysis complete ({len(analyzed)} songs).")
+            return
+
+        print(f"\nFinding top {top_n} compatible pairs from {len(analyzed)} songs...")
+        pairs = self._find_top_pairs(analyzed, top_n)
+        if not pairs:
+            print("  Not enough MERT embeddings to rank pairs yet.")
+            return
+
+        for a, b, sim in pairs:
+            print(f"\nAuto-fusing: {a} + {b}  (MERT similarity={sim:.3f})")
+            try:
+                self.fuse_two_songs(a, b)
+            except Exception as e:
+                print(f"  Error: {e}")
+
+        print(f"\nBatch complete. Mixes saved to {self.base_dir / 'mixes'}/")
+
+    def watch_folder(self, watch_dir, auto_fuse=True, interval=5,
+                     stop_event=None):
+        """
+        Watch a folder for new audio files.  Each new file is automatically
+        analyzed, and (if auto_fuse) fused with its best MERT match.
+
+        Runs until Ctrl+C or stop_event is set.
+        """
+        import time
+        watch_dir = Path(watch_dir)
+        watch_dir.mkdir(parents=True, exist_ok=True)
+        AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg'}
+
+        # Treat already-analyzed songs as "seen" so they're not re-processed
+        seen = set(self._list_analyzed_ids())
+        # Also track filenames already picked up this session
+        seen_files = set(f.name for f in watch_dir.iterdir()
+                         if f.suffix.lower() in AUDIO_EXTS
+                         and f.stem in seen)
+
+        print(f"\nWatch mode active — drop audio files into:")
+        print(f"  {watch_dir.resolve()}")
+        print(f"Auto-analyze: ON")
+        print(f"Auto-fuse with best match: {'ON' if auto_fuse else 'OFF'}")
+        if stop_event is None:
+            print("Press Ctrl+C to stop.\n")
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                print("[watch] Stopped.")
+                break
+            try:
+                for f in sorted(watch_dir.iterdir()):
+                    if f.suffix.lower() not in AUDIO_EXTS:
+                        continue
+                    if f.name in seen_files:
+                        continue
+                    seen_files.add(f.name)
+                    song_id = f.stem
+
+                    print(f"\n[watch] New file: {f.name}")
+                    try:
+                        self.process_single_song(f, song_id)
+                        seen.add(song_id)
+
+                        if auto_fuse:
+                            match = self.find_best_match(song_id)
+                            if match:
+                                print(f"[watch] Auto-fusing {song_id} + {match}...")
+                                self.fuse_two_songs(song_id, match)
+                            else:
+                                print(f"[watch] No match yet — need at least 2 songs.")
+                    except Exception as e:
+                        import traceback
+                        print(f"[watch] Error: {e}")
+                        traceback.print_exc()
+
+                time.sleep(interval)
+
+            except KeyboardInterrupt:
+                print("\n[watch] Stopped.")
+                break
+
 
 # ============================================================================
 # WEB APP
 # ============================================================================
 
-web_app = Flask(__name__)
+web_app = Flask(__name__, template_folder='templates')
 engine = None
 active_jobs = {}
+_watch_thread = None
+_watch_stop = None
 
-HTML = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VocalFusion AI v10.0</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);min-height:100vh;padding:20px}
-.container{max-width:1200px;margin:0 auto;background:#fff;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.3);overflow:hidden}
-header{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;padding:40px;text-align:center}
-h1{font-size:2.5rem;font-weight:800;margin-bottom:8px}
-.sub{opacity:.9;font-size:1.1rem}
-.badge{display:inline-block;background:rgba(255,255,255,.2);padding:4px 12px;border-radius:20px;font-size:.8rem;margin-top:10px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:30px;padding:30px}
-@media(max-width:768px){.grid{grid-template-columns:1fr}}
-.panel{background:#f8fafc;border-radius:15px;padding:25px}
-h2{color:#334155;margin-bottom:15px;font-size:1.4rem;border-bottom:3px solid #4f46e5;padding-bottom:8px}
-.drop{border:3px dashed #cbd5e1;border-radius:10px;padding:30px;text-align:center;cursor:pointer;transition:.3s}
-.drop:hover{border-color:#4f46e5;background:#eef2ff}
-.btn{background:linear-gradient(135deg,#4f46e5,#7c3aed);color:#fff;border:none;padding:12px 24px;border-radius:10px;font-size:1rem;font-weight:600;cursor:pointer;width:100%;margin-top:8px;transition:.2s}
-.btn:hover{transform:translateY(-2px);box-shadow:0 8px 16px rgba(79,70,229,.3)}
-.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
-.songs{list-style:none;max-height:300px;overflow-y:auto;margin-top:15px}
-.song{background:#fff;padding:12px;border-radius:8px;margin-bottom:8px;border-left:4px solid #4f46e5}
-.song b{color:#334155;font-size:.95rem}
-.song small{display:block;color:#64748b;margin-top:4px}
-.bar-wrap{margin-top:15px;background:#e2e8f0;border-radius:10px;overflow:hidden;height:16px;display:none}
-.bar{height:100%;background:linear-gradient(90deg,#4f46e5,#7c3aed);width:0%;transition:width .5s}
-.status{text-align:center;padding:15px;background:#f1f5f9;border-radius:10px;margin-top:15px;color:#475569;display:none}
-select{width:100%;padding:10px;border:2px solid #cbd5e1;border-radius:8px;font-size:.95rem;margin-bottom:10px;background:#fff}
-.score{font-size:2.5rem;font-weight:800;text-align:center;color:#4f46e5;margin:15px 0}
-.metric{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #e2e8f0}
-.metric span:first-child{color:#475569}
-.metric span:last-child{color:#4f46e5;font-weight:600}
-.ai-scores{margin-top:20px;padding:15px;background:#f0fdf4;border-radius:10px;border:2px solid #86efac;display:none}
-.ai-scores h3{color:#166534;margin-bottom:10px;font-size:1.1rem}
-.ai-bar{height:8px;background:#e2e8f0;border-radius:4px;margin:4px 0 10px 0;overflow:hidden}
-.ai-fill{height:100%;border-radius:4px;transition:width .5s}
-footer{text-align:center;padding:15px;color:#94a3b8;font-size:.85rem;border-top:1px solid #e2e8f0}
-</style>
-</head>
-<body>
-<div class="container">
-<header>
-<h1>VocalFusion AI</h1>
-<div class="sub">AI-Powered Vocal Fusion</div>
-<div class="badge">v10.0 — AI DJ</div>
-</header>
-<div class="grid">
-<div class="panel">
-<h2>Upload &amp; Analyze</h2>
-<div class="drop" id="drop" onclick="document.getElementById('fi').click()">
-<div style="font-size:2.5rem;color:#94a3b8;margin-bottom:10px">&#127925;</div>
-<div style="color:#334155">Click to upload audio</div>
-<div style="color:#94a3b8;font-size:.85rem">WAV, MP3, FLAC, M4A</div>
-</div>
-<input type="file" id="fi" accept="audio/*" style="display:none">
-<div id="fn" style="text-align:center;color:#4f46e5;font-weight:600;margin-top:8px"></div>
-<button class="btn" id="goBtn" disabled>Analyze Song</button>
-<div class="bar-wrap" id="aBar"><div class="bar" id="aFill"></div></div>
-<div class="status" id="aStat"></div>
-<h2 style="margin-top:30px">Analyzed Songs</h2>
-<ul class="songs" id="songList"><li style="color:#94a3b8;text-align:center;padding:20px">Loading...</li></ul>
-</div>
-<div class="panel">
-<h2>Fuse Two Songs</h2>
-<div style="margin-bottom:5px;color:#475569;font-weight:500;font-size:.9rem">Song A:</div>
-<select id="sA"><option value="">Choose...</option></select>
-<div style="margin-bottom:5px;color:#475569;font-weight:500;font-size:.9rem">Song B:</div>
-<select id="sB"><option value="">Choose...</option></select>
-<button class="btn" id="compBtn" disabled>Check Compatibility</button>
-<div id="compRes" style="display:none">
-<div class="score" id="oScore">-</div>
-<div style="text-align:center;color:#64748b;margin-bottom:20px">Overall Compatibility</div>
-<div id="mets"></div>
-<button class="btn" id="fuseBtn" style="margin-top:15px">Create Fusion</button>
-</div>
-<div class="bar-wrap" id="fBar"><div class="bar" id="fFill"></div></div>
-<div class="status" id="fStat"></div>
-<div class="ai-scores" id="aiScores">
-<h3>AI Mix Quality Analysis</h3>
-<div id="aiMetrics"></div>
-</div>
-</div>
-</div>
-<footer>VocalFusion AI v10.0 &mdash; AI DJ &bull; Experiment &rarr; Score &rarr; Decide</footer>
-</div>
-<script>
-var file=null,fi=document.getElementById("fi"),goBtn=document.getElementById("goBtn");
-var sA=document.getElementById("sA"),sB=document.getElementById("sB"),compBtn=document.getElementById("compBtn");
 
-fi.onchange=function(){if(fi.files.length){file=fi.files[0];document.getElementById("fn").textContent=file.name;goBtn.disabled=false}};
-sA.onchange=sB.onchange=function(){compBtn.disabled=!(sA.value&&sB.value&&sA.value!==sB.value)};
+def _cleanup_old_jobs():
+    """Remove completed/failed jobs older than 10 minutes to prevent memory leak"""
+    import time
+    cutoff = time.time() - 600
+    stale = [jid for jid, j in active_jobs.items()
+             if j.get('status') in ('completed', 'failed')
+             and j.get('completed_at', float('inf')) < cutoff]
+    for jid in stale:
+        del active_jobs[jid]
 
-function prog(id,pct){var w=document.getElementById(id);w.parentElement.style.display="block";w.style.width=pct+"%"}
-function stat(id,html){var e=document.getElementById(id);e.style.display="block";e.innerHTML=html}
-
-goBtn.onclick=function(){
-  if(!file)return;
-  var fd=new FormData();fd.append("file",file);fd.append("name",file.name.replace(/\.[^/.]+$/,""));
-  prog("aFill",10);stat("aStat","Uploading...");goBtn.disabled=true;
-  fetch("/api/upload",{method:"POST",body:fd}).then(function(r){return r.json()}).then(function(d){
-    if(d.success){stat("aStat","Processing... (takes a few minutes)");prog("aFill",30);poll(d.job_id)}
-    else{stat("aStat","Error: "+d.error);goBtn.disabled=false}
-  }).catch(function(e){stat("aStat","Error: "+e.message);goBtn.disabled=false});
-};
-
-function poll(jid){
-  var iv=setInterval(function(){
-    fetch("/api/job/"+jid).then(function(r){return r.json()}).then(function(d){
-      if(!d.success)return;var j=d.job;prog("aFill",j.progress||50);
-      if(j.status==="completed"){clearInterval(iv);prog("aFill",100);stat("aStat","Done!");
-        file=null;fi.value="";document.getElementById("fn").textContent="";goBtn.disabled=true;loadSongs()}
-      else if(j.status==="failed"){clearInterval(iv);stat("aStat","Error: "+(j.error||"Unknown"));goBtn.disabled=false}
-    }).catch(function(){});
-  },3000);
-}
-
-compBtn.onclick=function(){
-  var a=sA.value,b=sB.value;if(!a||!b||a===b)return;
-  compBtn.disabled=true;stat("fStat","Checking...");
-  fetch("/api/compatibility/"+encodeURIComponent(a)+"/"+encodeURIComponent(b))
-  .then(function(r){return r.json()}).then(function(d){
-    compBtn.disabled=false;
-    if(d.success){showComp(d.compatibility);document.getElementById("fStat").style.display="none"}
-    else stat("fStat","Error: "+d.error);
-  }).catch(function(e){compBtn.disabled=false;stat("fStat","Error: "+e.message)});
-};
-
-function showComp(c){
-  document.getElementById("compRes").style.display="block";
-  document.getElementById("oScore").textContent=(c.overall_score||0).toFixed(2);
-  var m=document.getElementById("mets");m.innerHTML="";
-  [["Key",c.key_compatibility],["Tempo",c.tempo_compatibility],
-   ["Range",c.range_compatibility],["Timbre",c.timbre_compatibility],
-   ["Structure",c.structure_compatibility],["Blend",c.vocal_blend_score]].forEach(function(p){
-    if(p[1]!==undefined){var d=document.createElement("div");d.className="metric";
-    d.innerHTML="<span>"+p[0]+"</span><span>"+(p[1]||0).toFixed(2)+"</span>";m.appendChild(d)}});
-}
-
-function showAIScores(q){
-  if(!q)return;
-  var box=document.getElementById("aiScores");box.style.display="block";
-  var m=document.getElementById("aiMetrics");m.innerHTML="";
-  var dims=[["Beat Coherence","beat_coherence"],["Spectral Balance","spectral_balance"],
-    ["Harmonic Clarity","harmonic_clarity"],["Vocal Clarity","vocal_clarity"],
-    ["Dynamic Range","dynamic_range"],["Phase Coherence","phase_coherence"],
-    ["Separation","spectral_separation"],["Energy","energy_consistency"]];
-  dims.forEach(function(d){
-    var val=q[d[1]]||0;
-    var color=val>=0.7?"#22c55e":val>=0.4?"#eab308":"#ef4444";
-    m.innerHTML+="<div style='display:flex;justify-content:space-between;font-size:.9rem'><span>"+d[0]+"</span><span style='color:"+color+";font-weight:600'>"+(val).toFixed(2)+"</span></div><div class='ai-bar'><div class='ai-fill' style='width:"+(val*100)+"%;background:"+color+"'></div></div>";
-  });
-  var overall=q.overall||0;
-  var ocolor=overall>=0.7?"#22c55e":overall>=0.4?"#eab308":"#ef4444";
-  m.innerHTML+="<div style='margin-top:10px;font-size:1.1rem;font-weight:700;text-align:center;color:"+ocolor+"'>Overall: "+(overall).toFixed(2)+"</div>";
-}
-
-document.getElementById("fuseBtn").onclick=function(){
-  var a=sA.value,b=sB.value;if(!a||!b||a===b)return;
-  prog("fFill",10);stat("fStat","AI analyzing and mixing... (several minutes)");
-  document.getElementById("aiScores").style.display="none";
-  fetch("/api/fuse/"+encodeURIComponent(a)+"/"+encodeURIComponent(b),{method:"POST"})
-  .then(function(r){return r.json()}).then(function(d){
-    prog("fFill",100);
-    if(d.success){
-      var m="Fusion complete!";
-      if(d.download_url)m+=" <a href='"+d.download_url+"' style='color:#4f46e5;font-weight:600'>Download</a>";
-      stat("fStat",m);
-      if(d.quality_scores)showAIScores(d.quality_scores);
-    }else stat("fStat","Error: "+d.error);
-  }).catch(function(e){stat("fStat","Error: "+e.message)});
-};
-
-function loadSongs(){
-  fetch("/api/songs").then(function(r){return r.json()}).then(function(d){
-    if(!d.success)return;
-    var list=document.getElementById("songList");list.innerHTML="";
-    sA.innerHTML="<option value=''>Choose...</option>";sB.innerHTML="<option value=''>Choose...</option>";
-    if(!d.songs.length){list.innerHTML="<li style='color:#94a3b8;text-align:center;padding:20px'>No songs yet</li>";return}
-    d.songs.forEach(function(s){
-      var li=document.createElement("li");li.className="song";
-      li.innerHTML="<b>"+s.song_id+"</b><small>"+Math.round(s.duration)+"s | "+
-        (s.key||"?")+" | "+Math.round(s.tempo)+" BPM | "+(s.voice_type||"?")+"</small>";
-      list.appendChild(li);
-      var o1=document.createElement("option");o1.value=s.song_id;o1.textContent=s.song_id;sA.appendChild(o1);
-      var o2=document.createElement("option");o2.value=s.song_id;o2.textContent=s.song_id;sB.appendChild(o2);
-    });
-  }).catch(function(){document.getElementById("songList").innerHTML="<li style='color:#94a3b8;text-align:center;padding:20px'>Error loading</li>"});
-}
-loadSongs();
-</script>
-</body>
-</html>'''
 
 
 @web_app.route('/')
 def index():
-    return render_template_string(HTML)
+    return render_template('index.html')
 
 
 @web_app.route('/api/upload', methods=['POST'])
@@ -505,18 +625,22 @@ def upload_song():
 
     job_id = str(uuid.uuid4())
     active_jobs[job_id] = {'status': 'processing', 'song_id': song_id, 'progress': 0}
+    _cleanup_old_jobs()
 
     def bg():
+        import time
         try:
             active_jobs[job_id]['progress'] = 10
             result = engine.process_single_song(temp_path, song_id)
             active_jobs[job_id].update({
                 'status': 'completed', 'progress': 100,
-                'result': {'song_id': result['song_id']}
+                'result': {'song_id': result['song_id']},
+                'completed_at': time.time(),
             })
         except Exception as e:
             import traceback
-            active_jobs[job_id].update({'status': 'failed', 'error': str(e)})
+            active_jobs[job_id].update({'status': 'failed', 'error': str(e),
+                                        'completed_at': time.time()})
             print(traceback.format_exc())
         finally:
             try:
@@ -526,6 +650,34 @@ def upload_song():
 
     threading.Thread(target=bg, daemon=True).start()
     return jsonify({'success': True, 'job_id': job_id, 'song_id': song_id})
+
+
+@web_app.route('/api/songs/<path:song_id>', methods=['DELETE'])
+def delete_song(song_id):
+    import shutil
+    deleted = []
+    errors = []
+    for subdir in ['stems', 'analysis']:
+        p = Path(DATA_DIR) / subdir / song_id
+        if p.exists():
+            try:
+                shutil.rmtree(str(p))
+                deleted.append(str(p))
+            except Exception as e:
+                errors.append(str(e))
+    # Remove embedding files (both old .npy and new _mert.npy)
+    emb_dir = Path(DATA_DIR) / 'embeddings'
+    for emb_file in [emb_dir / f"{song_id}.npy",
+                     emb_dir / f"{song_id}_mert.npy"]:
+        if emb_file.exists():
+            try:
+                emb_file.unlink()
+                deleted.append(str(emb_file))
+            except Exception as e:
+                errors.append(str(e))
+    if errors:
+        return jsonify({'success': False, 'error': '; '.join(errors)}), 500
+    return jsonify({'success': True, 'deleted': deleted})
 
 
 @web_app.route('/api/songs')
@@ -556,6 +708,7 @@ def list_songs():
 
 @web_app.route('/api/job/<job_id>')
 def get_job(job_id):
+    _cleanup_old_jobs()
     if job_id not in active_jobs:
         return jsonify({'success': False, 'error': 'Job not found'}), 404
     return jsonify({'success': True, 'job': active_jobs[job_id]})
@@ -574,14 +727,54 @@ def get_compatibility(song_a, song_b):
 
 @web_app.route('/api/fuse/<path:song_a>/<path:song_b>', methods=['POST'])
 def fuse_songs(song_a, song_b):
+    """Start a fuse job in the background and return job_id immediately."""
+    import time
+    job_id = str(uuid.uuid4())
+    active_jobs[job_id] = {'status': 'processing', 'progress': 10,
+                            'type': 'fuse', 'song_a': song_a, 'song_b': song_b}
+    _cleanup_old_jobs()
+
+    def bg():
+        try:
+            result = engine.fuse_two_songs(song_a, song_b)
+            mix_file = Path(DATA_DIR) / "mixes" / f"{song_a}_{song_b}" / "full_mix.wav"
+            url = f"/download/{song_a}_{song_b}" if mix_file.exists() else None
+            active_jobs[job_id].update({
+                'status': 'completed', 'progress': 100,
+                'completed_at': time.time(),
+                'result': {
+                    'download_url': url,
+                    'quality_scores': result.get('quality_scores'),
+                    'mix_id': result.get('mix_id'),
+                    'ratings_count': engine.predictor.get_ratings_count(),
+                },
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            active_jobs[job_id].update({'status': 'failed', 'error': str(e),
+                                        'completed_at': time.time()})
+
+    threading.Thread(target=bg, daemon=True).start()
+    return jsonify({'success': True, 'job_id': job_id})
+
+
+@web_app.route('/api/rate', methods=['POST'])
+def rate_mix():
     try:
-        result = engine.fuse_two_songs(song_a, song_b)
-        mix_file = Path(DATA_DIR) / "mixes" / f"{song_a}_{song_b}" / "full_mix.wav"
-        url = f"/download/{song_a}_{song_b}" if mix_file.exists() else None
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No JSON body'}), 400
+        mix_id = data.get('mix_id')
+        rating = data.get('rating')
+        if not mix_id or rating is None:
+            return jsonify({'success': False, 'error': 'mix_id and rating required'}), 400
+        ok = engine.predictor.add_rating(mix_id, int(rating))
+        count = engine.predictor.get_ratings_count()
         return jsonify({
-            'success': True,
-            'download_url': url,
-            'quality_scores': result.get('quality_scores'),
+            'success': ok,
+            'ratings_count': count,
+            'message': f'Rating saved. {count} total ratings.',
         })
     except Exception as e:
         import traceback
@@ -596,6 +789,95 @@ def download_mix(fusion_id):
     if p.exists():
         return send_from_directory(str(p.parent), p.name, as_attachment=True)
     return "Not found", 404
+
+
+@web_app.route('/api/stream')
+def stream_logs():
+    """SSE endpoint: streams all print() output to the browser in real time."""
+    from flask import Response, stream_with_context
+
+    sub_queue = _broadcaster.subscribe()
+
+    def generate():
+        try:
+            yield "data: Connected to VocalFusion AI log stream\n\n"
+            while True:
+                try:
+                    line = sub_queue.get(timeout=15)
+                    if line:
+                        yield f"data: {line}\n\n"
+                except queue.Empty:
+                    yield ": keepalive\n\n"   # SSE comment keeps connection alive
+        except GeneratorExit:
+            pass
+        finally:
+            _broadcaster.unsubscribe(sub_queue)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+        },
+    )
+
+
+@web_app.route('/api/mixes')
+def list_mixes():
+    """Return all completed mixes with quality scores."""
+    mixes_dir = Path(DATA_DIR) / "mixes"
+    mixes = []
+    if mixes_dir.exists():
+        for d in sorted(mixes_dir.iterdir(), reverse=True):
+            report = d / "fusion_report.json"
+            if not (d.is_dir() and report.exists()):
+                continue
+            try:
+                with open(report) as f:
+                    r = json.load(f)
+                qs = r.get('quality_scores') or {}
+                overall = qs.get('overall', 0) if isinstance(qs, dict) else 0
+                mix_file = d / "full_mix.wav"
+                mixes.append({
+                    'mix_id': r.get('mix_id'),
+                    'song_a': r.get('song_a_id'),
+                    'song_b': r.get('song_b_id'),
+                    'overall': float(overall),
+                    'created_at': r.get('created_at'),
+                    'download_url': f"/download/{d.name}" if mix_file.exists() else None,
+                })
+            except Exception:
+                pass
+    return jsonify({'success': True, 'mixes': mixes})
+
+
+@web_app.route('/api/watch/status')
+def watch_status():
+    active = _watch_thread is not None and _watch_thread.is_alive()
+    folder = str(Path(DATA_DIR) / "watch")
+    return jsonify({'active': active, 'folder': folder})
+
+
+@web_app.route('/api/watch/toggle', methods=['POST'])
+def watch_toggle():
+    global _watch_thread, _watch_stop
+    if _watch_thread is not None and _watch_thread.is_alive():
+        _watch_stop.set()
+        _watch_thread.join(timeout=3)
+        _watch_thread = None
+        _watch_stop = None
+        return jsonify({'active': False})
+    else:
+        _watch_stop = threading.Event()
+        watch_dir = Path(DATA_DIR) / "watch"
+
+        def _run():
+            engine.watch_folder(watch_dir, stop_event=_watch_stop)
+
+        _watch_thread = threading.Thread(target=_run, daemon=True)
+        _watch_thread.start()
+        return jsonify({'active': True, 'folder': str(watch_dir.resolve())})
 
 
 # ============================================================================
@@ -626,13 +908,32 @@ def main():
     p.add_argument('--port', type=int, default=5000)
     p.add_argument('--host', default='127.0.0.1')
 
+    p = sub.add_parser('watch',
+        help='Watch a folder — auto-analyze new files and fuse best pairs')
+    p.add_argument('folder', nargs='?', default='vf_data/watch',
+                   help='Folder to watch (default: vf_data/watch)')
+    p.add_argument('--no-fuse', action='store_true',
+                   help='Analyze only, do not auto-fuse')
+    p.add_argument('--interval', type=int, default=5,
+                   help='Polling interval in seconds (default: 5)')
+
+    p = sub.add_parser('batch',
+        help='Analyze all songs in a folder, then fuse the most compatible pairs')
+    p.add_argument('folder', help='Folder containing audio files')
+    p.add_argument('--top', type=int, default=3,
+                   help='How many pairs to fuse (default: 3)')
+    p.add_argument('--no-fuse', action='store_true',
+                   help='Analyze only, do not auto-fuse')
+
     args = parser.parse_args()
     ir = getattr(args, 'ir', None)
 
     if args.cmd == 'serve':
         engine = VocalFusion(ir_path=ir)
+        _broadcaster.install()   # capture all print() → SSE stream
         print(f"\nWeb UI: http://{args.host}:{args.port}\n")
-        web_app.run(host=args.host, port=args.port, debug=False)
+        web_app.run(host=args.host, port=args.port, debug=False,
+                    threaded=True)
 
     elif args.cmd == 'analyze':
         engine = VocalFusion(ir_path=ir)
@@ -671,6 +972,22 @@ def main():
     elif args.cmd == 'fuse':
         engine = VocalFusion(ir_path=ir)
         engine.fuse_two_songs(args.song_a, args.song_b)
+
+    elif args.cmd == 'watch':
+        engine = VocalFusion(ir_path=ir)
+        engine.watch_folder(
+            watch_dir=args.folder,
+            auto_fuse=not args.no_fuse,
+            interval=args.interval,
+        )
+
+    elif args.cmd == 'batch':
+        engine = VocalFusion(ir_path=ir)
+        engine.batch_process(
+            folder=args.folder,
+            auto_fuse=not args.no_fuse,
+            top_n=args.top,
+        )
 
     else:
         parser.print_help()

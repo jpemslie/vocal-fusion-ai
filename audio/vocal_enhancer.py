@@ -24,10 +24,8 @@ from pedalboard import (
     Pedalboard,
     HighpassFilter,
     PeakFilter,
-    Compressor,
-    Limiter,
 )
-from vocalfusion.dsp import EnhancedDSP
+from audio.dsp import EnhancedDSP
 
 
 class VocalEnhancer:
@@ -37,13 +35,19 @@ class VocalEnhancer:
         self.sr = sample_rate
         self.dsp = EnhancedDSP(sample_rate)
 
-        # Keep it simple: HPF + subtle presence + gentle compression
+        # Clarity chain — three moves, nothing more:
+        #   1. HPF at 100Hz: Demucs leaks sub-bass mud into the vocal stem.
+        #      100Hz is safe (no vocal content below this) and removes all mud.
+        #   2. Cut 300Hz -3dB: removes boxy/nasal honk from separation artefacts.
+        #   3. Boost 3kHz +4dB: the primary "cut-through" frequency for vocals —
+        #      this is what makes a vocal sit forward in a mix.
+        #   4. Boost 9kHz +2.5dB: air/presence — adds crispness and life.
+        # No compressor — _set_rms() in AIDJ already normalises level.
         self._vocal_board = Pedalboard([
             HighpassFilter(cutoff_frequency_hz=100.0),
-            PeakFilter(cutoff_frequency_hz=2500.0, gain_db=2.0, q=1.0),
-            Compressor(threshold_db=-18.0, ratio=2.0,
-                       attack_ms=20.0, release_ms=150.0),
-            Limiter(threshold_db=-0.5, release_ms=50.0),
+            PeakFilter(cutoff_frequency_hz=300.0,  gain_db=-3.0, q=1.0),
+            PeakFilter(cutoff_frequency_hz=3000.0, gain_db=2.0,  q=0.8),
+            PeakFilter(cutoff_frequency_hz=9000.0, gain_db=2.5,  q=0.7),
         ])
 
         # Carve a pocket for vocals in the melodic instruments
@@ -68,23 +72,25 @@ class VocalEnhancer:
         if other is not None and np.any(other != 0):
             other = self._process_other(other)
 
-        # Sidechain: instruments duck when vocals hit
+        # Sidechain: instruments duck subtly when vocals are loud.
+        # Threshold raised to -16dBFS so ducking only triggers on loud
+        # vocal peaks, not constantly. Amounts reduced to avoid hollow sound.
         if has_vocals:
             if drums is not None:
                 drums = self.dsp.sidechain_duck(
                     drums, vocals,
-                    threshold_db=-22, ratio=2.5,
-                    attack_ms=8, release_ms=200, amount=0.18)
+                    threshold_db=-16, ratio=2.0,
+                    attack_ms=10, release_ms=250, amount=0.10)
             if bass is not None:
                 bass = self.dsp.sidechain_duck(
                     bass, vocals,
-                    threshold_db=-22, ratio=2.5,
-                    attack_ms=8, release_ms=150, amount=0.20)
+                    threshold_db=-16, ratio=2.0,
+                    attack_ms=10, release_ms=200, amount=0.12)
             if other is not None:
                 other = self.dsp.sidechain_duck(
                     other, vocals,
-                    threshold_db=-22, ratio=2.0,
-                    attack_ms=10, release_ms=200, amount=0.15)
+                    threshold_db=-16, ratio=1.8,
+                    attack_ms=12, release_ms=250, amount=0.08)
 
         return vocals, drums, bass, other
 

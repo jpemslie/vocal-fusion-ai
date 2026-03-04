@@ -4,10 +4,14 @@ scipy>=1.8.0
 librosa>=0.10.0
 soundfile>=0.12.0
 
-# Deep learning (stem separation)
+# Deep learning (stem separation + models)
 torch>=2.0.0
 torchaudio>=2.0.0
 demucs>=4.0.0
+
+# Pre-trained music understanding model (MERT-v1-95M embeddings)
+# Pin to 4.38 — later versions broke MERT trust_remote_code compatibility
+transformers==4.38
 
 # Web server
 flask>=2.0.0
@@ -15,14 +19,14 @@ flask>=2.0.0
 # Professional audio effects (Spotify/JUCE engine — same as pro DAWs)
 pedalboard>=0.9.0
 
-# Spectral noise reduction (clean up Demucs stem bleed before processing)
-noisereduce>=3.0.0
-
-# Reference mastering (match output loudness/EQ to a professional reference)
-matchering>=2.0.0
-
 # High-quality time-stretching and pitch-shifting
 pyrubberband>=0.3.0
 
-# Optional extras
-matplotlib>=3.7.0
+# Objective audio evaluation metrics (beat F-measure, key scoring)
+mir_eval>=0.6.0
+
+# Progress bars
+tqdm>=4.60.0
+
+# Enterprise-grade vocal activity detection (used in _extract_vocal_phrases)
+silero-vad>=5.0

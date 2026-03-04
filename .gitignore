@@ -12,16 +12,11 @@ venv/
 *.wav
 *.flac
 *.m4a
+*.npy
+*.npz
 
-# Data (we'll store large files here)
-data/raw/*
-data/stems/*
-data/outputs/*
-
-# Except keep the folder structure
-!data/raw/.gitkeep
-!data/stems/.gitkeep
-!data/outputs/.gitkeep
+# Runtime data (songs, stems, ML models — not committed)
+vf_data/
 
 # IDE
 .vscode/

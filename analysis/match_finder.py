@@ -20,7 +20,7 @@ import librosa
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
-from vocalfusion.song_dna import SongDNA, Section
+from analysis.song_dna import SongDNA, Section
 
 
 @dataclass

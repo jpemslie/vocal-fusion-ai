@@ -253,42 +253,42 @@ class EnhancedDSP:
 
     def _find_first_downbeat(self, audio: np.ndarray, tempo: float) -> int:
         """
-        Find the sample position of the first strong downbeat.
+        Find the sample position of the first bar-level downbeat.
 
-        Uses onset strength and beat tracking to find where the
-        first bar-level strong beat lands.
+        Strategy: use beat tracking to get all beat positions, then find
+        the beat phase that gives the strongest mean onset at every 4th beat
+        (i.e. the beat that is CONSISTENTLY the strongest bar-opener, not just
+        the single loudest onset in the first 8 beats).
         """
-        # Get beat frames
         tempo_detected, beats = librosa.beat.beat_track(
             y=audio, sr=self.sr, start_bpm=tempo, units='frames')
 
-        if len(beats) < 2:
-            # Fallback: use onset detection
+        if len(beats) < 4:
             onsets = librosa.onset.onset_detect(y=audio, sr=self.sr, units='samples')
             return int(onsets[0]) if len(onsets) > 0 else 0
 
-        # Get onset strength at each beat position
         onset_env = librosa.onset.onset_strength(y=audio, sr=self.sr)
 
-        # Find the strongest beat among the first 8 beats
-        # (the first downbeat of a bar is usually the strongest)
-        search_range = min(8, len(beats))
-        beat_strengths = []
-        for i in range(search_range):
-            frame = beats[i]
-            if frame < len(onset_env):
-                beat_strengths.append(onset_env[frame])
-            else:
-                beat_strengths.append(0)
+        # Score each possible downbeat phase (0, 1, 2, 3 within a 4-beat bar).
+        # For each phase p, sum onset strength at beats p, p+4, p+8, ...
+        # The phase with the highest cumulative strength is bar beat 1.
+        best_phase = 0
+        best_score = -1.0
+        for phase in range(4):
+            score = 0.0
+            count = 0
+            for i in range(phase, len(beats), 4):
+                frame = beats[i]
+                if frame < len(onset_env):
+                    score += float(onset_env[frame])
+                    count += 1
+            if count > 0 and (score / count) > best_score:
+                best_score = score / count
+                best_phase = phase
 
-        # Pick the strongest
-        strongest_idx = np.argmax(beat_strengths)
-        downbeat_frame = beats[strongest_idx]
-
-        # Convert frame to samples
-        downbeat_sample = librosa.frames_to_samples(downbeat_frame)
-
-        return int(downbeat_sample)
+        # First downbeat is the first beat at the winning phase
+        downbeat_frame = beats[best_phase]
+        return int(librosa.frames_to_samples(downbeat_frame))
 
     def fine_align_onsets(self, primary: np.ndarray, secondary: np.ndarray,
                           window_ms: float = 50.0) -> np.ndarray:

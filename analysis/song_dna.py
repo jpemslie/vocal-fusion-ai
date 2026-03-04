@@ -15,6 +15,7 @@ This module re-analyzes from the actual audio at mix time.
 
 import numpy as np
 import librosa
+import tempfile, os, soundfile as sf
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 
@@ -89,6 +90,8 @@ class SongDNA:
     vocal_activity: np.ndarray = field(default_factory=lambda: np.array([]))
     energy_curve: np.ndarray = field(default_factory=lambda: np.array([]))
     energy_curve_times: np.ndarray = field(default_factory=lambda: np.array([]))
+    # Per-stem energy curves (same beat grid as energy_curve)
+    stem_energy: Dict = field(default_factory=dict)  # {'drums': array, 'bass': ..., etc}
     key: str = ""
     key_chroma: np.ndarray = field(default_factory=lambda: np.zeros(12))
     overall_energy: float = 0.0
@@ -124,10 +127,19 @@ class SongAnalyzer:
               f"{dna.beat_grid.bars} bars, "
               f"{len(dna.beat_grid.beat_times)} beats")
 
-        # 2. Energy curve (per beat)
+        # 2. Energy curve (per beat) — full mix + per-stem
         dna.energy_curve, dna.energy_curve_times = self._compute_energy_curve(
             full, dna.beat_grid)
         dna.overall_energy = float(np.mean(dna.energy_curve)) if len(dna.energy_curve) > 0 else 0
+
+        # Per-stem energy curves: same beat grid, separate for each stem.
+        # These tell us WHICH stem is driving energy at each section,
+        # enabling accurate drop/breakdown/buildup detection.
+        for name, stem in [('vocals', vocals), ('drums', drums),
+                            ('bass', bass), ('other', other)]:
+            if stem is not None:
+                curve, _ = self._compute_energy_curve(stem, dna.beat_grid)
+                dna.stem_energy[name] = curve
 
         # 3. Vocal analysis
         dna.vocal_activity = self._detect_vocal_activity(vocals)
@@ -142,15 +154,17 @@ class SongAnalyzer:
             dna.has_strong_drums = drum_rms > 0.02
         print(f"      Drums: strong={dna.has_strong_drums}")
 
-        # 5. Key detection
-        dna.key, dna.key_chroma = self._detect_key(full)
+        # 5. Key detection — use 'other' stem (melodic instruments only).
+        # Detecting key on the full mix lets drums and bass noise destroy
+        # the chroma analysis. The 'other' stem is pure harmonic content.
+        dna.key, dna.key_chroma = self._detect_key(full, other=other)
         print(f"      Key: {dna.key}")
 
         # 6. Section detection (the important one)
         dna.sections = self._detect_sections(
             full, vocals, drums, dna.beat_grid,
             dna.energy_curve, dna.energy_curve_times,
-            dna.vocal_activity)
+            dna.vocal_activity, dna.stem_energy)
         print(f"      Sections: {len(dna.sections)}")
         for s in dna.sections:
             print(f"        {s.start_time:5.1f}-{s.end_time:5.1f}s "
@@ -164,61 +178,102 @@ class SongAnalyzer:
     # ================================================================
 
     def _detect_beats(self, full, drums):
-        """Detect beats using drums (preferred) or full mix"""
+        """Detect beats using madmom (preferred) or librosa fallback."""
         grid = BeatGrid()
-
-        # Use drums if strong enough, otherwise full mix
         source = drums if drums is not None and np.sqrt(np.mean(drums**2)) > 0.01 else full
 
-        # Get tempo
-        tempo, beat_frames = librosa.beat.beat_track(
-            y=source, sr=self.sr, units='frames')
+        # Try madmom first — RNN+DBN is far more accurate than librosa on real music,
+        # and crucially gives us true downbeat positions (beat 1 of each bar).
+        try:
+            beat_times, downbeat_times, tempo = self._detect_beats_madmom(source)
+            grid.beat_times = beat_times
+            grid.downbeat_times = downbeat_times
+            grid.tempo = tempo
+            grid.beat_samples = (beat_times * self.sr).astype(int)
+            grid.bars = len(downbeat_times)
+            if len(beat_times) > 4:
+                intervals = np.diff(beat_times)
+                cv = np.std(intervals) / np.mean(intervals) if np.mean(intervals) > 0 else 1
+                grid.tempo_stable = cv < 0.15
+            print(f"      Beat tracking: madmom ({tempo:.0f} BPM, {len(downbeat_times)} bars)")
+            return grid
+        except Exception as e:
+            print(f"      madmom unavailable ({e}), falling back to librosa")
 
-        # Handle tempo as array (newer librosa)
+        # Librosa fallback
+        tempo, beat_frames = librosa.beat.beat_track(y=source, sr=self.sr, units='frames')
         if hasattr(tempo, '__len__'):
             tempo = float(tempo[0]) if len(tempo) > 0 else 120.0
         tempo = float(tempo)
-
-        # Resolve to reasonable range (80-170 BPM)
         if tempo < 70:
             tempo *= 2
         elif tempo > 180:
             tempo /= 2
 
         grid.tempo = tempo
-
-        # Get beat times
         beat_times = librosa.frames_to_time(beat_frames, sr=self.sr)
         grid.beat_times = beat_times
         grid.beat_samples = librosa.frames_to_samples(beat_frames)
 
-        # Downbeats: every 4th beat
         if len(beat_times) >= 4:
-            # Try to find the strongest beat as the downbeat
             beat_strengths = np.array([
                 np.sqrt(np.mean(source[max(0,s-256):s+256]**2))
                 for s in grid.beat_samples[:min(16, len(grid.beat_samples))]
             ])
             if len(beat_strengths) >= 4:
-                # Find which offset (0,1,2,3) has strongest average
                 offsets = [np.mean(beat_strengths[i::4]) for i in range(4)]
                 best_offset = int(np.argmax(offsets))
             else:
                 best_offset = 0
-
             grid.downbeat_times = beat_times[best_offset::4]
         else:
             grid.downbeat_times = beat_times
 
         grid.bars = len(grid.downbeat_times)
-
-        # Check tempo stability
         if len(beat_times) > 4:
             intervals = np.diff(beat_times)
             cv = np.std(intervals) / np.mean(intervals) if np.mean(intervals) > 0 else 1
             grid.tempo_stable = cv < 0.15
 
         return grid
+
+    def _detect_beats_madmom(self, source: np.ndarray):
+        """Use madmom RNN+DBN for beat and downbeat detection."""
+        from madmom.features.downbeats import RNNDownBeatProcessor, DBNDownBeatTrackingProcessor
+
+        # madmom needs a file path, so write a temp WAV
+        tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        try:
+            sf.write(tmp.name, source.astype(np.float32), self.sr)
+            tmp.close()
+
+            rnn = RNNDownBeatProcessor()
+            dbn = DBNDownBeatTrackingProcessor(
+                beats_per_bar=[3, 4],
+                fps=100,
+                min_bpm=90.0,
+                max_bpm=175.0,
+            )
+            activations = rnn(tmp.name)
+            beats = dbn(activations)  # shape (N, 2): [time_sec, beat_in_bar]
+        finally:
+            os.unlink(tmp.name)
+
+        beat_times = beats[:, 0].astype(float)
+        downbeat_times = beats[beats[:, 1] == 1, 0].astype(float)
+
+        # Estimate BPM from median beat interval
+        if len(beat_times) > 1:
+            tempo = float(60.0 / np.median(np.diff(beat_times)))
+            # Resolve half/double time
+            if tempo < 70:
+                tempo *= 2
+            elif tempo > 180:
+                tempo /= 2
+        else:
+            tempo = 120.0
+
+        return beat_times, downbeat_times, tempo
 
     # ================================================================
     # ENERGY CURVE
@@ -261,31 +316,66 @@ class SongAnalyzer:
     # ================================================================
 
     def _detect_vocal_activity(self, vocals, hop_s=0.25):
-        """Detect where vocals are active, returns array of 0/1 per time window"""
+        """
+        Detect where vocals are active — returns 0/1 array per hop_s window.
+
+        Primary: Silero VAD (same engine as ai_dj phrase extraction)
+          — more accurate than RMS: ignores breath, room tone, reverb tails
+        Fallback: adaptive RMS threshold
+        """
         if vocals is None:
             return np.array([])
 
         hop = int(hop_s * self.sr)
         n_frames = max(1, len(vocals) // hop)
-        activity = np.zeros(n_frames)
 
-        # RMS in each window
+        # ── Primary: Silero VAD ────────────────────────────────────────
+        try:
+            import torch
+            from silero_vad import load_silero_vad, get_speech_timestamps
+
+            audio_16k = librosa.resample(
+                vocals.astype(np.float32), orig_sr=self.sr, target_sr=16000)
+            model = load_silero_vad()
+            timestamps = get_speech_timestamps(
+                torch.from_numpy(audio_16k), model,
+                sampling_rate=16000,
+                threshold=0.45,
+                min_speech_duration_ms=300,
+                min_silence_duration_ms=200,
+            )
+            activity = np.zeros(n_frames)
+            ratio = self.sr / 16000
+            for ts in timestamps:
+                s_frame = int(ts['start'] * ratio / hop)
+                e_frame = int(ts['end']   * ratio / hop)
+                activity[s_frame:min(e_frame, n_frames)] = 1.0
+
+            # Smooth: bridge tiny gaps ≤ 1 second
+            gap_frames = int(1.0 / hop_s)
+            for i in range(1, len(activity) - 1):
+                if activity[i] == 0:
+                    left  = max(0, i - gap_frames)
+                    right = min(len(activity), i + gap_frames)
+                    if np.any(activity[left:i]) and np.any(activity[i+1:right]):
+                        activity[i] = 0.5
+            return activity
+
+        except Exception:
+            pass  # Fall through to RMS fallback
+
+        # ── Fallback: adaptive RMS ─────────────────────────────────────
         rms_values = np.array([
             np.sqrt(np.mean(vocals[i*hop:(i+1)*hop]**2))
             for i in range(n_frames)
         ])
 
         if np.max(rms_values) < 1e-6:
-            return activity
+            return np.zeros(n_frames)
 
-        # Normalize
         rms_norm = rms_values / np.max(rms_values)
-
-        # Threshold: vocal is active when above 15% of peak
-        # Use adaptive threshold based on distribution
         median_rms = np.median(rms_norm[rms_norm > 0.01]) if np.any(rms_norm > 0.01) else 0.1
         threshold = max(0.10, median_rms * 0.5)
-
         activity = (rms_norm > threshold).astype(float)
 
         # Smooth: fill short gaps (< 1 second)
@@ -367,9 +457,29 @@ class SongAnalyzer:
     # KEY DETECTION
     # ================================================================
 
-    def _detect_key(self, full):
-        """Detect musical key using chroma features"""
-        chroma = librosa.feature.chroma_cqt(y=full, sr=self.sr)
+    def _detect_key(self, full, other=None):
+        """
+        Detect musical key using the melodic stem + chroma_cens.
+
+        Why not the full mix:
+          - Drums have no pitch — they add noise to every chroma bin equally
+          - Bass is often one note that biases the root, not the key
+          - The 'other' stem (synths, guitar, piano) IS the harmonic content
+
+        Why chroma_cens over chroma_cqt:
+          - chroma_cens applies L2 normalisation + energy thresholding per window
+          - Far less sensitive to rhythmic noise and transients
+        """
+        # Use melodic stem for clean harmonic content
+        source = other if other is not None else full
+
+        # HPSS: isolate harmonic component from percussive transients
+        try:
+            source_h, _ = librosa.effects.hpss(source.astype(np.float32))
+        except Exception:
+            source_h = source
+
+        chroma = librosa.feature.chroma_cens(y=source_h.astype(np.float32), sr=self.sr)
         chroma_profile = np.mean(chroma, axis=1)
 
         # Krumhansl-Kessler profiles
@@ -407,7 +517,8 @@ class SongAnalyzer:
     # ================================================================
 
     def _detect_sections(self, full, vocals, drums, beat_grid,
-                          energy_curve, energy_times, vocal_activity):
+                          energy_curve, energy_times, vocal_activity,
+                          stem_energy=None):
         """
         Detect real sections using multiple novelty signals.
 
@@ -451,8 +562,10 @@ class SongAnalyzer:
             np.arange(min_len), sr=self.sr, hop_length=2048)
 
         # === Find peaks (section boundaries) ===
-        # Minimum section length: 8 seconds (roughly 4 bars at 120bpm)
-        min_section_s = 8.0
+        # Minimum section length: 16 seconds = ~8 bars at 120 BPM.
+        # Electronic music sections are never shorter than 8 bars.
+        # The old 8s minimum created micro-sections too short to classify.
+        min_section_s = 16.0
         min_frames = int(min_section_s * self.sr / 2048)
 
         # Adaptive threshold: peaks must be above median + 0.5*std
@@ -549,38 +662,73 @@ class SongAnalyzer:
                 for s in sections:
                     s.energy = s.energy / max_energy  # Normalize to 0-1
 
-            self._classify_sections(sections)
+            self._classify_sections(sections, stem_energy=stem_energy)
 
         return sections
 
-    def _classify_sections(self, sections):
-        """Classify sections based on energy, vocals, and position"""
+    def _classify_sections(self, sections, stem_energy=None):
+        """
+        Classify sections using per-stem energy + percentile thresholds.
+
+        Per-stem energy (when available) lets us detect:
+          - Drop:      drum energy spikes, no vocals
+          - Breakdown: all stems quiet simultaneously
+          - Buildup:   total energy rising + drum pattern changing
+          - Chorus:    high energy + vocals
+          - Verse:     medium energy + vocals
+          - Intro/Outro: position-based + low energy
+        """
         n = len(sections)
         if n == 0:
             return
 
-        for i, sec in enumerate(sections):
-            position = i / max(n - 1, 1)  # 0 = start, 1 = end
+        energies = [s.energy for s in sections]
+        p75 = float(np.percentile(energies, 75))
+        p40 = float(np.percentile(energies, 40))
+        p20 = float(np.percentile(energies, 20))
 
-            # Simple rules that actually work:
-            if position < 0.08 and sec.energy < 0.5:
+        # Song duration = end of last section (used for beat index mapping)
+        song_dur = max(sections[-1].end_time, 1.0)
+        n_beats_total = len(stem_energy.get('drums', [])) if stem_energy else 0
+
+        for i, sec in enumerate(sections):
+            position = i / max(n - 1, 1)
+
+            # Drum energy fraction for this section — is this a drum-heavy moment?
+            # Used to distinguish: chorus (vocals + energy) vs drop (drums + no vocals)
+            drum_dom = False
+            if stem_energy and 'drums' in stem_energy and n_beats_total > 0:
+                d_curve = stem_energy['drums']
+                s_idx = max(0, int(sec.start_time / song_dur * n_beats_total))
+                e_idx = min(int(sec.end_time   / song_dur * n_beats_total), n_beats_total)
+                if e_idx > s_idx:
+                    drum_mean = float(np.mean(d_curve[s_idx:e_idx]))
+                    full_mean = float(np.mean(list(stem_energy.values())[0])) if stem_energy else 0
+                    # Drums are dominant when they're above-average for the song
+                    drum_dom = drum_mean > (float(np.mean(d_curve)) * 1.1)
+
+            # Rising energy into next section = buildup
+            is_building = (i < n - 1 and
+                           sec.energy > 0 and
+                           sections[i+1].energy > sec.energy * 1.2)
+
+            if position < 0.08 and sec.energy < p40:
                 sec.classification = "intro"
-            elif position > 0.90 and sec.energy < 0.5:
+            elif position > 0.90 and sec.energy < p40:
                 sec.classification = "outro"
-            elif sec.energy >= 0.75 and sec.has_vocals:
-                sec.classification = "chorus"
-            elif sec.energy >= 0.80 and not sec.has_vocals:
-                sec.classification = "drop"
-            elif sec.energy < 0.35:
+            elif sec.energy <= p20:
                 sec.classification = "breakdown"
-            elif sec.has_vocals and sec.energy < 0.75:
+            elif is_building and not sec.has_vocals:
+                sec.classification = "buildup"
+            elif sec.energy >= p75 and not sec.has_vocals:
+                # High energy, no vocals — classic drop (drum-driven)
+                sec.classification = "drop"
+            elif sec.energy >= p75 and sec.has_vocals:
+                sec.classification = "chorus"
+            elif sec.has_vocals:
                 sec.classification = "verse"
-            elif not sec.has_vocals and sec.energy >= 0.5:
-                # Check if energy is rising (buildup)
-                if i > 0 and sec.energy > sections[i-1].energy + 0.1:
-                    sec.classification = "buildup"
-                else:
-                    sec.classification = "instrumental"
+            elif not sec.has_vocals and sec.energy >= p40:
+                sec.classification = "instrumental"
             else:
                 sec.classification = "verse"
 

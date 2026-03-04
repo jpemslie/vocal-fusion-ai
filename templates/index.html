@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VocalFusion AI v10.0</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #22263a;
+  --border: #2e3350;
+  --accent: #6c63ff;
+  --accent2: #a78bfa;
+  --green: #22c55e;
+  --yellow: #eab308;
+  --red: #ef4444;
+  --text: #e2e8f0;
+  --muted: #64748b;
+  --code-bg: #0d1117;
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+/* ── Header ── */
+.header {
+  background: linear-gradient(135deg, #4c1d95 0%, #1e1b4b 100%);
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  height: 52px;
+}
+.logo { font-size: 1.25rem; font-weight: 800; color: #fff; letter-spacing: -0.5px; }
+.logo span { color: var(--accent2); }
+.badge {
+  background: rgba(108,99,255,0.25);
+  border: 1px solid rgba(108,99,255,0.5);
+  color: var(--accent2);
+  padding: 2px 10px;
+  border-radius: 20px;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+.header-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.watch-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 5px 14px;
+  border-radius: 20px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+  transition: 0.2s;
+}
+.watch-btn:hover { border-color: var(--accent); color: var(--accent2); }
+.watch-btn.active { border-color: var(--green); color: var(--green); }
+.watch-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); transition: 0.3s; }
+.watch-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); animation: blink 2s infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+/* ── Three-column layout ── */
+.main {
+  display: grid;
+  grid-template-columns: 260px 1fr 290px;
+  flex: 1;
+  overflow: hidden;
+  height: calc(100vh - 52px);
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+}
+.col:last-child { border-right: none; }
+
+/* ── Cards ── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+}
+.card-title {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.card-title::before {
+  content: '';
+  width: 3px;
+  height: 11px;
+  background: var(--accent);
+  border-radius: 2px;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+/* ── Drop zone ── */
+.drop-zone {
+  border: 2px dashed var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: 0.2s;
+}
+.drop-zone:hover, .drop-zone.drag { border-color: var(--accent); background: rgba(108,99,255,0.05); }
+.drop-icon { font-size: 1.8rem; margin-bottom: 4px; }
+.drop-text { color: var(--muted); font-size: 0.8rem; }
+.file-name { color: var(--accent2); font-size: 0.8rem; font-weight: 600; margin-top: 5px;
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ── Buttons ── */
+.btn {
+  background: linear-gradient(135deg, var(--accent) 0%, #7c3aed 100%);
+  color: #fff;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 7px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  width: 100%;
+  margin-top: 6px;
+  transition: 0.2s;
+  text-align: center;
+  text-decoration: none;
+  display: block;
+}
+.btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(108,99,255,0.4); }
+.btn:disabled { opacity: 0.35; cursor: not-allowed; transform: none !important; box-shadow: none !important; }
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent2);
+  flex: 1;
+}
+.btn-outline:hover:not(:disabled) { background: rgba(108,99,255,0.1); box-shadow: none; }
+.btn-sm { padding: 5px 11px; font-size: 0.78rem; margin-top: 0; }
+.btn-green { background: linear-gradient(135deg, #16a34a, #15803d); }
+.btn-green:hover:not(:disabled) { box-shadow: 0 4px 10px rgba(34,197,94,0.35); }
+
+/* ── Progress ── */
+.prog-wrap { height: 3px; background: var(--surface2); border-radius: 3px; overflow: hidden; display: none; margin-top: 6px; }
+.prog-bar { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); width: 0%; transition: width 0.5s; border-radius: 3px; }
+.status-msg { font-size: 0.8rem; color: var(--muted); margin-top: 5px; display: none; line-height: 1.4; }
+.status-msg.err { color: var(--red); }
+
+/* ── Song list ── */
+.song-list { list-style: none; display: flex; flex-direction: column; gap: 5px; }
+.song-item {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 9px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  transition: 0.15s;
+}
+.song-item:hover { border-color: var(--accent); }
+.song-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+.song-info { flex: 1; min-width: 0; }
+.song-name { font-size: 0.82rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.song-meta { font-size: 0.7rem; color: var(--muted); margin-top: 2px; }
+.del-btn {
+  background: none; border: none; color: var(--muted);
+  cursor: pointer; padding: 2px 5px; border-radius: 4px;
+  font-size: 0.7rem; line-height: 1; transition: 0.15s; flex-shrink: 0;
+}
+.del-btn:hover { color: var(--red); background: rgba(239,68,68,0.1); }
+
+/* ── Selects ── */
+select {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface2);
+  color: var(--text);
+  font-size: 0.85rem;
+  margin-bottom: 6px;
+  outline: none;
+  transition: 0.2s;
+}
+select:focus { border-color: var(--accent); }
+
+/* ── Compatibility ── */
+.compat-score { font-size: 2rem; font-weight: 800; color: var(--accent2); text-align: center; padding: 6px 0; }
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+.metric-row:last-child { border-bottom: none; }
+
+/* ── AI score bars ── */
+.ai-score-row { margin-bottom: 7px; }
+.ai-score-label { display: flex; justify-content: space-between; font-size: 0.77rem; margin-bottom: 2px; }
+.ai-bar { height: 4px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
+.ai-fill { height: 100%; border-radius: 3px; transition: width 0.6s; }
+
+/* ── Stars ── */
+.star-row { display: flex; justify-content: center; gap: 5px; font-size: 1.6rem; cursor: pointer; user-select: none; padding: 5px 0; }
+.star { transition: transform 0.1s; color: var(--muted); line-height: 1; }
+.star.lit { color: #fbbf24; }
+.star:hover { transform: scale(1.2); }
+
+/* ── Pipeline tracker ── */
+.pipe-steps { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.pipe-step {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 9px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  transition: 0.3s;
+}
+.pipe-step.active { border-color: var(--accent); color: var(--accent2); background: rgba(108,99,255,0.1); }
+.pipe-step.done { border-color: var(--green); color: var(--green); background: rgba(34,197,94,0.08); }
+.pipe-arrow { color: var(--border); font-size: 0.6rem; }
+
+/* ── Live log ── */
+.log-box {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  font-family: 'SF Mono', 'Fira Code', 'Menlo', monospace;
+  font-size: 0.72rem;
+  line-height: 1.7;
+  overflow-y: auto;
+  min-height: 160px;
+  flex: 1;
+  color: #4a5568;
+}
+.log-line { padding: 0; }
+.log-line.phase { color: #f59e0b; font-weight: 600; }
+.log-line.success { color: var(--green); }
+.log-line.warn { color: #f97316; }
+.log-line.dim { color: #2d3748; }
+.log-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.log-clear { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 0.72rem; transition: 0.15s; }
+.log-clear:hover { color: var(--text); }
+
+/* ── Mix cards ── */
+.mix-card {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mix-songs { font-size: 0.8rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mix-songs em { color: var(--accent2); font-style: normal; }
+.mix-q-row { display: flex; align-items: center; gap: 8px; }
+.mix-q-bar { flex: 1; height: 4px; background: var(--surface); border-radius: 3px; overflow: hidden; }
+.mix-q-fill { height: 100%; border-radius: 3px; }
+.mix-q-val { font-size: 0.72rem; font-weight: 700; width: 30px; text-align: right; }
+.mix-date { font-size: 0.68rem; color: var(--muted); }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* ── Divider ── */
+.sep { height: 1px; background: var(--border); margin: 4px 0; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<header class="header">
+  <div class="logo">Vocal<span>Fusion</span> AI</div>
+  <div class="badge">v10.0 &mdash; AI DJ</div>
+  <div class="header-right">
+    <button class="watch-btn" id="watchBtn" onclick="toggleWatch()">
+      <div class="watch-dot" id="watchDot"></div>
+      <span id="watchLabel">Watch Folder</span>
+    </button>
+  </div>
+</header>
+
+<!-- Three columns -->
+<div class="main">
+
+  <!-- LEFT: Upload + Library -->
+  <div class="col">
+
+    <div class="card">
+      <div class="card-title">Upload &amp; Analyze</div>
+      <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+        <div class="drop-icon">🎵</div>
+        <div class="drop-text">Click or drag audio here</div>
+        <div class="drop-text" style="font-size:0.71rem;margin-top:2px">WAV &middot; MP3 &middot; FLAC &middot; M4A</div>
+        <div class="file-name" id="fileName"></div>
+      </div>
+      <input type="file" id="fileInput" accept="audio/*" style="display:none">
+      <button class="btn" id="analyzeBtn" disabled>Analyze Song</button>
+      <div class="prog-wrap" id="aProg"><div class="prog-bar" id="aBar"></div></div>
+      <div class="status-msg" id="aStat"></div>
+    </div>
+
+    <div class="card" style="flex:1">
+      <div class="card-title">Song Library</div>
+      <ul class="song-list" id="songList">
+        <li style="text-align:center;padding:14px;color:var(--muted);font-size:0.82rem">Loading...</li>
+      </ul>
+    </div>
+
+  </div>
+
+  <!-- CENTER: Pipeline + Log -->
+  <div class="col">
+
+    <div class="card">
+      <div class="card-title">Pipeline</div>
+      <div id="pipeContext" style="font-size:0.78rem;color:var(--muted);margin-bottom:8px">Idle — waiting for a job</div>
+
+      <div id="analyzePipe" style="display:none;margin-bottom:8px">
+        <div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.09em;color:var(--muted);margin-bottom:5px">Analyze</div>
+        <div class="pipe-steps">
+          <div class="pipe-step" id="pa1">📁 Separate</div>
+          <div class="pipe-arrow">&#9658;</div>
+          <div class="pipe-step" id="pa2">🧬 Embed</div>
+          <div class="pipe-arrow">&#9658;</div>
+          <div class="pipe-step" id="pa3">🔬 DNA</div>
+          <div class="pipe-arrow">&#9658;</div>
+          <div class="pipe-step" id="pa4">&#10003; Done</div>
+        </div>
+      </div>
+
+      <div id="fusePipe" style="display:none">
+        <div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:0.09em;color:var(--muted);margin-bottom:5px">Fuse</div>
+        <div class="pipe-steps">
+          <div class="pipe-step" id="pf1">🔬 Analyze</div>
+          <div class="pipe-arrow">&#9658;</div>
+          <div class="pipe-step" id="pf2">🎸 Stems</div>
+          <div class="pipe-arrow">&#9658;</div>
+          <div class="pipe-step" id="pf3">🤖 AI DJ</div>
+          <div class="pipe-arrow">&#9658;</div>
+          <div class="pipe-step" id="pf4">&#10024; Refine</div>
+          <div class="pipe-arrow">&#9658;</div>
+          <div class="pipe-step" id="pf5">🎚 Master</div>
+          <div class="pipe-arrow">&#9658;</div>
+          <div class="pipe-step" id="pf6">&#10003; Done</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0">
+      <div class="log-header">
+        <div class="card-title" style="margin-bottom:0">Live Log</div>
+        <button class="log-clear" onclick="clearLog()">Clear</button>
+      </div>
+      <div class="log-box" id="logBox">
+        <div class="log-line dim">Connecting to log stream...</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- RIGHT: Fuse + Mixes -->
+  <div class="col">
+
+    <div class="card">
+      <div class="card-title">Fuse Two Songs</div>
+      <div style="font-size:0.73rem;color:var(--muted);margin-bottom:4px">Song A &mdash; vocals source</div>
+      <select id="sA"><option value="">Choose song...</option></select>
+      <div style="font-size:0.73rem;color:var(--muted);margin-bottom:4px">Song B &mdash; instrumental source</div>
+      <select id="sB"><option value="">Choose song...</option></select>
+      <div style="display:flex;gap:6px;margin-top:2px">
+        <button class="btn btn-outline btn-sm" id="compatBtn" disabled style="flex:1">Check Compat</button>
+        <button class="btn btn-sm" id="fuseBtn" disabled style="flex:1">&#9654; Fuse</button>
+      </div>
+
+      <div id="compatRes" style="display:none;margin-top:10px">
+        <div class="compat-score" id="compatScore">-</div>
+        <div style="font-size:0.7rem;text-align:center;color:var(--muted);margin-bottom:8px">Overall Compatibility</div>
+        <div id="compatMetrics"></div>
+      </div>
+
+      <div class="prog-wrap" id="fProg"><div class="prog-bar" id="fBar"></div></div>
+      <div class="status-msg" id="fStat"></div>
+
+      <div id="aiScores" style="display:none;margin-top:10px">
+        <div style="font-size:0.73rem;font-weight:700;color:var(--accent2);margin-bottom:7px">AI Quality Analysis</div>
+        <div id="aiMetrics"></div>
+      </div>
+
+      <div id="rateBox" style="display:none;margin-top:10px;text-align:center;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px">
+        <div style="font-size:0.78rem;color:var(--muted);margin-bottom:5px">Rate this mix:</div>
+        <div class="star-row" id="starRow"></div>
+        <div id="rateThx" style="display:none;font-size:0.76rem;color:var(--green);margin-top:4px">AI is learning from your rating!</div>
+        <div id="rateInfo" style="font-size:0.7rem;color:var(--muted);margin-top:3px"></div>
+      </div>
+    </div>
+
+    <div class="card" style="flex:1">
+      <div class="card-title">Mixes</div>
+      <div id="mixList" style="display:flex;flex-direction:column;gap:7px">
+        <div style="text-align:center;padding:14px;color:var(--muted);font-size:0.82rem">No mixes yet</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ──────────────── State ────────────────
+var uploadFile = null;
+var currentMixId = null;
+var currentRating = 0;
+var watchActive = false;
+var eventSource = null;
+
+function $(id) { return document.getElementById(id); }
+
+// ──────────────── Stars ────────────────
+(function(){
+  var row = $('starRow');
+  for (var i = 1; i <= 5; i++) {
+    var s = document.createElement('span');
+    s.className = 'star';
+    s.textContent = '\u2605';
+    (function(n){
+      s.onmouseover = function(){ hiliteStars(n); };
+      s.onmouseout  = function(){ hiliteStars(currentRating); };
+      s.onclick     = function(){ doRate(n); };
+    })(i);
+    row.appendChild(s);
+  }
+})();
+
+function hiliteStars(n) {
+  var stars = $('starRow').children;
+  for (var i = 0; i < stars.length; i++) {
+    stars[i].className = 'star' + (i < n ? ' lit' : '');
+  }
+}
+
+function doRate(n) {
+  if (!currentMixId) return;
+  currentRating = n;
+  hiliteStars(n);
+  fetch('/api/rate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mix_id: currentMixId, rating: n})
+  }).then(function(r){ return r.json(); }).then(function(d){
+    $('rateThx').style.display = 'block';
+    if (d.ratings_count) {
+      $('rateInfo').textContent = d.ratings_count + ' ratings collected' +
+        (d.ratings_count >= 3 ? ' \u2014 AI learning active!' : '');
+    }
+    setTimeout(loadMixes, 500);
+  }).catch(function(){});
+}
+
+// ──────────────── SSE Log Stream ────────────────
+function connectLog() {
+  if (eventSource) { eventSource.close(); }
+  var box = $('logBox');
+  box.innerHTML = '';
+  eventSource = new EventSource('/api/stream');
+
+  eventSource.onmessage = function(e) {
+    var text = e.data;
+    var div = document.createElement('div');
+    div.className = 'log-line';
+    if (text.indexOf('PHASE') !== -1 || text.indexOf('===') !== -1 || text.indexOf('---') !== -1) {
+      div.className += ' phase';
+    } else if (text.indexOf('Done!') !== -1 || text.indexOf('COMPLETE') !== -1 ||
+               text.indexOf('complete') !== -1 || text.indexOf('Saved') !== -1) {
+      div.className += ' success';
+    } else if (text.indexOf('Error') !== -1 || text.indexOf('Warning') !== -1 ||
+               text.indexOf('failed') !== -1) {
+      div.className += ' warn';
+    }
+    div.textContent = text;
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+    trackPipeline(text);
+  };
+
+  eventSource.onerror = function() {
+    var div = document.createElement('div');
+    div.className = 'log-line dim';
+    div.textContent = '\u2014 reconnecting... \u2014';
+    box.appendChild(div);
+    setTimeout(connectLog, 3000);
+  };
+}
+
+function clearLog() { $('logBox').innerHTML = ''; }
+
+// ──────────────── Pipeline Tracker ────────────────
+function setStep(id, state) { $(id).className = 'pipe-step ' + state; }
+
+function resetAnalyzePipe() {
+  ['pa1','pa2','pa3','pa4'].forEach(function(id){ $(id).className = 'pipe-step'; });
+  $('analyzePipe').style.display = 'none';
+}
+function resetFusePipe() {
+  ['pf1','pf2','pf3','pf4','pf5','pf6'].forEach(function(id){ $(id).className = 'pipe-step'; });
+  $('fusePipe').style.display = 'none';
+}
+
+function trackPipeline(t) {
+  // Analyze steps
+  if (t.indexOf('Step 1:') !== -1 || t.indexOf('Separating stems') !== -1) {
+    $('analyzePipe').style.display = 'block';
+    $('pipeContext').textContent = 'Analyzing song...';
+    setStep('pa1', 'active');
+  }
+  if (t.indexOf('Step 2:') !== -1) { setStep('pa1', 'done'); }
+  if (t.indexOf('Step 3:') !== -1 || t.indexOf('Generating song embedding') !== -1) {
+    setStep('pa1', 'done'); setStep('pa2', 'active');
+  }
+  if (t.indexOf('Step 4:') !== -1 || t.indexOf('Analyzing song DNA') !== -1) {
+    setStep('pa2', 'done'); setStep('pa3', 'active');
+  }
+  if (t.indexOf('Done! ID:') !== -1) {
+    setStep('pa3', 'done'); setStep('pa4', 'done');
+    $('pipeContext').textContent = 'Analysis complete \u2713';
+    setTimeout(function(){ resetAnalyzePipe(); $('pipeContext').textContent = 'Idle \u2014 waiting for a job'; }, 5000);
+  }
+  // Fuse steps
+  if (t.indexOf('FUSING:') !== -1) {
+    $('fusePipe').style.display = 'block';
+    $('pipeContext').textContent = 'Fusing songs...';
+    setStep('pf1', 'active');
+    resetAnalyzePipe();
+  }
+  if (t.indexOf('PHASE 1: Analyzing') !== -1) { setStep('pf1', 'active'); }
+  if (t.indexOf('PHASE 1.5') !== -1) { setStep('pf1', 'done'); setStep('pf2', 'active'); }
+  if (t.indexOf('PHASE 2: AI DJ') !== -1) {
+    setStep('pf1', 'done'); setStep('pf2', 'done'); setStep('pf3', 'active');
+  }
+  if (t.indexOf('PHASE 3: Refining') !== -1) { setStep('pf3', 'done'); setStep('pf4', 'active'); }
+  if (t.indexOf('PHASE 4: Mastering') !== -1) { setStep('pf4', 'done'); setStep('pf5', 'active'); }
+  if (t.indexOf('COMPLETE:') !== -1) {
+    setStep('pf5', 'done'); setStep('pf6', 'done');
+    $('pipeContext').textContent = 'Fusion complete \u2713';
+    loadMixes();
+    setTimeout(function(){ resetFusePipe(); $('pipeContext').textContent = 'Idle \u2014 waiting for a job'; }, 7000);
+  }
+}
+
+// ──────────────── Upload ────────────────
+$('fileInput').onchange = function() {
+  if (this.files.length) {
+    uploadFile = this.files[0];
+    $('fileName').textContent = uploadFile.name;
+    $('analyzeBtn').disabled = false;
+  }
+};
+
+var dz = $('dropZone');
+dz.ondragover  = function(e){ e.preventDefault(); dz.classList.add('drag'); };
+dz.ondragleave = function(){ dz.classList.remove('drag'); };
+dz.ondrop = function(e){
+  e.preventDefault(); dz.classList.remove('drag');
+  if (e.dataTransfer.files.length) {
+    uploadFile = e.dataTransfer.files[0];
+    $('fileName').textContent = uploadFile.name;
+    $('analyzeBtn').disabled = false;
+  }
+};
+
+$('analyzeBtn').onclick = function() {
+  if (!uploadFile) return;
+  var fd = new FormData();
+  fd.append('file', uploadFile);
+  fd.append('name', uploadFile.name.replace(/\.[^/.]+$/, ''));
+  setProg('a', 10); setStat('a', 'Uploading...'); $('analyzeBtn').disabled = true;
+  fetch('/api/upload', {method: 'POST', body: fd})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (d.success) {
+      setStat('a', 'Processing... (takes a few minutes)');
+      setProg('a', 30);
+      pollJob(d.job_id, 'a', function(){ loadSongs(); });
+    } else {
+      setStat('a', 'Error: ' + d.error, true);
+      $('analyzeBtn').disabled = false;
+    }
+  }).catch(function(e){ setStat('a', 'Error: ' + e.message, true); $('analyzeBtn').disabled = false; });
+};
+
+// ──────────────── Helpers ────────────────
+function setProg(p, pct) { $(p+'Prog').style.display = 'block'; $(p+'Bar').style.width = pct + '%'; }
+function setStat(p, msg, isErr) {
+  var el = $(p+'Stat');
+  el.style.display = 'block';
+  el.textContent = msg;
+  el.className = 'status-msg' + (isErr ? ' err' : '');
+}
+function setStatHTML(p, html) {
+  var el = $(p+'Stat');
+  el.style.display = 'block';
+  el.innerHTML = html;
+  el.className = 'status-msg';
+}
+
+function pollJob(jid, prefix, onDone) {
+  var iv = setInterval(function(){
+    fetch('/api/job/' + jid)
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.success) return;
+      var j = d.job;
+      if (j.progress) setProg(prefix, j.progress);
+      if (j.status === 'completed') {
+        clearInterval(iv);
+        setProg(prefix, 100);
+        setStat(prefix, 'Done!');
+        uploadFile = null;
+        $('fileInput').value = '';
+        $('fileName').textContent = '';
+        $('analyzeBtn').disabled = true;
+        if (onDone) onDone(j.result);
+      } else if (j.status === 'failed') {
+        clearInterval(iv);
+        setStat(prefix, 'Error: ' + (j.error || 'Unknown'), true);
+        $('analyzeBtn').disabled = false;
+      }
+    }).catch(function(){});
+  }, 2000);
+}
+
+// ──────────────── Songs ────────────────
+$('sA').onchange = $('sB').onchange = function() {
+  var ok = $('sA').value && $('sB').value && $('sA').value !== $('sB').value;
+  $('compatBtn').disabled = !ok;
+  $('fuseBtn').disabled = !ok;
+};
+
+function loadSongs() {
+  fetch('/api/songs')
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (!d.success) return;
+    var list = $('songList');
+    list.innerHTML = '';
+    $('sA').innerHTML = '<option value="">Choose song...</option>';
+    $('sB').innerHTML = '<option value="">Choose song...</option>';
+    if (!d.songs.length) {
+      list.innerHTML = '<li style="text-align:center;padding:14px;color:var(--muted);font-size:0.82rem">No songs analyzed yet</li>';
+      return;
+    }
+    d.songs.forEach(function(s) {
+      var li = document.createElement('li');
+      li.className = 'song-item';
+      li.innerHTML =
+        '<div class="song-dot"></div>' +
+        '<div class="song-info">' +
+          '<div class="song-name">' + s.song_id + '</div>' +
+          '<div class="song-meta">' +
+            Math.round(s.duration) + 's \u00b7 ' + (s.key||'?') +
+            ' \u00b7 ' + Math.round(s.tempo) + ' BPM \u00b7 ' + (s.voice_type||'?') +
+          '</div>' +
+        '</div>' +
+        '<button class="del-btn" title="Delete song">\u2715</button>';
+      (function(sid){ li.querySelector('.del-btn').onclick = function(){ deleteSong(sid); }; })(s.song_id);
+      list.appendChild(li);
+      var o1 = document.createElement('option'); o1.value = s.song_id; o1.textContent = s.song_id; $('sA').appendChild(o1);
+      var o2 = document.createElement('option'); o2.value = s.song_id; o2.textContent = s.song_id; $('sB').appendChild(o2);
+    });
+  }).catch(function(){
+    $('songList').innerHTML = '<li style="text-align:center;padding:10px;color:var(--red);font-size:0.82rem">Error loading songs</li>';
+  });
+}
+
+function deleteSong(id) {
+  if (!confirm('Delete ' + id + '? This removes stems, analysis and embeddings.')) return;
+  fetch('/api/songs/' + encodeURIComponent(id), {method: 'DELETE'})
+  .then(function(r){ return r.json(); })
+  .then(function(d){ if (d.success) { loadSongs(); } else { alert('Delete failed: ' + d.error); } })
+  .catch(function(e){ alert('Delete failed: ' + e.message); });
+}
+
+// ──────────────── Compatibility ────────────────
+$('compatBtn').onclick = function() {
+  var a = $('sA').value, b = $('sB').value;
+  if (!a || !b || a === b) return;
+  $('compatBtn').disabled = true;
+  fetch('/api/compatibility/' + encodeURIComponent(a) + '/' + encodeURIComponent(b))
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    $('compatBtn').disabled = false;
+    if (d.success) { showCompat(d.compatibility); }
+    else { alert('Compatibility error: ' + d.error); }
+  }).catch(function(e){ $('compatBtn').disabled = false; alert(e.message); });
+};
+
+function showCompat(c) {
+  $('compatRes').style.display = 'block';
+  $('compatScore').textContent = ((c.overall_score || 0) * 100).toFixed(0) + '%';
+  var m = $('compatMetrics'); m.innerHTML = '';
+  [
+    ['Key', c.key_compatibility], ['Tempo', c.tempo_compatibility],
+    ['Timbre', c.timbre_compatibility], ['Range', c.range_compatibility],
+    ['Structure', c.structure_compatibility], ['Blend', c.vocal_blend_score]
+  ].forEach(function(p) {
+    if (p[1] === undefined) return;
+    var v = p[1] || 0;
+    var col = v >= 0.7 ? 'var(--green)' : v >= 0.4 ? 'var(--yellow)' : 'var(--red)';
+    var row = document.createElement('div'); row.className = 'metric-row';
+    row.innerHTML = '<span style="color:var(--muted)">' + p[0] + '</span>' +
+      '<span style="color:' + col + ';font-weight:600">' + (v * 100).toFixed(0) + '%</span>';
+    m.appendChild(row);
+  });
+}
+
+// ──────────────── Fuse ────────────────
+$('fuseBtn').onclick = function() {
+  var a = $('sA').value, b = $('sB').value;
+  if (!a || !b || a === b) return;
+  setProg('f', 10);
+  setStat('f', 'AI is analyzing and mixing \u2014 this takes a few minutes...');
+  $('aiScores').style.display = 'none';
+  $('rateBox').style.display = 'none';
+  $('fuseBtn').disabled = true;
+  fetch('/api/fuse/' + encodeURIComponent(a) + '/' + encodeURIComponent(b), {method: 'POST'})
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (d.success) { pollFuse(d.job_id); }
+    else { setStat('f', 'Error: ' + d.error, true); $('fuseBtn').disabled = false; }
+  }).catch(function(e){ setStat('f', 'Error: ' + e.message, true); $('fuseBtn').disabled = false; });
+};
+
+function pollFuse(jid) {
+  var iv = setInterval(function(){
+    fetch('/api/job/' + jid)
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.success) return;
+      var j = d.job;
+      if (j.progress) setProg('f', j.progress);
+      if (j.status === 'completed') {
+        clearInterval(iv);
+        $('fuseBtn').disabled = false;
+        onFuseDone(j.result || {});
+      } else if (j.status === 'failed') {
+        clearInterval(iv);
+        $('fuseBtn').disabled = false;
+        setStat('f', 'Error: ' + (j.error || 'Unknown'), true);
+      }
+    }).catch(function(){});
+  }, 2000);
+}
+
+function onFuseDone(r) {
+  setProg('f', 100);
+  if (r.download_url) {
+    setStatHTML('f', 'Fusion complete! \u2014 <a href="' + r.download_url +
+      '" style="color:var(--accent2);font-weight:600">Download Mix</a>');
+  } else {
+    setStat('f', 'Fusion complete!');
+  }
+  if (r.quality_scores) showAIScores(r.quality_scores);
+  if (r.mix_id) {
+    currentMixId = r.mix_id; currentRating = 0;
+    hiliteStars(0);
+    $('rateThx').style.display = 'none';
+    $('rateInfo').textContent = r.ratings_count ? '(' + r.ratings_count + ' ratings so far)' : '';
+    $('rateBox').style.display = 'block';
+  }
+  loadMixes();
+}
+
+function showAIScores(q) {
+  if (!q) return;
+  $('aiScores').style.display = 'block';
+  var m = $('aiMetrics'); m.innerHTML = '';
+  [
+    ['Beat Coherence','beat_coherence'], ['Spectral Balance','spectral_balance'],
+    ['Harmonic Clarity','harmonic_clarity'], ['Vocal Clarity','vocal_clarity'],
+    ['Dynamic Range','dynamic_range'], ['Phase Coherence','phase_coherence'],
+    ['Separation','spectral_separation'], ['Energy','energy_consistency']
+  ].forEach(function(d) {
+    var v = q[d[1]] || 0;
+    var col = v >= 0.7 ? '#22c55e' : v >= 0.4 ? '#eab308' : '#ef4444';
+    var row = document.createElement('div'); row.className = 'ai-score-row';
+    row.innerHTML =
+      '<div class="ai-score-label"><span>' + d[0] + '</span>' +
+      '<span style="color:' + col + ';font-weight:700">' + (v * 100).toFixed(0) + '%</span></div>' +
+      '<div class="ai-bar"><div class="ai-fill" style="width:' + (v * 100) + '%;background:' + col + '"></div></div>';
+    m.appendChild(row);
+  });
+  var overall = q.overall || 0;
+  var ocol = overall >= 0.7 ? '#22c55e' : overall >= 0.4 ? '#eab308' : '#ef4444';
+  var summary = document.createElement('div');
+  summary.style.cssText = 'text-align:center;font-size:0.95rem;font-weight:800;margin-top:8px;color:' + ocol;
+  summary.textContent = 'Overall: ' + (overall * 100).toFixed(0) + '%';
+  m.appendChild(summary);
+}
+
+// ──────────────── Mixes ────────────────
+function loadMixes() {
+  fetch('/api/mixes')
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (!d.success) return;
+    var list = $('mixList'); list.innerHTML = '';
+    if (!d.mixes.length) {
+      list.innerHTML = '<div style="text-align:center;padding:14px;color:var(--muted);font-size:0.82rem">No mixes yet</div>';
+      return;
+    }
+    d.mixes.forEach(function(m) {
+      var q = m.overall || 0;
+      var col = q >= 0.7 ? '#22c55e' : q >= 0.4 ? '#eab308' : '#ef4444';
+      var date = m.created_at ? new Date(m.created_at).toLocaleDateString() : '';
+      var card = document.createElement('div'); card.className = 'mix-card';
+      card.innerHTML =
+        '<div class="mix-songs"><em>' + (m.song_a||'?') + '</em> + <em>' + (m.song_b||'?') + '</em></div>' +
+        '<div class="mix-q-row">' +
+          '<div class="mix-q-bar"><div class="mix-q-fill" style="width:' + (q*100) + '%;background:' + col + '"></div></div>' +
+          '<span class="mix-q-val" style="color:' + col + '">' + (q*100).toFixed(0) + '%</span>' +
+        '</div>' +
+        '<div class="mix-date">' + date + '</div>' +
+        '<div>' +
+          (m.download_url
+            ? '<a href="' + m.download_url + '" class="btn btn-green btn-sm" style="text-decoration:none;display:inline-block">Download</a>'
+            : '<span style="font-size:0.75rem;color:var(--muted)">No audio file</span>') +
+        '</div>';
+      list.appendChild(card);
+    });
+  }).catch(function(){});
+}
+
+// ──────────────── Watch Folder ────────────────
+function loadWatchStatus() {
+  fetch('/api/watch/status')
+  .then(function(r){ return r.json(); })
+  .then(function(d){ applyWatchUI(d.active, d.folder); })
+  .catch(function(){});
+}
+
+function applyWatchUI(active, folder) {
+  watchActive = active;
+  var btn = $('watchBtn');
+  if (active) {
+    btn.className = 'watch-btn active';
+    $('watchDot').className = 'watch-dot on';
+    $('watchLabel').textContent = 'Watch: ON';
+    btn.title = folder ? ('Watching: ' + folder) : '';
+  } else {
+    btn.className = 'watch-btn';
+    $('watchDot').className = 'watch-dot';
+    $('watchLabel').textContent = 'Watch Folder';
+    btn.title = '';
+  }
+}
+
+function toggleWatch() {
+  fetch('/api/watch/toggle', {method: 'POST'})
+  .then(function(r){ return r.json(); })
+  .then(function(d){ applyWatchUI(d.active, d.folder); })
+  .catch(function(){});
+}
+
+// ──────────────── Init ────────────────
+loadSongs();
+loadMixes();
+loadWatchStatus();
+connectLog();
+setInterval(loadMixes, 15000);
+setInterval(loadSongs, 20000);
+</script>
+</body>
+</html>

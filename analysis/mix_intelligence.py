@@ -22,7 +22,7 @@ Each dimension produces a 0.0-1.0 score.
 The evaluator then recommends adjustments to improve low-scoring areas.
 
 Usage:
-    from vocalfusion.mix_intelligence import MixIntelligence
+    from analysis.mix_intelligence import MixIntelligence
     ai = MixIntelligence(sample_rate=44100)
 
     # Score a mix
@@ -176,9 +176,10 @@ class MixIntelligence:
         # Normalize
         autocorr = autocorr / autocorr[0]
 
-        # Look for strong peak between 0.3-2 seconds (30-200 BPM range)
-        min_lag = int(0.3 * self.sr / 512)   # ~0.3s in frames
-        max_lag = min(int(2.0 * self.sr / 512), len(autocorr) - 1)
+        # Cover 50–300 BPM: beat period = 60/BPM seconds
+        # 300 BPM → 0.20s, 50 BPM → 1.20s  (extend range from old 0.3–2.0)
+        min_lag = int(0.20 * self.sr / 512)   # 300 BPM upper bound
+        max_lag = min(int(1.25 * self.sr / 512), len(autocorr) - 1)  # 48 BPM lower bound
 
         if min_lag >= max_lag:
             return 0.5
@@ -371,16 +372,14 @@ class MixIntelligence:
         # Ratio: how much of the mix energy is in the vocal region
         vocal_ratio = vocal_energy / full_energy
 
-        # Good mix: vocal region is prominent but not overwhelming
-        # Target ratio: 0.15-0.35
-        if vocal_ratio < 0.10:
-            score = vocal_ratio / 0.10 * 0.5  # Too quiet
-        elif vocal_ratio < 0.15:
-            score = 0.5 + (vocal_ratio - 0.10) / 0.05 * 0.3
-        elif vocal_ratio <= 0.35:
-            score = 0.8 + (0.2 * (1.0 - abs(vocal_ratio - 0.25) / 0.10))
-        else:
-            score = max(0.3, 1.0 - (vocal_ratio - 0.35) * 3)  # Too harsh
+        # Score on a smooth curve centred at 0.20 (DJ-style: beat-forward).
+        # Old hardcoded thresholds (0.15–0.35) didn't adapt to song content.
+        # Gaussian-shaped reward: peaks at target, falls off symmetrically.
+        TARGET = 0.20
+        WIDTH  = 0.10   # ±1 sigma
+        score  = float(np.exp(-0.5 * ((vocal_ratio - TARGET) / WIDTH) ** 2))
+        # Floor at 0.2 so total silence (no vocals at all) doesn't drag overall score to 0
+        score  = 0.2 + 0.8 * score
 
         return float(np.clip(score, 0, 1))
 
@@ -866,7 +865,7 @@ class MixIntelligence:
 
         Returns the configuration that scores highest.
         """
-        from vocalfusion.dsp import EnhancedDSP
+        from audio.dsp import EnhancedDSP
         dsp = EnhancedDSP(self.sr)
 
         tempo_a = analysis_a.get('tempo', 120)
