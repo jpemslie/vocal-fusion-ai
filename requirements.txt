@@ -28,5 +28,8 @@ mir_eval>=0.6.0
 # Progress bars
 tqdm>=4.60.0
 
+# True LUFS loudness measurement (ITU-R BS.1770-4)
+pyloudnorm>=0.1.0
+
 # Enterprise-grade vocal activity detection (used in _extract_vocal_phrases)
 silero-vad>=5.0

@@ -31,6 +31,18 @@ import librosa
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, field
 
+try:
+    import pyloudnorm as pyln
+    _PYLOUDNORM = True
+except ImportError:
+    _PYLOUDNORM = False
+
+try:
+    from pedalboard import Pedalboard, Compressor as PBCompressor
+    _PEDALBOARD = True
+except ImportError:
+    _PEDALBOARD = False
+
 from audio.dsp import EnhancedDSP
 from analysis.mix_intelligence import MixIntelligence
 from analysis.song_dna import SongDNA
@@ -1282,12 +1294,42 @@ class AIDJ:
         return audio * min(target / rms, 8.0)
 
     def _light_master(self, audio):
-        rms = np.sqrt(np.mean(audio ** 2))
-        if rms < 1e-8:
+        """Bus compression → soft-clip → LUFS normalisation → true peak limit."""
+        if audio is None or np.sqrt(np.mean(audio ** 2)) < 1e-8:
             return audio
-        target = 10 ** (-14 / 20)
-        audio = audio * min(target / rms, 5.0)
+
+        # 1. Bus compressor — glue the mix
+        if _PEDALBOARD:
+            try:
+                board = Pedalboard([PBCompressor(
+                    threshold_db=-18.0, ratio=2.0,
+                    attack_ms=10.0, release_ms=100.0)])
+                audio = board(audio.astype(np.float32), self.sr).astype(np.float64)
+                audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+            except Exception:
+                pass
+
+        # 2. Soft-clip peaks > 0.9 (tanh curve — no harsh digital clipping)
+        audio = np.tanh(audio / 0.9) * 0.9
+
+        # 3. Normalize to -14 LUFS (true integrated loudness)
+        if _PYLOUDNORM:
+            try:
+                meter = pyln.Meter(self.sr)
+                loudness = meter.integrated_loudness(audio.reshape(-1, 1))
+                if np.isfinite(loudness) and loudness < -1.0:
+                    audio = pyln.normalize.loudness(
+                        audio.reshape(-1, 1), loudness, -14.0).ravel()
+            except Exception:
+                pass
+        else:
+            rms = np.sqrt(np.mean(audio ** 2))
+            if rms > 1e-8:
+                audio = audio * min(10 ** (-14 / 20) / rms, 5.0)
+
+        # 4. True peak limit to -1 dBTP (0.891)
         peak = np.max(np.abs(audio))
-        if peak > 0.95:
-            audio *= 0.95 / peak
+        if peak > 0.891:
+            audio *= 0.891 / peak
+
         return audio
