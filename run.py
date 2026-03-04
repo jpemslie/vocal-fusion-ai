@@ -352,11 +352,9 @@ class VocalFusion:
         if emb_b is None:
             emb_b = self.embedder.embed_song(song_b_id, stems_b)
 
-        # Ask predictor if it has a direction suggestion
-        predicted_params = {}
-        direction_suggestion = self.predictor.suggest_direction(song_a_id, song_b_id)
-        if direction_suggestion:
-            predicted_params['direction'] = direction_suggestion
+        # Ask predictor for full parameter suggestions
+        predicted_params = self.predictor.suggest_params(
+            song_a_id, song_b_id, emb_a=emb_a, emb_b=emb_b)
 
         print("Step 2: AI mixing (v10.0)...")
         mix_result = self.mixing_engine.create_mix(
@@ -379,6 +377,8 @@ class VocalFusion:
                     inst_rms=params_used.get('inst_rms', 0.05),
                     emb_a=emb_a,
                     emb_b=emb_b,
+                    duck_depth=predicted_params.get('duck_depth', 0.3),
+                    comp_threshold=predicted_params.get('comp_threshold', -18.0),
                 )
                 # Auto-rate using the AI quality score so the predictor learns
                 # from every mix, not just the ones the user manually rates.
@@ -449,6 +449,85 @@ class VocalFusion:
         if best_id:
             print(f"  Best match for {song_id}: {best_id} (similarity={best_sim:.3f})")
         return best_id
+
+    def select_next_song(self, current_id: str):
+        """
+        Return the most compatible song ID for current_id.
+        Score = 0.5 * embedding_similarity + 0.3 * key_compat + 0.2 * tempo_compat.
+        """
+        candidates = [sid for sid in self._list_analyzed_ids() if sid != current_id]
+        if not candidates:
+            return None
+
+        emb_cur = self.embedder.load_cached(current_id)
+        best_id, best_score = None, -1.0
+
+        for sid in candidates:
+            score = 0.0
+            if emb_cur is not None:
+                emb_sid = self.embedder.load_cached(sid)
+                if emb_sid is not None:
+                    score += 0.5 * float(np.dot(emb_cur, emb_sid))
+            try:
+                compat = self.analyze_compatibility(current_id, sid)
+                score += 0.3 * compat['key_compatibility']
+                score += 0.2 * compat['tempo_compatibility']
+            except Exception:
+                score += 0.25
+            if score > best_score:
+                best_score, best_id = score, sid
+
+        if best_id:
+            print(f"  Best next song: {best_id} (score={best_score:.3f})")
+        return best_id
+
+    def dj_session(self, start_id: str, count: int = 5, learn: bool = False):
+        """
+        Autonomous DJ loop: select next song → fuse → prompt for rating → repeat.
+        With --learn, retrains the predictor after each rating.
+        """
+        import time
+        current_id = start_id
+        print(f"\n{'='*60}")
+        print(f"  AUTO DJ SESSION — {count} mix(es) from: {start_id}")
+        print(f"  Learning mode: {'ON' if learn else 'OFF'}")
+        print(f"{'='*60}")
+
+        for i in range(count):
+            print(f"\n[Mix {i+1}/{count}] Current: {current_id}")
+            next_id = self.select_next_song(current_id)
+            if next_id is None:
+                print("  No compatible songs found. Session complete.")
+                break
+
+            print(f"  Next: {next_id}")
+            try:
+                result = self.fuse_two_songs(current_id, next_id)
+                mix_dir = self.base_dir / "mixes" / f"{current_id}_{next_id}"
+                print(f"\n  Output: {mix_dir / 'full_mix.wav'}")
+
+                # Rating prompt
+                try:
+                    raw = input("\n  Rate this mix 1-5 (Enter to skip): ").strip()
+                    if raw.isdigit():
+                        rating = max(1, min(5, int(raw)))
+                        self.predictor.add_rating(result['mix_id'], rating)
+                        if learn and self.predictor.get_ratings_count() >= 5:
+                            print("  Retraining predictor on new rating...")
+                            self.predictor.train()
+                except (EOFError, KeyboardInterrupt):
+                    pass
+
+            except Exception as e:
+                import traceback
+                print(f"  Error: {e}")
+                traceback.print_exc()
+
+            current_id = next_id
+
+        print(f"\n{'='*60}")
+        print(f"  DJ session complete ({i+1} mix(es)).")
+        print(f"{'='*60}\n")
 
     def _find_top_pairs(self, song_ids, top_n=3):
         """Return top_n (a, b, similarity) pairs by MERT cosine similarity."""
@@ -925,6 +1004,14 @@ def main():
     p.add_argument('--no-fuse', action='store_true',
                    help='Analyze only, do not auto-fuse')
 
+    p = sub.add_parser('dj',
+        help='Autonomous DJ session: auto-select songs, fuse, rate, repeat')
+    p.add_argument('start_song', help='Song ID to start the session from')
+    p.add_argument('--count', type=int, default=5,
+                   help='Number of mixes to create (default: 5)')
+    p.add_argument('--learn', action='store_true',
+                   help='Retrain predictor in real-time after each rating')
+
     args = parser.parse_args()
     ir = getattr(args, 'ir', None)
 
@@ -987,6 +1074,14 @@ def main():
             folder=args.folder,
             auto_fuse=not args.no_fuse,
             top_n=args.top,
+        )
+
+    elif args.cmd == 'dj':
+        engine = VocalFusion(ir_path=ir)
+        engine.dj_session(
+            start_id=args.start_song,
+            count=args.count,
+            learn=args.learn,
         )
 
     else:

@@ -186,10 +186,16 @@ class AIDJ:
         print(f"\n  DECISION 2: Vocal Level")
         print(f"  {'─'*50}")
 
-        best_vox_rms, best_inst_rms = self._find_best_levels(
-            vox_audio, beat_drums, beat_bass, beat_other)
-        print(f"    → Vocals: {best_vox_rms:.3f} RMS, "
-              f"Inst: {best_inst_rms:.3f} RMS")
+        if predicted_params.get('vox_rms') and predicted_params.get('inst_rms'):
+            best_vox_rms = float(predicted_params['vox_rms'])
+            best_inst_rms = float(predicted_params['inst_rms'])
+            print(f"    → Using predicted levels: "
+                  f"Vocals {best_vox_rms:.3f} RMS, Inst {best_inst_rms:.3f} RMS")
+        else:
+            best_vox_rms, best_inst_rms = self._find_best_levels(
+                vox_audio, beat_drums, beat_bass, beat_other)
+            print(f"    → Vocals: {best_vox_rms:.3f} RMS, "
+                  f"Inst: {best_inst_rms:.3f} RMS")
 
         # ============================================================
         # DECISION 3: Best beat region (scored experiment)

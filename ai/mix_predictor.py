@@ -49,7 +49,9 @@ class MixPredictor:
                         direction: str, key_shift: int,
                         vox_rms: float, inst_rms: float,
                         emb_a: Optional[np.ndarray] = None,
-                        emb_b: Optional[np.ndarray] = None):
+                        emb_b: Optional[np.ndarray] = None,
+                        duck_depth: float = 0.3,
+                        comp_threshold: float = -18.0):
         """Save mixing parameters before user rates."""
         params = self._load_json(self.params_file, default={})
         params[mix_id] = {
@@ -59,6 +61,8 @@ class MixPredictor:
             'key_shift': int(key_shift),
             'vox_rms': float(vox_rms),
             'inst_rms': float(inst_rms),
+            'duck_depth': float(duck_depth),
+            'comp_threshold': float(comp_threshold),
             'emb_a': emb_a.tolist() if emb_a is not None else None,
             'emb_b': emb_b.tolist() if emb_b is not None else None,
             'timestamp': datetime.now().isoformat(),
@@ -99,43 +103,107 @@ class MixPredictor:
         return len([r for r in ratings if 'rating' in r])
 
     # ------------------------------------------------------------------
-    # DIRECTION SUGGESTION
+    # PARAMETER SUGGESTION
     # ------------------------------------------------------------------
 
-    def suggest_direction(self, song_a: str, song_b: str) -> Optional[str]:
+    def suggest_params(self, song_a: str, song_b: str,
+                       emb_a: Optional[np.ndarray] = None,
+                       emb_b: Optional[np.ndarray] = None) -> Dict:
         """
-        Suggest direction based on past ratings for this song pair.
-        Returns 'a_vocals', 'b_vocals', or None (not enough data).
+        Suggest full mixing parameters by averaging top-rated similar mixes.
+        Uses embedding cosine similarity to find neighbors; falls back to
+        exact-pair direction matching if no embeddings are available.
+        Returns dict with keys: direction, vox_rms, inst_rms, key_shift,
+        duck_depth, comp_threshold (empty dict if not enough data).
         """
         ratings = self._load_json(self.ratings_file, default=[])
         rated = [r for r in ratings if 'rating' in r]
 
         if len(rated) < MIN_RATINGS_TO_TRAIN:
-            return None
+            return {}
 
-        # Find ratings for this exact pair (or flipped)
+        # ── Embedding-similarity path ────────────────────────────────
+        if emb_a is not None and emb_b is not None:
+            emb_rated = [r for r in rated if r.get('emb_a') is not None]
+            if emb_rated:
+                query = np.concatenate([
+                    np.array(emb_a, dtype=np.float32),
+                    np.array(emb_b, dtype=np.float32),
+                ])
+                scored = []
+                for r in emb_rated:
+                    try:
+                        ra = np.array(r['emb_a'], dtype=np.float32)
+                        rb = np.array(r['emb_b'], dtype=np.float32)
+                        if len(ra) != len(emb_a) or len(rb) != len(emb_b):
+                            continue
+                        key_vec = np.concatenate([ra, rb])
+                        norm = np.linalg.norm(query) * np.linalg.norm(key_vec) + 1e-10
+                        sim = float(np.dot(query, key_vec) / norm)
+                        scored.append((sim, r))
+                    except Exception:
+                        continue
+
+                if scored:
+                    scored.sort(key=lambda x: x[0], reverse=True)
+                    top_k = scored[:5]
+
+                    # Weighted average — weight = similarity * normalised_rating
+                    total_w = vox_w = inst_w = ks_w = duck_w = comp_w = 0.0
+                    dir_votes: Dict[str, float] = {'a_vocals': 0.0, 'b_vocals': 0.0}
+                    for sim, r in top_k:
+                        w = max(sim, 0.0) * (r['rating'] / 5.0)
+                        total_w += w
+                        vox_w   += w * r.get('vox_rms',        0.09)
+                        inst_w  += w * r.get('inst_rms',        0.12)
+                        ks_w    += w * r.get('key_shift',       0)
+                        duck_w  += w * r.get('duck_depth',      0.3)
+                        comp_w  += w * r.get('comp_threshold', -18.0)
+                        dir_votes[r.get('direction', 'a_vocals')] += w
+
+                    if total_w > 1e-6:
+                        result = {
+                            'direction':      max(dir_votes, key=dir_votes.get),
+                            'vox_rms':        float(vox_w  / total_w),
+                            'inst_rms':       float(inst_w / total_w),
+                            'key_shift':      int(round(ks_w   / total_w)),
+                            'duck_depth':     float(duck_w / total_w),
+                            'comp_threshold': float(comp_w / total_w),
+                        }
+                        print(f"MixPredictor: Params from {len(top_k)} similar mixes "
+                              f"(top sim={top_k[0][0]:.3f})")
+                        print(f"  direction={result['direction']}, "
+                              f"vox_rms={result['vox_rms']:.3f}, "
+                              f"inst_rms={result['inst_rms']:.3f}, "
+                              f"key_shift={result['key_shift']}")
+                        return result
+
+        # ── Exact-pair fallback (no embeddings) ─────────────────────
         pair = []
         for r in rated:
             a, b = r.get('song_a'), r.get('song_b')
             if a == song_a and b == song_b:
                 pair.append((r['direction'], r['rating']))
             elif a == song_b and b == song_a:
-                # Flip direction to match the requested orientation
                 flipped = 'b_vocals' if r['direction'] == 'a_vocals' else 'a_vocals'
                 pair.append((flipped, r['rating']))
 
         if not pair:
-            return None
+            return {}
 
-        scores: Dict[str, List[float]] = {}
+        dir_scores: Dict[str, List[float]] = {}
         for d, rval in pair:
-            scores.setdefault(d, []).append(float(rval))
-
-        best_dir = max(scores, key=lambda d: sum(scores[d]) / len(scores[d]))
-        avg = sum(scores[best_dir]) / len(scores[best_dir])
+            dir_scores.setdefault(d, []).append(float(rval))
+        best_dir = max(dir_scores, key=lambda d: sum(dir_scores[d]) / len(dir_scores[d]))
+        avg = sum(dir_scores[best_dir]) / len(dir_scores[best_dir])
         print(f"MixPredictor: Suggesting direction '{best_dir}' "
-              f"(avg {avg:.1f} from {len(pair)} past mixes)")
-        return best_dir
+              f"(avg {avg:.1f} from {len(pair)} exact-pair mixes)")
+        return {'direction': best_dir}
+
+    def suggest_direction(self, song_a: str, song_b: str) -> Optional[str]:
+        """Legacy wrapper — returns just the direction string."""
+        params = self.suggest_params(song_a, song_b)
+        return params.get('direction')
 
     # ------------------------------------------------------------------
     # MODEL — pure numpy 2-layer MLP
