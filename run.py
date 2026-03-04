@@ -659,6 +659,111 @@ class VocalFusion:
 
 
 # ============================================================================
+# DJ SESSION STATE
+# ============================================================================
+
+class DJSession:
+    """State machine for an auto-DJ session running in a background thread."""
+
+    def __init__(self, session_id, start_song, count, learn):
+        self.session_id = session_id
+        self.start_song = start_song
+        self.count = count
+        self.learn = learn
+        self.mix_n = 0
+        self.status = 'starting'   # starting|selecting|mixing|waiting_rating|complete|stopped|error
+        self.current_song = start_song
+        self.next_song = None
+        self.mix_id = None
+        self.download_url = None
+        self.quality_scores = None
+        self.error = None
+        self.stop_event = threading.Event()
+        self._rating_event = threading.Event()
+        self._pending_rating = None
+
+    def to_dict(self):
+        return {
+            'session_id':   self.session_id,
+            'status':       self.status,
+            'mix_n':        self.mix_n,
+            'total':        self.count,
+            'current_song': self.current_song,
+            'next_song':    self.next_song,
+            'mix_id':       self.mix_id,
+            'download_url': self.download_url,
+            'quality_scores': safe_serialize(self.quality_scores),
+            'error':        self.error,
+        }
+
+
+dj_sessions: Dict[str, DJSession] = {}
+
+
+def _run_dj_session(vf_engine, session: DJSession):
+    """Background thread — drives the DJ loop."""
+    try:
+        for i in range(session.count):
+            if session.stop_event.is_set():
+                break
+
+            session.mix_n = i + 1
+            session.status = 'selecting'
+            print(f"\n[DJ] Mix {i+1}/{session.count}: selecting next song...")
+
+            next_id = vf_engine.select_next_song(session.current_song)
+            if next_id is None:
+                session.error = 'No more compatible songs found.'
+                break
+
+            session.next_song = next_id
+            session.status = 'mixing'
+            print(f"[DJ] Mixing: {session.current_song} → {next_id}")
+
+            try:
+                result = vf_engine.fuse_two_songs(session.current_song, next_id)
+                mix_dir = vf_engine.base_dir / 'mixes' / f'{session.current_song}_{next_id}'
+                session.mix_id = result.get('mix_id')
+                session.download_url = (
+                    f'/download/{session.current_song}_{next_id}'
+                    if (mix_dir / 'full_mix.wav').exists() else None)
+                session.quality_scores = result.get('quality_scores')
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                session.status = 'error'
+                session.error = str(e)
+                break
+
+            session.status = 'waiting_rating'
+            print(f"[DJ] Mix ready — waiting for rating (5-min window)...")
+            session._rating_event.clear()
+            session._rating_event.wait(timeout=300)
+
+            if session._pending_rating is not None:
+                try:
+                    vf_engine.predictor.add_rating(session.mix_id, session._pending_rating)
+                    if session.learn and vf_engine.predictor.get_ratings_count() >= 5:
+                        print("[DJ] Retraining predictor...")
+                        vf_engine.predictor.train()
+                except Exception:
+                    pass
+                session._pending_rating = None
+
+            if session.stop_event.is_set():
+                break
+
+            session.current_song = next_id
+
+        if not session.stop_event.is_set() and session.status not in ('error',):
+            session.status = 'complete'
+            print(f"\n[DJ] Session complete — {session.mix_n} mix(es) created.")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        session.status = 'error'
+        session.error = str(e)
+
+
+# ============================================================================
 # WEB APP
 # ============================================================================
 
@@ -957,6 +1062,68 @@ def watch_toggle():
         _watch_thread = threading.Thread(target=_run, daemon=True)
         _watch_thread.start()
         return jsonify({'active': True, 'folder': str(watch_dir.resolve())})
+
+
+# ============================================================================
+# DJ SESSION ROUTES
+# ============================================================================
+
+@web_app.route('/api/dj/start', methods=['POST'])
+def dj_start():
+    global engine
+    data = request.get_json() or {}
+    start_song = data.get('start_song')
+    if not start_song:
+        return jsonify({'success': False, 'error': 'start_song required'}), 400
+    count = max(1, min(20, int(data.get('count', 5))))
+    learn = bool(data.get('learn', False))
+    session_id = str(uuid.uuid4())
+    session = DJSession(session_id, start_song, count, learn)
+    dj_sessions[session_id] = session
+    threading.Thread(target=_run_dj_session, args=(engine, session),
+                     daemon=True).start()
+    return jsonify({'success': True, 'session_id': session_id})
+
+
+@web_app.route('/api/dj/<session_id>')
+def dj_status(session_id):
+    session = dj_sessions.get(session_id)
+    if not session:
+        return jsonify({'success': False, 'error': 'Session not found'}), 404
+    return jsonify({'success': True, 'session': session.to_dict()})
+
+
+@web_app.route('/api/dj/<session_id>/rate', methods=['POST'])
+def dj_rate_mix(session_id):
+    session = dj_sessions.get(session_id)
+    if not session:
+        return jsonify({'success': False, 'error': 'Session not found'}), 404
+    data = request.get_json() or {}
+    rating = data.get('rating')
+    if rating is not None:
+        session._pending_rating = max(1, min(5, int(rating)))
+    session._rating_event.set()
+    return jsonify({'success': True})
+
+
+@web_app.route('/api/dj/<session_id>/skip', methods=['POST'])
+def dj_skip_mix(session_id):
+    session = dj_sessions.get(session_id)
+    if not session:
+        return jsonify({'success': False, 'error': 'Session not found'}), 404
+    session._rating_event.set()
+    return jsonify({'success': True})
+
+
+@web_app.route('/api/dj/<session_id>/stop', methods=['POST'])
+def dj_stop_session(session_id):
+    session = dj_sessions.get(session_id)
+    if not session:
+        return jsonify({'success': False, 'error': 'Session not found'}), 404
+    session.stop_event.set()
+    session._rating_event.set()
+    session.status = 'stopped'
+    return jsonify({'success': True})
 
 
 # ============================================================================

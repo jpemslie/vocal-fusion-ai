@@ -297,6 +297,17 @@ select:focus { border-color: var(--accent); }
 .mix-q-val { font-size: 0.72rem; font-weight: 700; width: 30px; text-align: right; }
 .mix-date { font-size: 0.68rem; color: var(--muted); }
 
+/* ── Auto DJ ── */
+.dj-dots { display: flex; gap: 4px; align-items: center; }
+.dj-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); transition: 0.3s; flex-shrink: 0; }
+.dj-dot.done   { background: var(--green); }
+.dj-dot.active { background: var(--accent2); box-shadow: 0 0 6px var(--accent2); animation: blink 1.5s infinite; }
+.dj-flow { background: var(--surface2); border-radius: 7px; padding: 9px; margin-bottom: 7px; }
+.dj-flow-label { font-size: 0.65rem; color: var(--muted); margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.07em; }
+.dj-flow-songs { font-size: 0.8rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dj-flow-songs em { color: var(--accent2); font-style: normal; }
+.dj-status { font-size: 0.78rem; color: var(--muted); text-align: center; margin-bottom: 7px; min-height: 18px; }
+
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -433,6 +444,71 @@ select:focus { border-color: var(--accent); }
         <div class="star-row" id="starRow"></div>
         <div id="rateThx" style="display:none;font-size:0.76rem;color:var(--green);margin-top:4px">AI is learning from your rating!</div>
         <div id="rateInfo" style="font-size:0.7rem;color:var(--muted);margin-top:3px"></div>
+      </div>
+    </div>
+
+    <!-- Auto DJ card -->
+    <div class="card" id="djCard">
+      <div class="card-title">Auto DJ</div>
+
+      <!-- Setup (idle) -->
+      <div id="djSetup">
+        <div style="font-size:0.73rem;color:var(--muted);margin-bottom:4px">Starting song</div>
+        <select id="djStartSong"><option value="">Choose song...</option></select>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+          <div style="flex:1">
+            <div style="font-size:0.73rem;color:var(--muted);margin-bottom:4px">Mixes</div>
+            <input type="number" id="djCount" value="5" min="1" max="20"
+              style="width:100%;padding:7px 10px;border:1px solid var(--border);
+                     border-radius:7px;background:var(--surface2);color:var(--text);
+                     font-size:0.85rem;outline:none">
+          </div>
+          <label style="display:flex;align-items:center;gap:5px;cursor:pointer;
+                        padding-top:14px;font-size:0.8rem;white-space:nowrap">
+            <input type="checkbox" id="djLearn"
+              style="accent-color:var(--accent);width:14px;height:14px"> Learn
+          </label>
+        </div>
+        <button class="btn btn-green" id="djStartBtn" disabled>&#9654; Start Auto DJ</button>
+      </div>
+
+      <!-- Running session -->
+      <div id="djSession" style="display:none">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <div class="dj-dots" id="djDots"></div>
+          <span id="djProgLabel" style="font-size:0.73rem;color:var(--muted)"></span>
+        </div>
+
+        <div class="dj-flow" id="djFlowBox" style="display:none">
+          <div class="dj-flow-label">Now mixing</div>
+          <div class="dj-flow-songs" id="djFlowText"></div>
+        </div>
+
+        <div class="dj-status" id="djStatusText"></div>
+
+        <!-- Mix ready: download + quality + stars -->
+        <div id="djMixReady" style="display:none">
+          <a id="djDlLink" href="#" class="btn btn-green btn-sm"
+             style="text-decoration:none;text-align:center;display:block;margin-bottom:7px">
+            &#8681; Download Mix
+          </a>
+          <div id="djQuality" style="text-align:center;font-size:0.82rem;font-weight:700;margin-bottom:8px"></div>
+          <div style="background:var(--surface2);border:1px solid var(--border);
+                      border-radius:8px;padding:10px;text-align:center">
+            <div style="font-size:0.74rem;color:var(--muted);margin-bottom:5px">Rate to advance:</div>
+            <div class="star-row" id="djStarRow" style="font-size:1.4rem"></div>
+            <button class="btn btn-outline btn-sm" onclick="djSkip()"
+                    style="margin-top:7px;width:100%">Skip</button>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <button class="btn btn-sm" id="djStopBtn"
+            style="background:transparent;border:1px solid var(--border);color:var(--muted);flex:1"
+            onclick="stopDjSession()">&#9646;&#9646; Stop</button>
+          <button class="btn btn-green btn-sm" id="djNewBtn"
+            style="display:none;flex:1" onclick="resetDjUI()">New Session</button>
+        </div>
       </div>
     </div>
 
@@ -669,6 +745,156 @@ function pollJob(jid, prefix, onDone) {
   }, 2000);
 }
 
+// ──────────────── Auto DJ ────────────────
+var djSessionId = null, djRating = 0, djPollIv = null;
+
+(function(){
+  var row = $('djStarRow');
+  for (var i = 1; i <= 5; i++) {
+    var s = document.createElement('span');
+    s.className = 'star'; s.textContent = '\u2605';
+    (function(n){
+      s.onmouseover = function(){ djHilite(n); };
+      s.onmouseout  = function(){ djHilite(djRating); };
+      s.onclick     = function(){ djDoRate(n); };
+    })(i);
+    row.appendChild(s);
+  }
+})();
+
+function djHilite(n) {
+  var stars = $('djStarRow').querySelectorAll('.star');
+  stars.forEach(function(s, i){ s.className = 'star' + (i < n ? ' lit' : ''); });
+}
+
+function djDoRate(n) {
+  if (!djSessionId) return;
+  djRating = n; djHilite(n);
+  $('djMixReady').style.display = 'none';
+  fetch('/api/dj/' + djSessionId + '/rate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({rating: n})
+  }).catch(function(){});
+}
+
+function djSkip() {
+  if (!djSessionId) return;
+  $('djMixReady').style.display = 'none';
+  fetch('/api/dj/' + djSessionId + '/skip', {method: 'POST'}).catch(function(){});
+}
+
+function stopDjSession() {
+  if (!djSessionId) return;
+  fetch('/api/dj/' + djSessionId + '/stop', {method: 'POST'})
+  .then(function(){ resetDjUI(); }).catch(function(){});
+}
+
+$('djStartSong').onchange = function(){ $('djStartBtn').disabled = !this.value; };
+
+$('djStartBtn').onclick = function() {
+  var start = $('djStartSong').value;
+  if (!start) return;
+  var n = Math.min(20, Math.max(1, parseInt($('djCount').value) || 5));
+  fetch('/api/dj/start', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({start_song: start, count: n, learn: $('djLearn').checked})
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(d){
+    if (!d.success) { alert('Error: ' + d.error); return; }
+    djSessionId = d.session_id;
+    $('djSetup').style.display = 'none';
+    $('djSession').style.display = 'block';
+    $('djNewBtn').style.display = 'none';
+    $('djStopBtn').style.display = 'block';
+    buildDjDots(n);
+    if (djPollIv) clearInterval(djPollIv);
+    djPollIv = setInterval(pollDj, 2500);
+  }).catch(function(e){ alert(e.message); });
+};
+
+function buildDjDots(n) {
+  var c = $('djDots'); c.innerHTML = '';
+  for (var i = 0; i < Math.min(n, 12); i++) {
+    var d = document.createElement('div');
+    d.className = 'dj-dot'; d.id = 'djDot' + i;
+    c.appendChild(d);
+  }
+}
+
+function pollDj() {
+  if (!djSessionId) return;
+  fetch('/api/dj/' + djSessionId)
+  .then(function(r){ return r.json(); })
+  .then(function(d){ if (d.success) applyDjState(d.session); })
+  .catch(function(){});
+}
+
+function applyDjState(s) {
+  // Progress dots
+  for (var i = 0; i < (s.total || 0); i++) {
+    var dot = $('djDot' + i);
+    if (!dot) continue;
+    dot.className = 'dj-dot' + (i < s.mix_n - 1 ? ' done' : i === s.mix_n - 1 ? ' active' : '');
+  }
+  $('djProgLabel').textContent = 'Mix ' + s.mix_n + ' / ' + s.total;
+
+  // Current flow
+  if (s.current_song && s.next_song) {
+    $('djFlowBox').style.display = 'block';
+    $('djFlowText').innerHTML =
+      '<em>' + s.current_song + '</em>' +
+      ' <span style="color:var(--accent)">&#9658;</span> ' +
+      '<em>' + s.next_song + '</em>';
+  }
+
+  // Status text
+  var labels = {
+    starting:       'Starting...',
+    selecting:      'Finding best next song...',
+    mixing:         'Creating mix \u2014 please wait...',
+    waiting_rating: 'Mix ready \u2014 listen and rate!',
+    complete:       '\u2713 Session complete!',
+    stopped:        'Session stopped.',
+    error:          'Error: ' + (s.error || '')
+  };
+  $('djStatusText').textContent = labels[s.status] || s.status;
+
+  // Mix ready panel
+  if (s.status === 'waiting_rating') {
+    $('djMixReady').style.display = 'block';
+    if (s.download_url) $('djDlLink').href = s.download_url;
+    if (s.quality_scores && s.quality_scores.overall != null) {
+      var q = s.quality_scores.overall;
+      var col = q >= 0.7 ? '#22c55e' : q >= 0.4 ? '#eab308' : '#ef4444';
+      $('djQuality').innerHTML = 'Quality: <span style="color:' + col + '">' +
+        (q * 100).toFixed(0) + '%</span>';
+    }
+    djRating = 0; djHilite(0);
+  } else if (s.status !== 'complete' && s.status !== 'stopped' && s.status !== 'error') {
+    $('djMixReady').style.display = 'none';
+  }
+
+  // Terminal states
+  if (s.status === 'complete' || s.status === 'stopped' || s.status === 'error') {
+    if (djPollIv) { clearInterval(djPollIv); djPollIv = null; }
+    $('djStopBtn').style.display = 'none';
+    $('djNewBtn').style.display = 'block';
+    $('djMixReady').style.display = 'none';
+    loadMixes();
+  }
+}
+
+function resetDjUI() {
+  if (djPollIv) { clearInterval(djPollIv); djPollIv = null; }
+  djSessionId = null; djRating = 0;
+  $('djSetup').style.display = 'block';
+  $('djSession').style.display = 'none';
+  $('djMixReady').style.display = 'none';
+  $('djFlowBox').style.display = 'none';
+  $('djDots').innerHTML = '';
+}
+
 // ──────────────── Songs ────────────────
 $('sA').onchange = $('sB').onchange = function() {
   var ok = $('sA').value && $('sB').value && $('sA').value !== $('sB').value;
@@ -685,6 +911,7 @@ function loadSongs() {
     list.innerHTML = '';
     $('sA').innerHTML = '<option value="">Choose song...</option>';
     $('sB').innerHTML = '<option value="">Choose song...</option>';
+    $('djStartSong').innerHTML = '<option value="">Choose song...</option>';
     if (!d.songs.length) {
       list.innerHTML = '<li style="text-align:center;padding:14px;color:var(--muted);font-size:0.82rem">No songs analyzed yet</li>';
       return;
@@ -706,6 +933,7 @@ function loadSongs() {
       list.appendChild(li);
       var o1 = document.createElement('option'); o1.value = s.song_id; o1.textContent = s.song_id; $('sA').appendChild(o1);
       var o2 = document.createElement('option'); o2.value = s.song_id; o2.textContent = s.song_id; $('sB').appendChild(o2);
+      var o3 = document.createElement('option'); o3.value = s.song_id; o3.textContent = s.song_id; $('djStartSong').appendChild(o3);
     });
   }).catch(function(){
     $('songList').innerHTML = '<li style="text-align:center;padding:10px;color:var(--red);font-size:0.82rem">Error loading songs</li>';
