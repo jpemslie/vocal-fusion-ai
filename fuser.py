@@ -705,8 +705,10 @@ def fuse(song_a: str, song_b: str, out_path: str,
     step(6, TOTAL, "Analyzing stems for adaptive parameters…")
     vox_params = _analyze_vocal_stem(vox)
     overlap    = _spectral_overlap(_to_mono(vox), _to_mono(inst))
-    # Map overlap (typically 0.3–0.7) to sidechain depth (0.15–0.40)
-    sidechain_depth = float(np.clip(overlap * 0.9, 0.15, 0.40))
+    # Spectral carve already handles freq-specific competition (up to -5 dB).
+    # Sidechain adds broadband duck on top — keep it light (max -2.5 dB) so
+    # the combined effect stays within 7-8 dB, not the 9+ dB of the old code.
+    sidechain_depth = float(np.clip(overlap * 0.4, 0.10, 0.22))
     print(f"      Gate thresh: {vox_params['gate_thresh_db']:.1f} dB  "
           f"Comp ratio: {vox_params['comp_ratio']:.1f}:1  "
           f"Spectral overlap: {overlap:.3f}  "
@@ -717,9 +719,9 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
     step(8, TOTAL, "Mixing (beat-align + spectral carve + M/S + sidechain + level match)…")
 
-    # Beat-grid alignment: snap vocal's first beat to a measure boundary in the inst
-    vox_pre, inst_pre = _beat_align(_to_mono(inst), _to_mono(stems_b["vocals"]),
-                                     ratio)
+    # Beat-grid alignment: use original full tracks for reliable beat detection
+    # (beat tracking works better on the full mix than on separated stems)
+    vox_pre, inst_pre = _beat_align(full_a, full_b, ratio)
     silence = lambda n: np.zeros((n, 2), dtype=np.float32)
     if vox_pre > 0:
         vox = np.concatenate([silence(vox_pre), vox], axis=0)
