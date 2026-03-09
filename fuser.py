@@ -242,6 +242,50 @@ def semitones_to_shift(src_root, src_mode, dst_root, dst_mode) -> int:
     return diff - 12 if diff > 6 else diff
 
 
+def _beat_align(inst_mono: np.ndarray, vox_mono: np.ndarray,
+                vox_stretch_ratio: float) -> tuple:
+    """
+    Compute the sample offset that aligns the vocal's first beat to the
+    nearest beat-grid position in the instrumental.
+
+    After time-stretching the vocal by `vox_stretch_ratio`, its beat positions
+    are scaled by 1/ratio. We find how many samples to prepend (silence) to
+    the vocal so its first downbeat lines up with a beat in the instrumental.
+
+    Returns (vox_prepend_samples, inst_prepend_samples).
+    One of them will always be 0.
+    """
+    try:
+        _, beats_inst = librosa.beat.beat_track(y=inst_mono, sr=SR, units="samples")
+        _, beats_vox  = librosa.beat.beat_track(y=vox_mono,  sr=SR, units="samples")
+    except Exception:
+        return 0, 0
+
+    if len(beats_inst) < 4 or len(beats_vox) < 2:
+        return 0, 0
+
+    # After stretching the vocal, its beat positions compress by ratio
+    # (stretch_factor > 1 = faster = shorter → beat[i]/ratio)
+    vox_first_beat_s = int(beats_vox[0] / vox_stretch_ratio)
+
+    # Find the beat in the instrumental that is closest to vox_first_beat_s
+    nearest_idx = int(np.argmin(np.abs(beats_inst - vox_first_beat_s)))
+
+    # Snap to a measure boundary (nearest multiple of 4 beats) for musical feel
+    measure_idx = round(nearest_idx / 4) * 4
+    measure_idx = min(measure_idx, len(beats_inst) - 1)
+    target_inst_beat = int(beats_inst[measure_idx])
+
+    offset = target_inst_beat - vox_first_beat_s  # positive = vocal starts too early
+
+    if offset >= 0:
+        # Vocal needs to start later → prepend silence to vocal
+        return int(offset), 0
+    else:
+        # Instrumental needs to start later → prepend silence to inst
+        return 0, int(-offset)
+
+
 # ── Adaptive Parameter Analysis ───────────────────────────────────────────────
 
 def _analyze_vocal_stem(vox: np.ndarray) -> dict:
@@ -671,7 +715,19 @@ def fuse(song_a: str, song_b: str, out_path: str,
     step(7, TOTAL, "Processing vocals (denoise + stretch + pitch + EQ + gate + reverb)…")
     vox = _process_vocals(vox, ratio, n_semi, vox_params)
 
-    step(8, TOTAL, "Mixing (spectral carve + M/S + sidechain + level match)…")
+    step(8, TOTAL, "Mixing (beat-align + spectral carve + M/S + sidechain + level match)…")
+
+    # Beat-grid alignment: snap vocal's first beat to a measure boundary in the inst
+    vox_pre, inst_pre = _beat_align(_to_mono(inst), _to_mono(stems_b["vocals"]),
+                                     ratio)
+    silence = lambda n: np.zeros((n, 2), dtype=np.float32)
+    if vox_pre > 0:
+        vox = np.concatenate([silence(vox_pre), vox], axis=0)
+        print(f"      Beat-align: prepend {vox_pre/SR*1000:.0f} ms to vocal", flush=True)
+    elif inst_pre > 0:
+        inst = np.concatenate([silence(inst_pre), inst], axis=0)
+        print(f"      Beat-align: prepend {inst_pre/SR*1000:.0f} ms to beat", flush=True)
+
     L = min(len(inst), len(vox))
     inst, vox = inst[:L], vox[:L]
 
