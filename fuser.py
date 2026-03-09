@@ -142,7 +142,7 @@ def detect_bpm(y_mono: np.ndarray) -> float:
     Normalised to 60-180 BPM to correct librosa half/double-time errors.
     """
     onset_env = librosa.onset.onset_strength(y=y_mono, sr=SR, hop_length=512)
-    tempo = float(librosa.feature.rhythm.tempo(onset_envelope=onset_env, sr=SR, hop_length=512)[0])
+    tempo = float(librosa.beat.tempo(onset_envelope=onset_env, sr=SR, hop_length=512)[0])
     while tempo > 180.0:
         tempo /= 2
     while tempo < 60.0:
