@@ -9,6 +9,10 @@ torch>=2.0.0
 torchaudio>=2.0.0
 demucs>=4.0.0
 
+# AI-powered stem separation (BS-Roformer, MDX-Net — much cleaner than Demucs)
+audio-separator>=0.24.0
+onnxruntime>=1.19.0
+
 # Web server
 flask>=2.0.0
 
@@ -17,3 +21,6 @@ pedalboard>=0.9.0
 
 # True LUFS loudness measurement (ITU-R BS.1770-4)
 pyloudnorm>=0.1.0
+
+# Spectral noise reduction (removes Demucs bleed artifacts from vocal stem)
+noisereduce>=3.0.0
