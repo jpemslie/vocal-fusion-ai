@@ -321,19 +321,67 @@ def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
+def _deess(vox: np.ndarray, threshold_db: float = -22.0,
+           cutoff_hz: float = 6500.0, max_reduction_db: float = 7.0) -> np.ndarray:
+    """
+    Dynamic de-esser: detect sibilance energy (6.5 kHz+) per frame and apply
+    proportional gain reduction when it exceeds threshold_db.
+    Placed before reverb so the tail doesn't get de-essed.
+    """
+    mono = _to_mono(vox)
+
+    # Sidechain: high-pass at cutoff to isolate sibilance
+    sos = butter(4, cutoff_hz / (SR / 2), btype="high", output="sos")
+    sib = sosfilt(sos, mono).astype(np.float32)
+
+    # Frame-by-frame RMS of sibilance (5ms frames)
+    win = max(1, int(SR * 0.005))
+    hop = win // 2
+    n = len(sib)
+    n_frames = max(1, (n + hop - 1) // hop)
+
+    env_db = np.array([
+        20 * np.log10(
+            float(np.sqrt(np.mean(sib[i * hop: min(i * hop + win, n)] ** 2))) + 1e-12
+        )
+        for i in range(n_frames)
+    ], dtype=np.float32)
+
+    # Gain reduction: compress sibilance above threshold, max reduction capped
+    over_thresh = env_db - threshold_db                   # positive when too loud
+    gain_db = np.clip(-over_thresh * 0.6, -max_reduction_db, 0.0)
+    gain_linear = 10 ** (gain_db / 20.0).astype(np.float32)
+
+    # Interpolate envelope to sample resolution
+    x_frames = np.arange(n_frames, dtype=np.float64) * hop
+    x_samp   = np.arange(n, dtype=np.float64)
+    gain_samp = interp1d(
+        x_frames, gain_linear, kind="linear",
+        bounds_error=False, fill_value=(gain_linear[0], gain_linear[-1])
+    )(x_samp).astype(np.float32)
+
+    out = vox.copy()
+    pad = len(gain_samp)
+    for c in range(out.shape[1]):
+        out[:pad, c] *= gain_samp
+    return out.astype(np.float32)
+
+
 def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
                     params: dict) -> np.ndarray:
     """
     Full vocal pipeline:
-      1. noisereduce: remove Demucs bleed artifacts
+      1. noisereduce: remove Demucs bleed artifacts (per channel)
       2. time_stretch + pitch_shift in ONE JUCE pass (no double-artefact)
       3. HPF 100 Hz — remove rumble / low instrument bleed
       4. Low-shelf cut -2 dB @ 200 Hz — reduce mud
       5. Peak cut -3 dB @ 320 Hz — remove Demucs 'boxy' resonance
       6. Peak boost +3 dB @ 3.5 kHz — presence / intelligibility
-      7. Adaptive Compressor — derived from actual vocal dynamic range
-      8. Adaptive NoiseGate — threshold set from measured noise floor
-      9. Plate reverb 8% wet — tie vocal into the same acoustic space
+      7. Adaptive Compressor — ratio/threshold from measured dynamic range
+      8. Adaptive NoiseGate — threshold from measured noise floor
+      9. De-esser — dynamic gain reduction above 6.5 kHz (before reverb)
+     10. Pre-delay reverb — 18 ms pre-delay separates voice from tail,
+         gives the vocal presence and depth rather than washing it out
     """
     # Step 1: noisereduce on each channel
     vox = np.stack([
@@ -351,8 +399,8 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
             pitch_shift_in_semitones=float(n_semitones),
         ).astype(np.float32)
 
-    # Steps 3-9: EQ + dynamics + space (adaptive params)
-    board = Pedalboard([
+    # Steps 3-8: EQ + dynamics (dry — no reverb yet)
+    dry_board = Pedalboard([
         HighpassFilter(cutoff_frequency_hz=100.0),
         LowShelfFilter(cutoff_frequency_hz=200.0, gain_db=-2.0, q=0.7),
         PeakFilter(cutoff_frequency_hz=320.0,  gain_db=-3.0, q=1.0),
@@ -369,9 +417,29 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
             attack_ms=3.0,
             release_ms=150.0,
         ),
-        Reverb(room_size=0.12, damping=0.75, wet_level=0.08, dry_level=1.0),
     ])
-    vox_ch = board(vox_ch, SR).astype(np.float32)
+    vox_dry = dry_board(vox_ch, SR).astype(np.float32)  # (2, samples)
+
+    # Step 9: de-esser on dry signal (before reverb — don't de-ess the tail)
+    vox_dry = _deess(vox_dry.T, threshold_db=-22.0).T.astype(np.float32)
+
+    # Step 10: pre-delay reverb (18 ms gap before reverb tail starts)
+    pre_delay = int(SR * 0.018)  # 661 samples @ 44100
+
+    # Reverb-only path (wet_level=1, dry_level=0)
+    reverb_board = Pedalboard([
+        Reverb(room_size=0.15, damping=0.75, wet_level=1.0, dry_level=0.0, width=0.8),
+    ])
+    reverb_wet = reverb_board(vox_dry, SR).astype(np.float32)
+
+    # Shift reverb tail by pre_delay samples (pad front, trim end)
+    reverb_shifted = np.concatenate([
+        np.zeros((reverb_wet.shape[0], pre_delay), dtype=np.float32),
+        reverb_wet,
+    ], axis=1)[:, :vox_dry.shape[1]]
+
+    # Mix: dry + pre-delayed reverb at 8% wet
+    vox_ch = (vox_dry + reverb_shifted * 0.08).astype(np.float32)
 
     return vox_ch.T  # (samples, 2)
 
@@ -455,13 +523,24 @@ def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
     return result
 
 
-def _sidechain(inst: np.ndarray, vox: np.ndarray,
-               depth: float, window_ms: int = 40) -> np.ndarray:
+def _parallel_compress(inst: np.ndarray) -> np.ndarray:
     """
-    Duck instrumental by `depth` when vocals are loud.
-    depth is computed adaptively from spectral overlap.
+    NY-style parallel compression: blend 30% heavily compressed signal with
+    70% dry. Adds density and sustain without squashing kick/snare transients.
     """
-    vox_mono = _to_mono(vox)
+    inst_ch = inst.T.astype(np.float32)
+    from pedalboard import Gain
+    crush = Pedalboard([
+        Compressor(threshold_db=-24.0, ratio=8.0, attack_ms=30.0, release_ms=200.0),
+        Gain(gain_db=9.0),   # makeup: bring crushed level up to match dry
+    ])
+    crushed = crush(inst_ch, SR).T.astype(np.float32)
+    return (0.70 * inst + 0.30 * crushed).astype(np.float32)
+
+
+def _sidechain_envelope(vox_mono: np.ndarray, n_out: int,
+                        depth: float, window_ms: int = 40) -> np.ndarray:
+    """Compute per-sample sidechain gain curve (1.0 = no duck, < 1.0 = ducked)."""
     win = max(1, int(SR * window_ms / 1000))
     hop = win // 2
     n = len(vox_mono)
@@ -471,18 +550,39 @@ def _sidechain(inst: np.ndarray, vox: np.ndarray,
         np.sqrt(np.mean(vox_mono[i * hop: min(i * hop + win, n)] ** 2))
         for i in range(n_frames)
     ], dtype=np.float32)
-
     env /= _rms(vox_mono) + 1e-9
     reduction = (1.0 - depth * np.clip(env, 0.0, 1.0)).astype(np.float64)
 
     x_frames = np.arange(n_frames, dtype=np.float64) * hop
-    x_samp   = np.arange(len(inst), dtype=np.float64)
-    gain = interp1d(
+    x_samp   = np.arange(n_out, dtype=np.float64)
+    return interp1d(
         x_frames, reduction, kind="linear",
         bounds_error=False, fill_value=(reduction[0], reduction[-1])
     )(x_samp).astype(np.float32)
 
-    return inst * gain[:, np.newaxis]
+
+def _sidechain(inst: np.ndarray, vox: np.ndarray,
+               depth: float, window_ms: int = 40) -> np.ndarray:
+    """
+    Multiband sidechain: duck only the mids/highs (200 Hz+) when vocal is loud.
+    Bass/sub-bass (< 200 Hz) pass through unaffected — kick and sub stay punchy.
+    depth is computed adaptively from spectral overlap.
+    """
+    # Split at 200 Hz (Linkwitz-Riley style: LP + HP, order 4)
+    crossover = 200.0
+    sos_lo = butter(4, crossover / (SR / 2), btype="low",  output="sos")
+    sos_hi = butter(4, crossover / (SR / 2), btype="high", output="sos")
+
+    inst_lo = sosfilt(sos_lo, inst, axis=0).astype(np.float32)  # kick, sub-bass
+    inst_hi = sosfilt(sos_hi, inst, axis=0).astype(np.float32)  # everything else
+
+    # Sidechain gain from vocal envelope (only applied to mids/highs)
+    vox_mono = _to_mono(vox)
+    gain = _sidechain_envelope(vox_mono, len(inst), depth, window_ms)
+
+    inst_hi_ducked = (inst_hi * gain[:, np.newaxis]).astype(np.float32)
+
+    return (inst_lo + inst_hi_ducked).astype(np.float32)
 
 
 # ── Mastering ────────────────────────────────────────────────────────────────
@@ -543,10 +643,11 @@ def fuse(song_a: str, song_b: str, out_path: str,
     print(f"      A: {_NOTES[key_a_root]} {key_a_mode}   "
           f"B: {_NOTES[key_b_root]} {key_b_mode}", flush=True)
 
-    step(4, TOTAL, "Separating stems — Song A (instrumental) via BS-Roformer…")
+    sep_model = "BS-Roformer" if _has_gpu() else "Demucs"
+    step(4, TOTAL, f"Separating stems — Song A (instrumental) via {sep_model}…")
     stems_a = separate(song_a, stems_cache)
 
-    step(5, TOTAL, "Separating stems — Song B (vocals) via BS-Roformer…")
+    step(5, TOTAL, f"Separating stems — Song B (vocals) via {sep_model}…")
     stems_b = separate(song_b, stems_cache)
 
     inst = stems_a["no_vocals"]   # (samples, 2)
@@ -583,7 +684,10 @@ def fuse(song_a: str, song_b: str, out_path: str,
     # Content-aware spectral carve on instrumental
     inst = _adaptive_spectral_carve(inst, vox, carve_db=5.0)
 
-    # Sidechain duck (adaptive depth from spectral overlap)
+    # Parallel compression: restore punch/density lost after carving
+    inst = _parallel_compress(inst)
+
+    # Multiband sidechain duck (only mids/highs — bass stays punchy)
     inst = _sidechain(inst, vox, depth=sidechain_depth)
 
     # M/S mix: vocal into Mid only, beat Sides preserved
