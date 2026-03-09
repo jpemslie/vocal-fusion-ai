@@ -25,6 +25,7 @@ import shutil
 from pathlib import Path
 
 import librosa
+import librosa.feature.rhythm
 import noisereduce as nr
 import numpy as np
 import pyloudnorm as pyln
@@ -208,7 +209,7 @@ def _separate_demucs(audio_path: str, out_dir: Path) -> None:
 
 def detect_bpm(y_mono: np.ndarray) -> float:
     onset_env = librosa.onset.onset_strength(y=y_mono, sr=SR, hop_length=512)
-    tempo = float(librosa.beat.tempo(
+    tempo = float(librosa.feature.rhythm.tempo(
         onset_envelope=onset_env, sr=SR, hop_length=512)[0])
     while tempo > 180.0:
         tempo /= 2
@@ -449,6 +450,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         LowShelfFilter(cutoff_frequency_hz=200.0, gain_db=-2.0, q=0.7),
         PeakFilter(cutoff_frequency_hz=320.0,  gain_db=-3.0, q=1.0),
         PeakFilter(cutoff_frequency_hz=3500.0, gain_db=3.0,  q=1.5),
+        HighShelfFilter(cutoff_frequency_hz=9000.0, gain_db=2.5),   # air / presence
         Compressor(
             threshold_db=params["comp_thresh_db"],
             ratio=params["comp_ratio"],
@@ -579,7 +581,7 @@ def _parallel_compress(inst: np.ndarray) -> np.ndarray:
         Gain(gain_db=9.0),   # makeup: bring crushed level up to match dry
     ])
     crushed = crush(inst_ch, SR).T.astype(np.float32)
-    return (0.70 * inst + 0.30 * crushed).astype(np.float32)
+    return (0.80 * inst + 0.20 * crushed).astype(np.float32)
 
 
 def _sidechain_envelope(vox_mono: np.ndarray, n_out: int,
@@ -640,7 +642,13 @@ def _lufs_normalize(y: np.ndarray, target: float = -11.0) -> np.ndarray:
 
 
 def _master(mix: np.ndarray) -> np.ndarray:
-    """Soft clip → LUFS -11 → brick-wall Limiter -1 dBTP."""
+    """Mastering EQ → soft clip → LUFS -11 → brick-wall Limiter -1 dBTP."""
+    # Mastering EQ: slight Lo-Mid cut to clean up warmth, air boost to open up HF
+    master_eq = Pedalboard([
+        PeakFilter(cutoff_frequency_hz=600.0, gain_db=-1.0, q=0.8),
+        HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=1.5),
+    ])
+    mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
     mix = (np.tanh(mix * 0.95) / 0.95).astype(np.float32)
     mix = _lufs_normalize(mix, -11.0)
     limiter = Pedalboard([Limiter(threshold_db=-1.0, release_ms=50.0)])
