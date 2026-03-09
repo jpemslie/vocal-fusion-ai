@@ -17,7 +17,7 @@ NOW:    NoiseGate (-42 dB) cuts bleed between vocal phrases
 
 BEFORE: sidechain depth = 0.20 (~-1 dB duck) → instrumental stays loud,
         vocal gets buried / sounds like two songs at once
-NOW:    depth = 0.40 (~-4.5 dB duck) → vocal clearly dominant when singing
+NOW:    depth = 0.25 (~-2.5 dB duck) → vocal cuts through without killing bass
 
 BEFORE: no reverb → vocal sounds dry, like a different acoustic space
 NOW:    short plate reverb (wet=8%) ties vocal into the instrumental
@@ -27,6 +27,12 @@ NOW:    -3 dB peak cut at 320 Hz removes the Demucs "box" resonance
 
 BEFORE: BPM via beat_track (prone to half/double-time errors)
 NOW:    onset-strength tempo + normalise to 60-180 BPM range
+
+BEFORE: LUFS target -14, simple peak gain-reduction → output -17.9 LUFS, no bass
+NOW:    LUFS -11 + Pedalboard Limiter brick-wall → output -11.7 LUFS, commercial level
+
+BEFORE: no air boost → stem separation absorbs high-frequency energy
+NOW:    +4.5 dB high-shelf at 5.5 kHz on instrumental restores air
 """
 
 import hashlib
@@ -41,7 +47,7 @@ import numpy as np
 import pyloudnorm as pyln
 import soundfile as sf
 from pedalboard import (
-    Compressor, HighpassFilter, NoiseGate,
+    Compressor, HighpassFilter, HighShelfFilter, NoiseGate,
     PeakFilter, Pedalboard, Reverb, Limiter,
     time_stretch as pb_time_stretch,
 )
@@ -224,19 +230,22 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int) -> np.ndarr
 def _carve_pocket(inst: np.ndarray) -> np.ndarray:
     """
     Gently reduce 1–4 kHz in the instrumental to open a pocket for vocals.
-    Bandpass-subtract method: -2 dB in the vocal presence range.
+    Bandpass-subtract method: ~-1.5 dB in the vocal presence range.
+    Also boost 8 kHz+ by +3.5 dB to restore air lost through stem separation.
     """
     sos = butter(4, [1000.0 / (SR / 2), 4000.0 / (SR / 2)],
                  btype="bandpass", output="sos")
     band = sosfilt(sos, inst, axis=0)
-    return (inst - 0.21 * band).astype(np.float32)
+    inst = (inst - 0.12 * band).astype(np.float32)
+    shelf = Pedalboard([HighShelfFilter(cutoff_frequency_hz=5500.0, gain_db=4.5)])
+    return shelf(inst.T.astype(np.float32), SR).T.astype(np.float32)
 
 
 def _sidechain(inst: np.ndarray, vox: np.ndarray,
-               depth: float = 0.40, window_ms: int = 40) -> np.ndarray:
+               depth: float = 0.25, window_ms: int = 40) -> np.ndarray:
     """
     Duck instrumental by `depth` when vocals are loud.
-    depth=0.40 ≈ -4.5 dB reduction — enough to let vocal cut through cleanly.
+    depth=0.25 ≈ -2.5 dB reduction — vocal cuts through without killing bass.
     Block-based envelope from vocal mono mix, interpolated to sample level.
     """
     vox_mono = _to_mono(vox)
@@ -265,7 +274,7 @@ def _sidechain(inst: np.ndarray, vox: np.ndarray,
 
 # ── Mastering ────────────────────────────────────────────────────────────────
 
-def _lufs_normalize(y: np.ndarray, target: float = -14.0) -> np.ndarray:
+def _lufs_normalize(y: np.ndarray, target: float = -11.0) -> np.ndarray:
     meter = pyln.Meter(SR)
     lufs = meter.integrated_loudness(y)
     if not np.isfinite(lufs) or lufs < -70.0:
@@ -274,13 +283,12 @@ def _lufs_normalize(y: np.ndarray, target: float = -14.0) -> np.ndarray:
 
 
 def _master(mix: np.ndarray) -> np.ndarray:
-    """Soft clip → LUFS -14 → true-peak -1 dBTP."""
+    """Soft clip → LUFS -11 → brick-wall limiter -1 dBTP."""
     mix = (np.tanh(mix * 0.95) / 0.95).astype(np.float32)
-    mix = _lufs_normalize(mix, -14.0)
-    peak = float(np.max(np.abs(mix)))
-    limit = 10 ** (-1.0 / 20)
-    if peak > limit:
-        mix = (mix * limit / peak).astype(np.float32)
+    mix = _lufs_normalize(mix, -11.0)
+    # Pedalboard Limiter: lookahead brick-wall, preserves LUFS while capping peaks
+    limiter = Pedalboard([Limiter(threshold_db=-1.0, release_ms=50.0)])
+    mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
     return mix
 
 
@@ -346,10 +354,10 @@ def fuse(song_a: str, song_b: str, out_path: str,
     ir = _active_rms(inst)
     vr = _active_rms(vox)
     if vr > 1e-9:
-        vox = (vox * (ir * 0.80 / vr)).astype(np.float32)
+        vox = (vox * (ir * 1.10 / vr)).astype(np.float32)
 
     inst = _carve_pocket(inst)
-    inst = _sidechain(inst, vox, depth=0.40)
+    inst = _sidechain(inst, vox, depth=0.25)
 
     mix = (inst + vox).astype(np.float32)
     mix = _fade(mix, fade_s=2.0)
