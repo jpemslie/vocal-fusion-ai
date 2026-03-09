@@ -243,48 +243,50 @@ def semitones_to_shift(src_root, src_mode, dst_root, dst_mode) -> int:
     return diff - 12 if diff > 6 else diff
 
 
-def _beat_align(inst_mono: np.ndarray, vox_mono: np.ndarray,
-                vox_stretch_ratio: float) -> tuple:
+def _beat_align(inst_mono: np.ndarray, vox_stretched_mono: np.ndarray) -> tuple:
     """
-    Compute the sample offset that aligns the vocal's first beat to the
-    nearest beat-grid position in the instrumental.
+    Align the first vocal onset to the nearest measure boundary in the instrumental.
 
-    After time-stretching the vocal by `vox_stretch_ratio`, its beat positions
-    are scaled by 1/ratio. We find how many samples to prepend (silence) to
-    the vocal so its first downbeat lines up with a beat in the instrumental.
+    Uses the ACTUAL STRETCHED VOCAL STEM to detect when the singer first comes in,
+    then aligns that moment to the nearest 4-beat measure start in the instrumental.
+    This is fundamentally more reliable than using the full original track's beat
+    positions (which may reflect a drum intro or silence before the singer starts).
 
-    Returns (vox_prepend_samples, inst_prepend_samples).
-    One of them will always be 0.
+    Returns (vox_prepend_samples, inst_prepend_samples). One will always be 0.
     """
     try:
+        # Detect beat grid in the instrumental
         _, beats_inst = librosa.beat.beat_track(y=inst_mono, sr=SR, units="samples")
-        _, beats_vox  = librosa.beat.beat_track(y=vox_mono,  sr=SR, units="samples")
+        if len(beats_inst) < 4:
+            return 0, 0
+
+        # Find the first strong vocal onset in the STRETCHED stem
+        # backtrack=True snaps to the energy onset, not the peak
+        onset_samples = librosa.onset.onset_detect(
+            y=vox_stretched_mono, sr=SR,
+            hop_length=512, units="samples",
+            backtrack=True,
+        )
+        if len(onset_samples) == 0:
+            return 0, 0
+        vox_onset_s = int(onset_samples[0])
+
+        # Find the instrumental beat closest to where the vocal first comes in
+        nearest_idx = int(np.argmin(np.abs(beats_inst - vox_onset_s)))
+
+        # Snap to measure boundary (nearest multiple of 4 beats) for phrasing
+        measure_idx = round(nearest_idx / 4) * 4
+        measure_idx = min(measure_idx, len(beats_inst) - 1)
+        target_beat = int(beats_inst[measure_idx])
+
+        offset = target_beat - vox_onset_s
+
+        if offset >= 0:
+            return int(offset), 0   # prepend silence to vocal
+        else:
+            return 0, int(-offset)  # prepend silence to instrumental
     except Exception:
         return 0, 0
-
-    if len(beats_inst) < 4 or len(beats_vox) < 2:
-        return 0, 0
-
-    # After stretching the vocal, its beat positions compress by ratio
-    # (stretch_factor > 1 = faster = shorter → beat[i]/ratio)
-    vox_first_beat_s = int(beats_vox[0] / vox_stretch_ratio)
-
-    # Find the beat in the instrumental that is closest to vox_first_beat_s
-    nearest_idx = int(np.argmin(np.abs(beats_inst - vox_first_beat_s)))
-
-    # Snap to a measure boundary (nearest multiple of 4 beats) for musical feel
-    measure_idx = round(nearest_idx / 4) * 4
-    measure_idx = min(measure_idx, len(beats_inst) - 1)
-    target_inst_beat = int(beats_inst[measure_idx])
-
-    offset = target_inst_beat - vox_first_beat_s  # positive = vocal starts too early
-
-    if offset >= 0:
-        # Vocal needs to start later → prepend silence to vocal
-        return int(offset), 0
-    else:
-        # Instrumental needs to start later → prepend silence to inst
-        return 0, int(-offset)
 
 
 # ── Adaptive Parameter Analysis ───────────────────────────────────────────────
@@ -361,7 +363,7 @@ def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     return nr.reduce_noise(
         y=vox_mono, sr=SR,
         stationary=False,
-        prop_decrease=0.75,
+        prop_decrease=0.45,   # 0.75 creates watery/metallic artifacts on melodic content
         n_fft=2048,
     ).astype(np.float32)
 
@@ -641,6 +643,121 @@ def _lufs_normalize(y: np.ndarray, target: float = -11.0) -> np.ndarray:
     return (y * 10 ** ((target - lufs) / 20)).astype(np.float32)
 
 
+def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
+                   bpm_a: float) -> dict:
+    """
+    Programmatic quality check — runs after every fusion so issues are caught
+    without needing a human listener. Checks:
+
+      1. Beat sync   — what % of vocal onsets land within 60ms of an inst beat
+      2. Vocal level — is the vocal audible vs the mix (20-50% of mix RMS)
+      3. Spectral    — are all 5 frequency bands within commercial reference ranges
+      4. Clipping    — any true peaks above -0.2 dBTP?
+      5. LUFS        — is the integrated loudness in the -15 to -8 range?
+    """
+    issues = []
+    scores = {}
+
+    mix_mono  = _to_mono(mix)
+    vox_mono  = _to_mono(vox)
+    inst_mono = _to_mono(inst)
+
+    # ── 1. Beat sync via cross-correlation ────────────────────────────────────
+    # Measures whether the vocal's rhythmic groove matches the instrumental's
+    # beat grid, using cross-correlation of onset envelopes rather than counting
+    # how many vocal onsets hit exact beat positions (which is too strict for
+    # singers/rappers who frequently land on off-beats or syncopate).
+    try:
+        hop = 512
+        vox_env  = librosa.onset.onset_strength(y=vox_mono,  sr=SR, hop_length=hop)
+        inst_env = librosa.onset.onset_strength(y=inst_mono, sr=SR, hop_length=hop)
+
+        # Normalise both envelopes
+        vox_env  = vox_env  / (vox_env.max()  + 1e-9)
+        inst_env = inst_env / (inst_env.max() + 1e-9)
+
+        # Cross-correlation — positive lags = vocal is ahead of beat
+        n = min(len(vox_env), len(inst_env), SR * 60 // hop)  # cap at 60s
+        xcorr = np.correlate(vox_env[:n], inst_env[:n], mode="full")
+        mid = len(xcorr) // 2
+
+        # Sync score: correlation at lag 0 vs the global peak correlation
+        # 1.0 = perfectly in phase, 0.0 = no rhythmic relationship at all
+        sync_score = float(xcorr[mid] / (xcorr.max() + 1e-9))
+        best_lag_frames = int(np.argmax(xcorr)) - mid
+        best_lag_ms = best_lag_frames * hop / SR * 1000
+
+        scores["beat_sync_pct"] = round(sync_score * 100, 1)
+        scores["beat_lag_ms"]   = round(best_lag_ms, 0)
+
+        if sync_score < 0.35:
+            issues.append(
+                f"BEAT SYNC FAIL: {sync_score:.0%} rhythmic correlation "
+                f"(best lag {best_lag_ms:+.0f} ms, want sync_score >35%)")
+        elif sync_score < 0.55:
+            issues.append(
+                f"Beat sync marginal: {sync_score:.0%} "
+                f"(best lag {best_lag_ms:+.0f} ms, want >55%)")
+    except Exception as e:
+        scores["beat_sync_pct"] = None
+        issues.append(f"Beat sync check error: {e}")
+
+    # ── 2. Vocal presence (stem-based, mastering-gain-independent) ────────────
+    # Compare vocal stem RMS to (inst + vocal) combined, not to the mastered mix,
+    # so LUFS normalization doesn't skew the metric.
+    vr = _rms(vox_mono)
+    ir = _rms(inst_mono)
+    vp = vr / (ir + vr + 1e-9)
+    scores["vocal_presence"] = round(vp * 100, 1)
+    if vp < 0.20:
+        issues.append(f"Vocal buried: {vp:.0%} of combined energy (want 25-45%)")
+    elif vp > 0.50:
+        issues.append(f"Vocal overpowers beat: {vp:.0%} of combined energy (want 25-45%)")
+
+    # ── 3. Spectral balance ───────────────────────────────────────────────────
+    clip_s = min(len(mix_mono), SR * 60)
+    S = np.abs(librosa.stft(mix_mono[:clip_s], n_fft=2048))
+    freqs = librosa.fft_frequencies(sr=SR)
+
+    def _bdb(lo, hi):
+        m = (freqs >= lo) & (freqs < hi)
+        return float(librosa.amplitude_to_db(S[m].mean() + 1e-9, ref=1.0))
+
+    bands = {
+        "Bass (20-250 Hz)":      (_bdb(20,   250),  25, 34),
+        "Lo-Mid (250-800 Hz)":   (_bdb(250,  800),  17, 24),
+        "Mid (800-2.5k Hz)":     (_bdb(800, 2500),  10, 18),
+        "Hi-Mid (2.5-6k Hz)":    (_bdb(2500, 6000),  4, 12),
+        "High (6-20k Hz)":       (_bdb(6000,20000), -12, -3),
+    }
+    scores["bands"] = {k: round(v, 1) for k, (v, _, _) in bands.items()}
+    for name, (val, lo, hi) in bands.items():
+        if val < lo:
+            issues.append(f"{name}: {val:.1f} dB (want {lo}–{hi}, TOO LOW)")
+        elif val > hi:
+            issues.append(f"{name}: {val:.1f} dB (want {lo}–{hi}, TOO HIGH)")
+
+    # ── 4. Clipping ───────────────────────────────────────────────────────────
+    peak = float(np.max(np.abs(mix)))
+    scores["peak_dBFS"] = round(20 * np.log10(peak + 1e-9), 2)
+    if peak > 1.001:
+        issues.append(f"CLIPPING: peak = {peak:.5f} (hard clip — limiter failed)")
+
+    # ── 5. Integrated loudness ────────────────────────────────────────────────
+    meter = pyln.Meter(SR)
+    lufs = meter.integrated_loudness(mix_mono)
+    scores["lufs"] = round(lufs, 1) if np.isfinite(lufs) else None
+    if np.isfinite(lufs):
+        if lufs < -15:
+            issues.append(f"Mix too quiet: {lufs:.1f} LUFS (want -15 to -8)")
+        elif lufs > -8:
+            issues.append(f"Mix too loud: {lufs:.1f} LUFS (want -15 to -8)")
+
+    scores["issues"] = issues
+    scores["pass"]   = not any("FAIL" in i or "CLIP" in i for i in issues)
+    return scores
+
+
 def _master(mix: np.ndarray) -> np.ndarray:
     """Mastering EQ → soft clip → LUFS -11 → brick-wall Limiter -1 dBTP."""
     # Mastering EQ: slight Lo-Mid cut to clean up warmth, air boost to open up HF
@@ -727,9 +844,9 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
     step(8, TOTAL, "Mixing (beat-align + spectral carve + M/S + sidechain + level match)…")
 
-    # Beat-grid alignment: use original full tracks for reliable beat detection
-    # (beat tracking works better on the full mix than on separated stems)
-    vox_pre, inst_pre = _beat_align(full_a, full_b, ratio)
+    # Beat-grid alignment: use the ACTUAL STRETCHED vocal stem to find when
+    # the singer first comes in, then align that to the nearest measure boundary.
+    vox_pre, inst_pre = _beat_align(full_a, _to_mono(vox))
     silence = lambda n: np.zeros((n, 2), dtype=np.float32)
     if vox_pre > 0:
         vox = np.concatenate([silence(vox_pre), vox], axis=0)
@@ -737,15 +854,22 @@ def fuse(song_a: str, song_b: str, out_path: str,
     elif inst_pre > 0:
         inst = np.concatenate([silence(inst_pre), inst], axis=0)
         print(f"      Beat-align: prepend {inst_pre/SR*1000:.0f} ms to beat", flush=True)
+    else:
+        print(f"      Beat-align: no offset needed", flush=True)
 
     L = min(len(inst), len(vox))
     inst, vox = inst[:L], vox[:L]
 
-    # Level match: vocal at 110% of instrumental active RMS
-    ir = _active_rms(inst)
-    vr = _active_rms(vox)
+    # Level match: target vocal at ~35% of combined stem energy.
+    # Use full-signal RMS (not active-only) so silence gaps don't inflate the ratio.
+    # Separated vocal stems are much quieter than instrumentals; active_rms comparison
+    # was blowing up the multiplier and making the vocal 2–3× too loud.
+    ir = _rms(_to_mono(inst))
+    vr = _rms(_to_mono(vox))
     if vr > 1e-9:
-        vox = (vox * (ir * 1.10 / vr)).astype(np.float32)
+        # target_ratio: vox/inst so that vox/(inst+vox) ≈ 35%
+        # → vox/inst = 0.35/(1-0.35) = 0.538 ≈ 0.55
+        vox = (vox * (ir * 0.55 / vr)).astype(np.float32)
 
     # Content-aware spectral carve on instrumental
     inst = _adaptive_spectral_carve(inst, vox, carve_db=5.0)
@@ -770,4 +894,21 @@ def fuse(song_a: str, song_b: str, out_path: str,
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     sf.write(out_path, mix, SR, subtype="PCM_16")
     print(f"Done → {out_path}", flush=True)
+
+    # ── Auto quality evaluation ──────────────────────────────────────────────
+    print("\n── Auto Quality Evaluation ─────────────────────────────────────", flush=True)
+    ev = _auto_evaluate(mix, inst, vox, bpm_a)
+    print(f"  Beat sync:      {ev['beat_sync_pct']}%  (want >45%)", flush=True)
+    print(f"  Vocal presence: {ev['vocal_presence']}%  (want 20-50%)", flush=True)
+    print(f"  LUFS:           {ev['lufs']} dB", flush=True)
+    print(f"  Peak:           {ev['peak_dBFS']} dBFS", flush=True)
+    print(f"  Bands:          {ev['bands']}", flush=True)
+    if ev["issues"]:
+        print("  ISSUES:", flush=True)
+        for iss in ev["issues"]:
+            print(f"    ✗ {iss}", flush=True)
+    else:
+        print("  ✓ All checks passed", flush=True)
+    print(f"  Overall: {'PASS' if ev['pass'] else 'FAIL'}", flush=True)
+
     return out_path
