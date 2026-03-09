@@ -3,16 +3,18 @@ VocalFusion Fusion Engine
 =========================
 Song A  →  instrumental (no_vocals stem from Demucs)
 Song B  →  vocals stem
-Output  →  mixed, mastered WAV
+Output  →  stereo mixed, mastered WAV
 
 Quality decisions
 ─────────────────
-• Key detection on the FULL song (not the artifact-prone separated stem)
-• BPM ratio tries ×0.5 and ×2 variants to minimise stretching distance
-• Pedalboard (JUCE) compressor/highpass — zero-copy, no Python loops
-• EQ carving: gentle -2 dB notch at 2.5 kHz in instrumental
-• Sidechain duck: block-based envelope (no sample-level Python loops)
-• LUFS-normalised master at -14 LUFS / -1 dBTP true peak
+• Full stereo pipeline — stems stay (samples, 2), no mono collapse
+• Key/BPM detection uses a mono mix of the original file (clean signal)
+• chroma_cens for key detection (energy-normalised, robust to timbre)
+• BPM ratio: direct bpm_a/bpm_b, capped ±50% to avoid stretch artefacts
+• Pedalboard (JUCE) vocal chain per channel: HPF + compression + air shelf
+• EQ carving: gentle -2 dB bandstop at 1–4 kHz in instrumental
+• Sidechain duck: envelope from mono mix of vocals, applied to both channels
+• Master: soft-clip → LUFS -14 → true-peak -1 dBTP
 """
 
 import hashlib
@@ -33,7 +35,6 @@ from scipy.signal import butter, sosfilt
 
 SR = 44100
 
-# Krumhansl-Schmuckler tonal hierarchy profiles
 _KS_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
                        2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 _KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
@@ -43,28 +44,43 @@ _NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _log(msg: str, cb=None) -> None:
-    print(msg, flush=True)
-    if cb:
-        cb(msg)
-
-
 def _file_id(path: str) -> str:
-    """Stable ID from file size + first 8 KB — avoids reading the whole file."""
     stat = os.stat(path)
     with open(path, "rb") as f:
         head = f.read(8192)
     return hashlib.md5(str(stat.st_size).encode() + head).hexdigest()[:12]
 
 
-def _load_mono(path: str) -> np.ndarray:
-    """Load any audio file as mono float32 at SR."""
-    y, sr = librosa.load(path, sr=SR, mono=True)
+def _to_mono(y: np.ndarray) -> np.ndarray:
+    """(samples, 2) or (samples,) → (samples,) mono float32."""
+    if y.ndim == 2:
+        return y.mean(axis=1).astype(np.float32)
     return y.astype(np.float32)
+
+
+def _to_stereo(y: np.ndarray) -> np.ndarray:
+    """(samples,) → (samples, 2) by duplicating channel."""
+    if y.ndim == 1:
+        return np.stack([y, y], axis=1)
+    return y
 
 
 def _rms(y: np.ndarray) -> float:
     return float(np.sqrt(np.mean(y ** 2) + 1e-12))
+
+
+def _active_rms(y: np.ndarray, threshold_db: float = -48.0) -> float:
+    """
+    RMS of only the active (non-silent) samples.
+    Avoids the silent gaps in Demucs vocal stems dragging down the level match.
+    """
+    mono = _to_mono(y)
+    peak = float(np.max(np.abs(mono)) + 1e-12)
+    cutoff = peak * 10 ** (threshold_db / 20)
+    active = mono[np.abs(mono) > cutoff]
+    if len(active) < SR:          # less than 1s of active audio — fall back
+        return _rms(y)
+    return float(np.sqrt(np.mean(active ** 2) + 1e-12))
 
 
 # ── Stem Separation ───────────────────────────────────────────────────────────
@@ -72,8 +88,7 @@ def _rms(y: np.ndarray) -> float:
 def separate(audio_path: str, cache_dir: str = "vf_data/stems") -> dict:
     """
     Run Demucs htdemucs_ft --two-stems vocals.
-    Results cached by file fingerprint so each song is separated once.
-    Returns {'vocals': ndarray, 'no_vocals': ndarray} — mono float32 at SR.
+    Cached by file fingerprint. Returns stereo (samples, 2) float32 arrays.
     """
     os.makedirs(cache_dir, exist_ok=True)
     fid = _file_id(audio_path)
@@ -88,8 +103,8 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems") -> dict:
                 [
                     sys.executable, "-m", "demucs",
                     "--two-stems", "vocals",
-                    "--model", "htdemucs_ft",
-                    "--out", cache_dir,
+                    "-n", "htdemucs_ft",
+                    "-o", cache_dir,
                     str(tmp),
                 ],
                 capture_output=True,
@@ -101,7 +116,6 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems") -> dict:
                 )
             raw = Path(cache_dir) / "htdemucs_ft" / fid
             raw.rename(cached)
-            # Clean up empty parent
             try:
                 (Path(cache_dir) / "htdemucs_ft").rmdir()
             except OSError:
@@ -113,48 +127,40 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems") -> dict:
     stems = {}
     for name in ("vocals", "no_vocals"):
         y, file_sr = sf.read(str(cached / f"{name}.wav"))
-        if y.ndim > 1:
-            y = y.mean(axis=1)
+        # Ensure stereo (samples, 2)
+        if y.ndim == 1:
+            y = np.stack([y, y], axis=1)
         if file_sr != SR:
-            y = librosa.resample(y, orig_sr=file_sr, target_sr=SR)
+            y = np.stack([
+                librosa.resample(y[:, c], orig_sr=file_sr, target_sr=SR)
+                for c in range(y.shape[1])
+            ], axis=1)
         stems[name] = y.astype(np.float32)
     return stems
 
 
-# ── Analysis ──────────────────────────────────────────────────────────────────
+# ── Analysis (mono) ───────────────────────────────────────────────────────────
 
-def detect_bpm(y: np.ndarray) -> float:
-    """Detect BPM using librosa beat tracker on the full audio."""
-    tempo, _ = librosa.beat.beat_track(y=y, sr=SR)
+def detect_bpm(y_mono: np.ndarray) -> float:
+    tempo, _ = librosa.beat.beat_track(y=y_mono, sr=SR)
     return max(float(tempo), 40.0)
 
 
 def _best_ratio(bpm_a: float, bpm_b: float) -> float:
-    """
-    Return the time-stretch ratio that brings bpm_b closest to bpm_a,
-    considering ×0.5 and ×2 multiples so we never over-stretch.
-    Capped at ±50% to avoid quality degradation.
-    """
-    candidates = [bpm_a / (bpm_b * m) for m in (0.5, 1.0, 2.0)]
-    ratio = min(candidates, key=lambda r: abs(r - 1.0))
-    return float(np.clip(ratio, 0.667, 1.5))
+    """rate > 1 = faster, rate < 1 = slower. Capped ±50%."""
+    return float(np.clip(bpm_a / bpm_b, 0.667, 1.5))
 
 
-def detect_key(y: np.ndarray) -> tuple:
-    """
-    Krumhansl-Schmuckler key detection on the full song audio.
-    Returns (root_semitone: int, mode: str)  e.g. (9, 'minor') = A minor.
-    """
-    chroma = librosa.feature.chroma_cqt(y=y, sr=SR, bins_per_octave=36)
+def detect_key(y_mono: np.ndarray) -> tuple:
+    """Krumhansl-Schmuckler on chroma_cens. Returns (root_semitone, mode)."""
+    chroma = librosa.feature.chroma_cens(y=y_mono, sr=SR)
     mean_ch = chroma.mean(axis=1)
     mean_ch /= mean_ch.sum() + 1e-9
-
     best_score, best_root, best_mode = -np.inf, 0, "major"
     for root in range(12):
         rot = np.roll(mean_ch, -root)
         for profile, mode in ((_KS_MAJOR, "major"), (_KS_MINOR, "minor")):
-            p = profile / profile.sum()
-            score = np.dot(rot, p)
+            score = np.dot(rot, profile / profile.sum())
             if score > best_score:
                 best_score, best_root, best_mode = score, root, mode
     return best_root, best_mode
@@ -162,72 +168,95 @@ def detect_key(y: np.ndarray) -> tuple:
 
 def semitones_to_shift(src_root: int, src_mode: str,
                        dst_root: int, dst_mode: str) -> int:
-    """
-    Smallest semitone shift to bring src key into dst key.
-    Minor keys are compared via their relative major to avoid over-shifting.
-    """
     src = (src_root + 3) % 12 if src_mode == "minor" else src_root
     dst = (dst_root + 3) % 12 if dst_mode == "minor" else dst_root
     diff = (dst - src) % 12
     return diff - 12 if diff > 6 else diff
 
 
-# ── DSP ───────────────────────────────────────────────────────────────────────
+# ── Stereo DSP ────────────────────────────────────────────────────────────────
+
+def _stretch_stereo(y: np.ndarray, ratio: float) -> np.ndarray:
+    """Time-stretch each channel independently via pyrubberband."""
+    return np.stack([
+        pyrb.time_stretch(y[:, c], SR, ratio)
+        for c in range(y.shape[1])
+    ], axis=1).astype(np.float32)
+
+
+def _shift_stereo(y: np.ndarray, n_semitones: int) -> np.ndarray:
+    """Pitch-shift each channel independently via pyrubberband."""
+    return np.stack([
+        pyrb.pitch_shift(y[:, c], SR, n_semitones)
+        for c in range(y.shape[1])
+    ], axis=1).astype(np.float32)
+
 
 def _process_vocals(vox: np.ndarray) -> np.ndarray:
-    """Vocal chain via Pedalboard (JUCE): highpass + compression."""
+    """
+    Per-channel vocal chain via Pedalboard (JUCE):
+      HPF 80 Hz → compression (4:1) → +2 dB air shelf at 8 kHz
+    """
     board = Pedalboard([
         HighpassFilter(cutoff_frequency_hz=80.0),
         Compressor(threshold_db=-18.0, ratio=4.0,
                    attack_ms=10.0, release_ms=80.0),
     ])
-    return board(vox, SR).astype(np.float32)
+    sos_shelf = butter(2, 8000.0 / (SR / 2), btype="high", output="sos")
+
+    channels = []
+    for c in range(vox.shape[1]):
+        ch = board(vox[:, c], SR)
+        ch = ch + 0.26 * sosfilt(sos_shelf, ch)   # +2 dB air
+        channels.append(ch.astype(np.float32))
+    return np.stack(channels, axis=1)
 
 
 def _carve_pocket(inst: np.ndarray) -> np.ndarray:
     """
-    Cut ~2 dB of 1–4 kHz from the instrumental to open a pocket for vocals.
-    A gentle bandpass-subtract is mathematically equivalent to a soft notch.
+    Cut ~2 dB of 1–4 kHz in the instrumental (bandpass-subtract method).
+    Applied simultaneously to both channels via sosfilt axis=0.
     """
     sos = butter(4,
                  [1000.0 / (SR / 2), 4000.0 / (SR / 2)],
                  btype="bandpass", output="sos")
-    band = sosfilt(sos, inst)
-    return (inst - 0.21 * band).astype(np.float32)  # 0.21 ≈ -2 dB
+    band = sosfilt(sos, inst, axis=0)
+    return (inst - 0.21 * band).astype(np.float32)
 
 
 def _sidechain(inst: np.ndarray, vox: np.ndarray,
-               depth: float = 0.25, window_ms: int = 30) -> np.ndarray:
+               depth: float = 0.2, window_ms: int = 30) -> np.ndarray:
     """
-    Duck instrumental by `depth` when vocals are loud.
-    Block-based envelope follower — no sample-level Python loop.
+    Duck instrumental by `depth` when vocals are present.
+    Envelope is derived from the vocal mono mix; gain applied to both channels.
     """
+    vox_mono = _to_mono(vox)
     win = max(1, int(SR * window_ms / 1000))
     hop = win // 2
-    n_vox = len(vox)
+    n_vox = len(vox_mono)
     n_frames = max(1, (n_vox + hop - 1) // hop)
 
-    env = np.zeros(n_frames, dtype=np.float32)
-    for i in range(n_frames):
-        s = i * hop
-        e = min(s + win, n_vox)
-        env[i] = np.sqrt(np.mean(vox[s:e] ** 2))
+    env = np.array([
+        np.sqrt(np.mean(vox_mono[i * hop: min(i * hop + win, n_vox)] ** 2))
+        for i in range(n_frames)
+    ], dtype=np.float32)
 
-    vocal_rms = _rms(vox)
-    env /= vocal_rms + 1e-9
+    env /= _rms(vox_mono) + 1e-9
     reduction = (1.0 - depth * np.clip(env, 0.0, 1.0)).astype(np.float64)
 
     x_frames = np.arange(n_frames, dtype=np.float64) * hop
-    x_samp = np.arange(len(inst), dtype=np.float64)
+    x_samp   = np.arange(len(inst), dtype=np.float64)
     gain = interp1d(
         x_frames, reduction, kind="linear",
         bounds_error=False, fill_value=(reduction[0], reduction[-1])
     )(x_samp).astype(np.float32)
 
-    return inst * gain
+    # Broadcast (samples,) gain over (samples, 2) inst
+    return inst * gain[:, np.newaxis]
 
 
 def _lufs_normalize(y: np.ndarray, target: float = -14.0) -> np.ndarray:
+    """pyloudnorm expects (samples,) mono or (samples, channels) stereo."""
     meter = pyln.Meter(SR)
     lufs = meter.integrated_loudness(y)
     if not np.isfinite(lufs) or lufs < -70.0:
@@ -236,11 +265,10 @@ def _lufs_normalize(y: np.ndarray, target: float = -14.0) -> np.ndarray:
 
 
 def _master(mix: np.ndarray) -> np.ndarray:
-    """Soft clip → LUFS normalise → true-peak limit."""
     mix = (np.tanh(mix * 0.95) / 0.95).astype(np.float32)
     mix = _lufs_normalize(mix, -14.0)
     peak = float(np.max(np.abs(mix)))
-    limit = 10 ** (-1.0 / 20)  # -1 dBTP
+    limit = 10 ** (-1.0 / 20)
     if peak > limit:
         mix = (mix * limit / peak).astype(np.float32)
     return mix
@@ -249,8 +277,10 @@ def _master(mix: np.ndarray) -> np.ndarray:
 def _fade(y: np.ndarray, fade_s: float = 2.0) -> np.ndarray:
     n = min(int(SR * fade_s), len(y) // 6)
     y = y.copy()
-    y[:n]  *= np.linspace(0.0, 1.0, n) ** 0.5
-    y[-n:] *= np.linspace(1.0, 0.0, n) ** 0.5
+    fade_in  = np.linspace(0.0, 1.0, n, dtype=np.float32) ** 0.5
+    fade_out = np.linspace(1.0, 0.0, n, dtype=np.float32) ** 0.5
+    y[:n]  *= fade_in[:, np.newaxis]
+    y[-n:] *= fade_out[:, np.newaxis]
     return y
 
 
@@ -260,20 +290,18 @@ def fuse(song_a: str, song_b: str, out_path: str,
          stems_cache: str = "vf_data/stems",
          progress_cb=None) -> str:
     """
-    Fuse Song A (provides beat/instrumental) with Song B (provides vocals).
-    Writes a WAV to out_path and returns it.
-    progress_cb(step, total, message) is called at each stage if provided.
+    Fuse Song A (beat/instrumental) with Song B (vocals).
+    Writes stereo WAV to out_path and returns the path.
+    progress_cb(step, total, message) called at each stage if provided.
     """
     def step(n, msg):
-        full = f"[{n}/8] {msg}"
-        print(full, flush=True)
+        print(f"[{n}/8] {msg}", flush=True)
         if progress_cb:
             progress_cb(n, 8, msg)
 
-    # Load full songs for analysis — key/BPM detection on clean audio
     step(1, "Loading audio for analysis…")
-    full_a = _load_mono(song_a)
-    full_b = _load_mono(song_b)
+    full_a = librosa.load(song_a, sr=SR, mono=True)[0].astype(np.float32)
+    full_b = librosa.load(song_b, sr=SR, mono=True)[0].astype(np.float32)
 
     step(2, "Detecting BPM…")
     bpm_a = detect_bpm(full_a)
@@ -292,19 +320,19 @@ def fuse(song_a: str, song_b: str, out_path: str,
     step(5, "Separating stems — Song B (vocals)…")
     stems_b = separate(song_b, stems_cache)
 
-    inst = stems_a["no_vocals"]
-    vox  = stems_b["vocals"]
+    inst = stems_a["no_vocals"]   # (samples, 2)
+    vox  = stems_b["vocals"]      # (samples, 2)
 
     step(6, "Time-stretching & pitch-shifting vocals…")
     ratio = _best_ratio(bpm_a, bpm_b)
     print(f"      BPM ratio: {ratio:.4f}", flush=True)
     if abs(ratio - 1.0) > 0.005:
-        vox = pyrb.time_stretch(vox, SR, ratio)
+        vox = _stretch_stereo(vox, ratio)
 
     n_semi = semitones_to_shift(key_b_root, key_b_mode, key_a_root, key_a_mode)
     print(f"      Pitch shift: {n_semi:+d} semitones", flush=True)
     if n_semi != 0:
-        vox = pyrb.pitch_shift(vox, SR, n_semi)
+        vox = _shift_stereo(vox, n_semi)
 
     step(7, "Mixing…")
     L = min(len(inst), len(vox))
@@ -312,15 +340,16 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
     vox = _process_vocals(vox)
 
-    inst_rms = _rms(inst)
-    vox_rms  = _rms(vox)
-    if vox_rms > 1e-9:
-        vox = vox * (inst_rms * 0.90 / vox_rms)
+    # Level match using active-region RMS (ignores silent gaps in vocal stem)
+    ir = _active_rms(inst)
+    vr = _active_rms(vox)
+    if vr > 1e-9:
+        vox = (vox * (ir * 0.90 / vr)).astype(np.float32)
 
     inst = _carve_pocket(inst)
     inst = _sidechain(inst, vox, depth=0.2)
 
-    mix = inst + vox
+    mix = (inst + vox).astype(np.float32)
     mix = _fade(mix, fade_s=2.0)
 
     step(8, "Mastering…")
