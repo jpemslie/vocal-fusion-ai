@@ -19,6 +19,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import librosa
@@ -85,7 +86,7 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems") -> dict:
         try:
             result = subprocess.run(
                 [
-                    "python", "-m", "demucs",
+                    sys.executable, "-m", "demucs",
                     "--two-stems", "vocals",
                     "--model", "htdemucs_ft",
                     "--out", cache_dir,
