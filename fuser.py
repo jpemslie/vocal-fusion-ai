@@ -42,8 +42,10 @@ _NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _log(msg: str) -> None:
+def _log(msg: str, cb=None) -> None:
     print(msg, flush=True)
+    if cb:
+        cb(msg)
 
 
 def _file_id(path: str) -> str:
@@ -254,74 +256,76 @@ def _fade(y: np.ndarray, fade_s: float = 2.0) -> np.ndarray:
 # ── Main Entry Point ──────────────────────────────────────────────────────────
 
 def fuse(song_a: str, song_b: str, out_path: str,
-         stems_cache: str = "vf_data/stems") -> str:
+         stems_cache: str = "vf_data/stems",
+         progress_cb=None) -> str:
     """
     Fuse Song A (provides beat/instrumental) with Song B (provides vocals).
     Writes a WAV to out_path and returns it.
+    progress_cb(step, total, message) is called at each stage if provided.
     """
+    def step(n, msg):
+        full = f"[{n}/8] {msg}"
+        print(full, flush=True)
+        if progress_cb:
+            progress_cb(n, 8, msg)
+
     # Load full songs for analysis — key/BPM detection on clean audio
-    _log("[1/8] Loading audio for analysis…")
+    step(1, "Loading audio for analysis…")
     full_a = _load_mono(song_a)
     full_b = _load_mono(song_b)
 
-    _log("[2/8] Detecting BPM…")
+    step(2, "Detecting BPM…")
     bpm_a = detect_bpm(full_a)
     bpm_b = detect_bpm(full_b)
-    _log(f"      A: {bpm_a:.1f} BPM   B: {bpm_b:.1f} BPM")
+    print(f"      A: {bpm_a:.1f} BPM   B: {bpm_b:.1f} BPM", flush=True)
 
-    _log("[3/8] Detecting keys…")
+    step(3, "Detecting keys…")
     key_a_root, key_a_mode = detect_key(full_a)
     key_b_root, key_b_mode = detect_key(full_b)
-    _log(f"      A: {_NOTES[key_a_root]} {key_a_mode}   "
-         f"B: {_NOTES[key_b_root]} {key_b_mode}")
+    print(f"      A: {_NOTES[key_a_root]} {key_a_mode}   "
+          f"B: {_NOTES[key_b_root]} {key_b_mode}", flush=True)
 
-    _log("[4/8] Separating stems — Song A (instrumental)…")
+    step(4, "Separating stems — Song A (instrumental)…")
     stems_a = separate(song_a, stems_cache)
 
-    _log("[5/8] Separating stems — Song B (vocals)…")
+    step(5, "Separating stems — Song B (vocals)…")
     stems_b = separate(song_b, stems_cache)
 
     inst = stems_a["no_vocals"]
     vox  = stems_b["vocals"]
 
-    _log("[6/8] Time-stretching & pitch-shifting vocals…")
+    step(6, "Time-stretching & pitch-shifting vocals…")
     ratio = _best_ratio(bpm_a, bpm_b)
-    _log(f"      BPM ratio: {ratio:.4f}")
+    print(f"      BPM ratio: {ratio:.4f}", flush=True)
     if abs(ratio - 1.0) > 0.005:
         vox = pyrb.time_stretch(vox, SR, ratio)
 
     n_semi = semitones_to_shift(key_b_root, key_b_mode, key_a_root, key_a_mode)
-    _log(f"      Pitch shift: {n_semi:+d} semitones")
+    print(f"      Pitch shift: {n_semi:+d} semitones", flush=True)
     if n_semi != 0:
         vox = pyrb.pitch_shift(vox, SR, n_semi)
 
-    _log("[7/8] Mixing…")
-    # Match lengths to the shorter of the two
+    step(7, "Mixing…")
     L = min(len(inst), len(vox))
     inst, vox = inst[:L], vox[:L]
 
-    # Vocal chain: highpass + compression
     vox = _process_vocals(vox)
 
-    # Level match: vocals at 90% of instrumental RMS
     inst_rms = _rms(inst)
     vox_rms  = _rms(vox)
     if vox_rms > 1e-9:
         vox = vox * (inst_rms * 0.90 / vox_rms)
 
-    # EQ: carve 1–4 kHz pocket in instrumental
     inst = _carve_pocket(inst)
-
-    # Sidechain: duck instrumental when vocals hit
     inst = _sidechain(inst, vox, depth=0.2)
 
     mix = inst + vox
     mix = _fade(mix, fade_s=2.0)
 
-    _log("[8/8] Mastering…")
+    step(8, "Mastering…")
     mix = _master(mix)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     sf.write(out_path, mix, SR, subtype="PCM_16")
-    _log(f"Done → {out_path}")
+    print(f"Done → {out_path}", flush=True)
     return out_path

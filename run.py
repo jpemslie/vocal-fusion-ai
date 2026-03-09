@@ -7,9 +7,7 @@ GET  /status/<id>   → {status, progress, message, output_url?}
 GET  /output/<file> → serve completed WAV
 """
 
-import builtins
 import os
-import re
 import threading
 import uuid
 from pathlib import Path
@@ -30,24 +28,17 @@ for _d in (UPLOAD_DIR, OUTPUT_DIR, STEMS_DIR):
 _jobs: dict = {}
 _lock = threading.Lock()
 
-_STEP_RE = re.compile(r"\[(\d+)/8\]")
-
 
 def _run_fuse(job_id: str, path_a: str, path_b: str, out_path: str) -> None:
-    orig_print = builtins.print
-
-    def _capture(*args, **kwargs):
-        orig_print(*args, **kwargs)
-        msg = " ".join(str(a) for a in args)
-        m = _STEP_RE.search(msg)
+    def on_progress(step, total, msg):
         with _lock:
-            _jobs[job_id]["message"] = msg.strip()
-            if m:
-                _jobs[job_id]["progress"] = int(int(m.group(1)) / 8 * 100)
+            _jobs[job_id]["progress"] = int(step / total * 100)
+            _jobs[job_id]["message"] = msg
 
-    builtins.print = _capture
     try:
-        fuse(path_a, path_b, out_path, stems_cache=str(STEMS_DIR))
+        fuse(path_a, path_b, out_path,
+             stems_cache=str(STEMS_DIR),
+             progress_cb=on_progress)
         with _lock:
             _jobs[job_id].update(
                 status="done", progress=100, message="Complete",
@@ -56,8 +47,6 @@ def _run_fuse(job_id: str, path_a: str, path_b: str, out_path: str) -> None:
     except Exception as exc:
         with _lock:
             _jobs[job_id].update(status="error", message=str(exc))
-    finally:
-        builtins.print = orig_print
 
 
 @app.route("/")
