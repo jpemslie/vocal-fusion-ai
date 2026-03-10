@@ -1238,18 +1238,26 @@ def _transient_shape(inst: np.ndarray,
     att_lin = 10 ** (attack_gain_db / 20.0)
     sus_lin = 10 ** (sustain_gain_db / 20.0)
 
+    # Frequency-weighted detection: kick band (60-200Hz) + snare band (150-6kHz)
+    # gives more accurate transient identification vs using full-bandwidth signal
+    nyq = SR / 2.0
+    sos_kick  = butter(4, [60 / nyq, 200 / nyq],  btype="band", output="sos")
+    sos_snare = butter(4, [150 / nyq, min(6000 / nyq, 0.999)], btype="high", output="sos")
+    inst_mono_d = _to_mono(inst).astype(np.float64)
+    kick_b  = sosfilt(sos_kick,  inst_mono_d)
+    snare_b = sosfilt(sos_snare, inst_mono_d)
+    detect  = (0.5 * kick_b + 0.5 * snare_b).astype(np.float32)
+
+    fast_env_d = _env_follow(detect, fast_ms, release_ms)
+    slow_env_d = _env_follow(detect, slow_ms, release_ms)
+
+    total_d = fast_env_d + slow_env_d + 1e-12
+    transient_mask = fast_env_d / total_d
+    sustain_mask   = slow_env_d / total_d
+    gain = (transient_mask * att_lin + sustain_mask * sus_lin).astype(np.float32)
+
     for c in range(inst.shape[1]):
-        ch = inst[:, c].astype(np.float64)
-        fast_env = _env_follow(ch, fast_ms, release_ms)
-        slow_env = _env_follow(ch, slow_ms, release_ms)
-
-        # Transient mask: how much is fast vs slow (normalized 0-1)
-        total = fast_env + slow_env + 1e-12
-        transient_mask = fast_env / total   # high during transients
-        sustain_mask   = slow_env / total   # high during sustain
-
-        gain = transient_mask * att_lin + sustain_mask * sus_lin
-        result[:, c] = (ch * gain).astype(np.float32)
+        result[:, c] = (inst[:, c] * gain).astype(np.float32)
 
     return result.astype(np.float32)
 
@@ -1289,17 +1297,24 @@ def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
     vocal_mask = gaussian_filter1d(vocal_mask.astype(np.float64),
                                     sigma=smooth_sigma, axis=1).astype(np.float32)
 
-    # Frequency weighting: only carve in the vocal presence range (300 Hz – 8 kHz)
+    # Frequency weighting: prioritize 2-4 kHz (core intelligibility) most,
+    # full weight 300 Hz - 8 kHz with extra weight on consonant range (1-5 kHz).
+    # Research: 2-4 kHz is the ear canal resonance peak (3.3 kHz) and the
+    # single most important band for vocal intelligibility in a dense mix.
     freqs = librosa.fft_frequencies(sr=SR, n_fft=n_fft)
     freq_w = np.zeros(len(freqs), dtype=np.float32)
     for i, f in enumerate(freqs):
-        if 300 <= f <= 8000:
-            if f < 600:
-                freq_w[i] = (f - 300) / 300
-            elif f > 6000:
-                freq_w[i] = (8000 - f) / 2000
-            else:
-                freq_w[i] = 1.0
+        if f < 300 or f > 8000:
+            freq_w[i] = 0.0
+        elif f < 600:
+            freq_w[i] = (f - 300) / 300 * 0.6         # ramp up (60% max below 600)
+        elif f < 1000:
+            freq_w[i] = 0.6 + (f - 600) / 400 * 0.4   # ramp to 1.0 at 1kHz
+        elif f <= 5000:
+            freq_w[i] = 1.0 + 0.5 * float(np.clip(
+                1.0 - abs(np.log2(f / 3000)) * 2, 0, 1))  # peak at 3kHz (1.5× weight)
+        elif f <= 8000:
+            freq_w[i] = 1.0 - (f - 5000) / 3000        # taper above 5kHz
 
     # Effective gain: 1.0 where vocal is absent, (1 - max_cut) where vocal is loud
     max_cut = 1.0 - 10 ** (-carve_db / 20.0)   # carve_db=5 → max_cut≈0.44
