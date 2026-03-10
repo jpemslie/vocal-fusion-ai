@@ -1314,18 +1314,13 @@ def _deess(vox: np.ndarray, threshold_db: float = -22.0,
     # Sidechain detection: sibilance band of mono sum
     sib = sosfilt(sos_hi, mono).astype(np.float32)
 
-    # Frame-by-frame RMS of sibilance (5ms frames)
-    win = max(1, int(SR * 0.005))
+    # Vectorized RMS envelope (replaces O(n_frames) Python loop)
+    win = max(1, int(SR * 0.005))   # 5ms frames
     hop = win // 2
     n = len(sib)
-    n_frames = max(1, (n + hop - 1) // hop)
-
-    env_db = np.array([
-        20 * np.log10(
-            float(np.sqrt(np.mean(sib[i * hop: min(i * hop + win, n)] ** 2))) + 1e-12
-        )
-        for i in range(n_frames)
-    ], dtype=np.float32)
+    rms_frames = librosa.feature.rms(y=sib, frame_length=win, hop_length=hop)[0]
+    n_frames = len(rms_frames)
+    env_db = (20 * np.log10(rms_frames.astype(np.float32) + 1e-12))
 
     # Gain reduction curve
     over_thresh = env_db - threshold_db
@@ -1340,16 +1335,12 @@ def _deess(vox: np.ndarray, threshold_db: float = -22.0,
         bounds_error=False, fill_value=(gain_linear[0], gain_linear[-1])
     )(x_samp).astype(np.float32)
 
-    # Apply gain ONLY to sibilance band per channel — surgical, transparent
-    out = vox.copy()
-    for c in range(out.shape[1]):
-        ch = out[:, c].astype(np.float64)
-        ch_hi = sosfilt(sos_hi, ch)          # sibilance band
-        ch_lo = sosfilt(sos_lo, ch)          # below cutoff — untouched
-        ch_hi_reduced = ch_hi * gain_samp    # reduce only the sibilance
-        out[:, c] = (ch_lo + ch_hi_reduced).astype(np.float32)
-
-    return out.astype(np.float32)
+    # Apply gain ONLY to sibilance band — vectorized over both channels at once
+    out_f64 = vox.astype(np.float64)
+    hi_all = sosfilt(sos_hi, out_f64, axis=0)   # (samples, 2)
+    lo_all = sosfilt(sos_lo, out_f64, axis=0)   # (samples, 2)
+    hi_reduced = hi_all * gain_samp[:, np.newaxis]
+    return (lo_all + hi_reduced).astype(np.float32)
 
 
 def _multiband_compress_vocal(vox_ch: np.ndarray, style: dict) -> np.ndarray:
@@ -1621,6 +1612,21 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     er_wet = style["reverb_wet"] * 0.4    # ER slightly quieter than tail
     tail_wet = style["reverb_wet"]
     vox_ch = (vox_ch + er_mix * er_wet + reverb_shifted * tail_wet).astype(np.float32)
+
+    # Step 11b: Slap-back echo — presence echo 80-100ms, no feedback.
+    # Research: 70-120ms single echo (0 feedback) at 12-18% wet adds presence
+    # and "fatness" to hip-hop vocals without sounding like reverb.
+    # BPM-synced: keep slap delay near an 8th-note (ensures rhythmic coherence).
+    eighth_note_ms = 60000.0 / max(bpm, 60.0) / 2.0
+    slap_ms = float(np.clip(eighth_note_ms, 70.0, 110.0))
+    slap_samp = int(SR * slap_ms / 1000.0)
+    # Slap level: rap needs slightly more fatness than singing
+    slap_level = float(np.interp(rap, [0, 1], [0.13, 0.16]))
+    slap_echo = np.concatenate([
+        np.zeros((vox_ch.shape[0], slap_samp), dtype=np.float32),
+        vox_ch,
+    ], axis=1)[:, :vox_ch.shape[1]]
+    vox_ch = (vox_ch + slap_echo * slap_level).astype(np.float32)
 
     # Step 12: Stereo ADT — Automatic Double Tracking (radio-ready width + thickness)
     # Two copies: pitch-up (+6 cents) panned left, pitch-down (-6 cents) panned right.
