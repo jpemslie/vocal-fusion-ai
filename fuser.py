@@ -896,6 +896,57 @@ def _deess(vox: np.ndarray, threshold_db: float = -22.0,
     return out.astype(np.float32)
 
 
+def _multiband_compress_vocal(vox_ch: np.ndarray, style: dict) -> np.ndarray:
+    """
+    4-band multiband compression modeled on Waves C6 / iZotope Neutron.
+
+    Standard vocal crossover points:
+      Band 1:   80 – 250 Hz  (body/mud) — gentle ratio, controls chest resonance
+      Band 2:  250 – 2000 Hz (warmth/body) — moderate, most critical band
+      Band 3: 2000 – 8000 Hz (presence/sibilance) — tightest, prevents harshness
+      Band 4: 8000 – 20000 Hz (air) — very gentle, protects brightness
+
+    Each band is: LP/HP filter pair → compress → recombine.
+    Ratios scale with rap_score: rap needs tighter, more controlled high-mids.
+    """
+    rap = style.get("_rap_score", 0.5)
+
+    # Band settings: (lo_hz, hi_hz, threshold_db, ratio, attack_ms, release_ms)
+    bands_def = [
+        (80,    250,  -24.0, 2.5, 10.0, 200.0),   # body — gentle
+        (250,  2000,  -20.0, float(np.interp(rap, [0,1], [3.0, 4.0])), 5.0, 100.0),
+        (2000, 8000,  -18.0, float(np.interp(rap, [0,1], [3.5, 5.0])), 2.0,  60.0),
+        (8000, 20000, -28.0, 2.0, 15.0, 300.0),   # air — very gentle
+    ]
+
+    n_ch, n_samp = vox_ch.shape
+    out = np.zeros_like(vox_ch)
+
+    for lo, hi, thresh, ratio, atk, rel in bands_def:
+        # Bandpass: LP at hi then HP at lo
+        nyq = SR / 2.0
+        lo_norm = lo / nyq
+        hi_norm = min(hi / nyq, 0.999)
+
+        sos_lp = butter(4, hi_norm, btype="low",  output="sos")
+        sos_hp = butter(4, lo_norm, btype="high", output="sos")
+
+        band_ch = np.zeros_like(vox_ch)
+        for c in range(n_ch):
+            bp = sosfilt(sos_lp, sosfilt(sos_hp, vox_ch[c]))
+            band_ch[c] = bp.astype(np.float32)
+
+        # Compress each band channel with pedalboard
+        band_board = Pedalboard([
+            Compressor(threshold_db=thresh, ratio=ratio,
+                       attack_ms=atk, release_ms=rel),
+        ])
+        compressed = band_board(band_ch.astype(np.float32), SR)
+        out += compressed
+
+    return out.astype(np.float32)
+
+
 def _hpf_signal(audio_ch: np.ndarray, cutoff_hz: float, order: int = 4) -> np.ndarray:
     """
     Apply a high-pass filter to a (channels, samples) array.
@@ -1006,6 +1057,10 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         ),
     ])
     vox_ch = dynamics_board(vox_ch, SR).astype(np.float32)
+
+    # Step 8b: multiband compression (Waves C6 / Neutron style) — per-band control
+    # Runs after the dual-stage broadband comp; refines each frequency region
+    vox_ch = _multiband_compress_vocal(vox_ch, style)
 
     # Step 9: additive EQ AFTER dynamics — style-adaptive presence + air
     post_dynamics_board = Pedalboard([
