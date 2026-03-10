@@ -988,6 +988,44 @@ def _pitch_correct(vox_mono: np.ndarray, target_root: int, target_mode: str,
         return vox_mono
 
 
+def _harmonic_excite(audio_ch: np.ndarray, crossover_hz: float = 3000.0,
+                     drive: float = 2.0, mix_level: float = 0.12) -> np.ndarray:
+    """
+    Aphex Aural Exciter-style harmonic excitement.
+
+    Generates upper harmonics (3–16 kHz) that are present in the original recording
+    but were attenuated or removed by stem separation, compression, and digital processing.
+
+    Algorithm (reverse-engineered from patents):
+      1. HP filter above crossover_hz to isolate high-frequency content only
+      2. Apply asymmetric soft saturation (odd+even harmonics → 4x, 8x, etc.)
+      3. Mix generated harmonics at mix_level under the original signal
+
+    This adds the "air" and "presence" that makes vocals cut through on earbuds
+    and streaming platforms where the high-shelf EQ alone isn't enough.
+
+    audio_ch: (n_channels, n_samples) float32
+    """
+    sos_hp = butter(4, crossover_hz / (SR / 2.0), btype="high", output="sos")
+    result = audio_ch.copy()
+
+    for c in range(audio_ch.shape[0]):
+        ch = audio_ch[c]
+        # HP filter: isolate frequencies above crossover
+        hp = sosfilt(sos_hp, ch.astype(np.float64)).astype(np.float32)
+
+        # Asymmetric drive: bias + tanh generates 2nd harmonic + higher
+        driven = np.tanh(drive * (hp + 0.1 * np.abs(hp))) * 0.8
+
+        # HP filter the driven output again (remove any low-freq artifacts)
+        harmonics = sosfilt(sos_hp, driven.astype(np.float64)).astype(np.float32)
+
+        # Mix generated harmonics into the original at low level
+        result[c] = (ch + harmonics * mix_level).astype(np.float32)
+
+    return result.astype(np.float32)
+
+
 def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     """
     Spectral gating with noisereduce to remove Demucs bleed artifacts.
@@ -1224,6 +1262,11 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=style["air_db"]),
     ])
     vox_ch = post_dynamics_board(vox_ch, SR).astype(np.float32)
+
+    # Step 9b: harmonic exciter (Aphex-style) — adds upper harmonics stripped by
+    # stem separation and digital processing. Crossover at 3kHz, 12% mix level.
+    vox_ch = _harmonic_excite(vox_ch, crossover_hz=3000.0,
+                               drive=2.0, mix_level=0.12)
 
     # Step 10: asymmetric waveshaper — adds even harmonics (2nd = "tube warmth")
     # tanh alone only generates odd harmonics; biasing the input before tanh
@@ -1716,6 +1759,11 @@ def _master(mix: np.ndarray) -> np.ndarray:
         HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=1.5),
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # Mastering harmonic exciter: gentle upper-harmonic generation on full mix
+    # Crossover higher (5kHz) and lower level (7%) than vocal chain
+    mix = _harmonic_excite(mix.T, crossover_hz=5000.0, drive=1.5,
+                           mix_level=0.07).T.astype(np.float32)
 
     # Soft clip: Chebyshev 3rd-order (1.5x - 0.5x³) — gentler than tanh,
     # preserves low-level signal shape, clips peaks without hardness
