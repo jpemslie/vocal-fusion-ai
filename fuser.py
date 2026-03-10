@@ -354,8 +354,13 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         # Sub-bass management: kick transient sidechains 20-80Hz sub-bass
         inst_c = _kick_sub_sidechain(inst_c, depth=0.35)
         inst_c = _parallel_compress(inst_c)
+        # Style-adaptive sidechain window: rap syllables are faster, need tighter tracking
+        # Release stays constant (100ms) to prevent pumping between phrases
+        sc_window_ms = int(np.interp(style.get("_rap_score", 0.5), [0, 1], [40, 15]))
         inst_c = _sidechain(inst_c, vox_scaled,
-                            depth=sidechain_depth * style["sidechain_mult"])
+                            depth=sidechain_depth * style["sidechain_mult"],
+                            window_ms=sc_window_ms,
+                            attack_ms=10.0, release_ms=100.0)
 
         # Evaluate presence
         vp = _rms(_to_mono(vox_scaled)) / (
@@ -1282,15 +1287,26 @@ def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
 def _deess(vox: np.ndarray, threshold_db: float = -22.0,
            cutoff_hz: float = 6500.0, max_reduction_db: float = 7.0) -> np.ndarray:
     """
-    Dynamic de-esser: detect sibilance energy (6.5 kHz+) per frame and apply
-    proportional gain reduction when it exceeds threshold_db.
+    Split-band de-esser: detect sibilance in the 6.5 kHz+ band and apply
+    gain reduction ONLY to that frequency band. The rest of the signal is untouched.
+
+    Split-band (vs wideband) is the professional standard:
+      - Wideband de-essers: whole vocal ducks when a sibilant fires — audible pump
+      - Split-band: only 6.5 kHz+ is reduced — transparent, surgical
+
+    Detection: mono sum of sibilance band → frame RMS → gain curve
+    Reduction: applied per-channel, only to HP band; LP band passes through clean
+
     Placed BEFORE compression to prevent sibilance pumping the compressor.
     """
+    nyq = SR / 2.0
+    sos_hi = butter(4, cutoff_hz / nyq, btype="high", output="sos")
+    sos_lo = butter(4, cutoff_hz / nyq, btype="low",  output="sos")
+
     mono = _to_mono(vox)
 
-    # Sidechain: high-pass at cutoff to isolate sibilance
-    sos = butter(4, cutoff_hz / (SR / 2), btype="high", output="sos")
-    sib = sosfilt(sos, mono).astype(np.float32)
+    # Sidechain detection: sibilance band of mono sum
+    sib = sosfilt(sos_hi, mono).astype(np.float32)
 
     # Frame-by-frame RMS of sibilance (5ms frames)
     win = max(1, int(SR * 0.005))
@@ -1305,12 +1321,12 @@ def _deess(vox: np.ndarray, threshold_db: float = -22.0,
         for i in range(n_frames)
     ], dtype=np.float32)
 
-    # Gain reduction: compress sibilance above threshold, max reduction capped
-    over_thresh = env_db - threshold_db                   # positive when too loud
+    # Gain reduction curve
+    over_thresh = env_db - threshold_db
     gain_db = np.clip(-over_thresh * 0.6, -max_reduction_db, 0.0)
-    gain_linear = 10 ** (gain_db / 20.0).astype(np.float32)
+    gain_linear = (10 ** (gain_db / 20.0)).astype(np.float32)
 
-    # Interpolate envelope to sample resolution
+    # Interpolate to sample resolution
     x_frames = np.arange(n_frames, dtype=np.float64) * hop
     x_samp   = np.arange(n, dtype=np.float64)
     gain_samp = interp1d(
@@ -1318,10 +1334,15 @@ def _deess(vox: np.ndarray, threshold_db: float = -22.0,
         bounds_error=False, fill_value=(gain_linear[0], gain_linear[-1])
     )(x_samp).astype(np.float32)
 
+    # Apply gain ONLY to sibilance band per channel — surgical, transparent
     out = vox.copy()
-    pad = len(gain_samp)
     for c in range(out.shape[1]):
-        out[:pad, c] *= gain_samp
+        ch = out[:, c].astype(np.float64)
+        ch_hi = sosfilt(sos_hi, ch)          # sibilance band
+        ch_lo = sosfilt(sos_lo, ch)          # below cutoff — untouched
+        ch_hi_reduced = ch_hi * gain_samp    # reduce only the sibilance
+        out[:, c] = (ch_lo + ch_hi_reduced).astype(np.float32)
+
     return out.astype(np.float32)
 
 
@@ -1394,7 +1415,8 @@ def _hpf_signal(audio_ch: np.ndarray, cutoff_hz: float, order: int = 4) -> np.nd
 
 def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
                     params: dict, style=None,
-                    target_root: int = 0, target_mode: str = "major") -> np.ndarray:
+                    target_root: int = 0, target_mode: str = "major",
+                    bpm: float = 120.0) -> np.ndarray:
     """
     Full professional vocal pipeline (v5 — style-adaptive):
       1. DeepFilterNet / noisereduce: remove bleed artifacts (per channel)
@@ -1498,6 +1520,12 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # Runs after the dual-stage broadband comp; refines each frequency region
     vox_ch = _multiband_compress_vocal(vox_ch, style)
 
+    # Step 8c: NY parallel vocal compression — adds density without pumping
+    # Blend of heavily crushed signal fills quiet gaps between syllables.
+    # Research: 25-38% blend, 8:1, fast attack, 100ms release — standard for hip-hop vocals.
+    rap = style.get("_rap_score", 0.5)
+    vox_ch = _parallel_compress_vocal(vox_ch, rap_score=rap)
+
     # Step 9: additive EQ AFTER dynamics — style-adaptive presence + air
     post_dynamics_board = Pedalboard([
         PeakFilter(cutoff_frequency_hz=style["presence_hz"],
@@ -1531,7 +1559,13 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # Early reflections (7ms, 14ms, 21ms at -3/-6/-9 dB) arrive BEFORE the
     # diffuse reverb tail and "glue" the vocal to the acoustic space.
     # Research: ER are the perceptually dominant quality factor in reverb.
-    pre_delay = int(SR * 0.020)  # 20ms pre-delay for reverb tail
+    #
+    # BPM-synced pre-delay: one 16th note at the track's tempo, capped at 40ms.
+    # At 120 BPM: 31ms; at 140 BPM: 27ms; at 160 BPM: 23ms.
+    # Rhythmically-locked pre-delay is a standard professional technique —
+    # the reverb tail "breathes" with the track's pulse.
+    predelay_ms = min(60000.0 / max(bpm, 60.0) / 16.0, 40.0)
+    pre_delay = int(SR * predelay_ms / 1000.0)
     er_levels = [(-3.0, 0.007), (-6.0, 0.014), (-9.0, 0.021)]  # (dB, sec)
 
     er_mix = np.zeros_like(vox_ch)
@@ -1770,9 +1804,49 @@ def _parallel_compress(inst: np.ndarray) -> np.ndarray:
     return (0.70 * inst + 0.30 * crushed).astype(np.float32)
 
 
+def _parallel_compress_vocal(vox_ch: np.ndarray, rap_score: float = 0.5) -> np.ndarray:
+    """
+    NY-style parallel (New York) compression on vocals.
+
+    Professional technique used on virtually every hip-hop and R&B vocal:
+      - Dry path  (62-75%): preserves transients, attack, and natural expression
+      - Crush path (25-38%): heavily compressed, level-matched, adds density
+
+    The crush path fills in quiet gaps between syllables and sustains energy
+    without causing audible pumping (because the dry path preserves dynamics).
+
+    blend = 25% (singing) → 38% (rap): rap needs more fill between fast syllables.
+
+    Level matching before blend ensures we're adding density, not just gain.
+    """
+    blend = float(np.interp(rap_score, [0, 1], [0.25, 0.38]))
+
+    crush = Pedalboard([
+        Compressor(threshold_db=-25.0, ratio=8.0, attack_ms=5.0, release_ms=100.0),
+    ])
+    crushed = crush(vox_ch, SR).astype(np.float32)
+
+    # Level-match crushed to dry RMS before blending (we want density, not loudness)
+    dry_rms     = float(np.sqrt(np.mean(vox_ch ** 2) + 1e-12))
+    crushed_rms = float(np.sqrt(np.mean(crushed ** 2) + 1e-12))
+    if crushed_rms > 1e-9:
+        crushed = (crushed * (dry_rms / crushed_rms)).astype(np.float32)
+
+    return ((1.0 - blend) * vox_ch + blend * crushed).astype(np.float32)
+
+
 def _sidechain_envelope(vox_mono: np.ndarray, n_out: int,
-                        depth: float, window_ms: int = 40) -> np.ndarray:
-    """Compute per-sample sidechain gain curve (1.0 = no duck, < 1.0 = ducked)."""
+                        depth: float, window_ms: int = 40,
+                        attack_ms: float = 10.0,
+                        release_ms: float = 100.0) -> np.ndarray:
+    """
+    Compute per-sample sidechain gain curve (1.0 = no duck, < 1.0 = ducked).
+
+    Separate attack/release smoothing prevents pumping at vocal phrase boundaries.
+    Without it, the gain snaps back as soon as the RMS window drops — audible thump.
+
+    Research: 10ms attack, 80-120ms release = transparent hip-hop sidechain.
+    """
     win = max(1, int(SR * window_ms / 1000))
     hop = win // 2
     n = len(vox_mono)
@@ -1783,22 +1857,37 @@ def _sidechain_envelope(vox_mono: np.ndarray, n_out: int,
         for i in range(n_frames)
     ], dtype=np.float32)
     env /= _rms(vox_mono) + 1e-9
-    reduction = (1.0 - depth * np.clip(env, 0.0, 1.0)).astype(np.float64)
+    target_gain = (1.0 - depth * np.clip(env, 0.0, 1.0)).astype(np.float64)
+
+    # Attack/release smoothing in frame domain
+    frame_rate = SR / max(hop, 1)
+    alpha_attack  = np.exp(-1.0 / (frame_rate * attack_ms  / 1000.0))
+    alpha_release = np.exp(-1.0 / (frame_rate * release_ms / 1000.0))
+    smoothed = np.zeros(n_frames, dtype=np.float64)
+    smoothed[0] = target_gain[0]
+    for i in range(1, n_frames):
+        if target_gain[i] < smoothed[i - 1]:
+            alpha = alpha_attack   # gain going down (ducking onset)
+        else:
+            alpha = alpha_release  # gain recovering after phrase ends
+        smoothed[i] = alpha * smoothed[i - 1] + (1.0 - alpha) * target_gain[i]
 
     x_frames = np.arange(n_frames, dtype=np.float64) * hop
     x_samp   = np.arange(n_out, dtype=np.float64)
     return interp1d(
-        x_frames, reduction, kind="linear",
-        bounds_error=False, fill_value=(reduction[0], reduction[-1])
+        x_frames, smoothed, kind="linear",
+        bounds_error=False, fill_value=(smoothed[0], smoothed[-1])
     )(x_samp).astype(np.float32)
 
 
 def _sidechain(inst: np.ndarray, vox: np.ndarray,
-               depth: float, window_ms: int = 40) -> np.ndarray:
+               depth: float, window_ms: int = 40,
+               attack_ms: float = 10.0, release_ms: float = 100.0) -> np.ndarray:
     """
     Multiband sidechain: duck only the mids/highs (200 Hz+) when vocal is loud.
     Bass/sub-bass (< 200 Hz) pass through unaffected — kick and sub stay punchy.
     depth is computed adaptively from spectral overlap.
+    attack_ms/release_ms: smoothing to prevent pumping at phrase boundaries.
     """
     # Split at 200 Hz (Linkwitz-Riley style: LP + HP, order 4)
     crossover = 200.0
@@ -1810,7 +1899,8 @@ def _sidechain(inst: np.ndarray, vox: np.ndarray,
 
     # Sidechain gain from vocal envelope (only applied to mids/highs)
     vox_mono = _to_mono(vox)
-    gain = _sidechain_envelope(vox_mono, len(inst), depth, window_ms)
+    gain = _sidechain_envelope(vox_mono, len(inst), depth, window_ms,
+                                attack_ms=attack_ms, release_ms=release_ms)
 
     inst_hi_ducked = (inst_hi * gain[:, np.newaxis]).astype(np.float32)
 
@@ -2158,9 +2248,12 @@ def fuse(song_a: str, song_b: str, out_path: str,
           f"Sidechain depth: {sidechain_depth:.2f}", flush=True)
 
     rb_engine = "pyrubberband R3" if HAS_PYRUBBERBAND else "pedalboard (fallback)"
-    step(7, TOTAL, f"Processing vocals (DeepFilter + pitch-correct + stretch [{rb_engine}] + style-adaptive chain)…")
+    predelay_ms = min(60000.0 / max(bpm_a, 60.0) / 16.0, 40.0)
+    step(7, TOTAL, f"Processing vocals (DeepFilter + pitch-correct + stretch [{rb_engine}] + NY-comp + "
+         f"split-band de-esser + BPM-reverb {predelay_ms:.0f}ms)…")
     vox = _process_vocals(vox, ratio, n_semi, vox_params, style,
-                          target_root=key_a_root, target_mode=key_a_mode)
+                          target_root=key_a_root, target_mode=key_a_mode,
+                          bpm=bpm_a)
 
     step(8, TOTAL, "Mixing (chorus-align + beat-snap + spectral carve + M/S + sidechain)…")
 
