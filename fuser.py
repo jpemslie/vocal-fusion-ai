@@ -1488,16 +1488,29 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # Step 5: de-esser BEFORE compression (prevents sibilance pumping the compressor)
     vox_ch = _deess(vox_ch.T, threshold_db=-22.0).T.astype(np.float32)
 
-    # Steps 6-8: dual compressor (FET → Opto) + NoiseGate — style-adaptive
+    # Steps 6-8: dual compressor (FET → Opto) + soft expander — style-adaptive
+    #
+    # Soft-knee emulation (pedalboard doesn't expose knee parameter):
+    # A 2-stage approach inserts a gentle "entry" compressor 6 dB before the
+    # main threshold, ratio 1.5:1. This begins smoothly easing in gain reduction
+    # before the main FET stage fires — the perceptual equivalent of a 6 dB knee.
+    # Research: 6 dB soft knee is the professional standard for vocal compression.
     dynamics_board = Pedalboard([
-        # Compressor 1: FET-type, fast (catch transients, control peaks)
+        # Soft-knee entry: begin compressing 6 dB before main threshold
+        Compressor(
+            threshold_db=params["comp_thresh_db"] - 6.0,  # early onset = knee
+            ratio=1.5,                                      # gentle slope into threshold
+            attack_ms=style["fet_attack"] * 2.0,           # slightly slower = smooth entry
+            release_ms=style["fet_release"],
+        ),
+        # Compressor 1 (FET-type): main compression — fast, catches transients
         Compressor(
             threshold_db=params["comp_thresh_db"],
             ratio=style["fet_ratio"],
             attack_ms=style["fet_attack"],
             release_ms=style["fet_release"],
         ),
-        # Compressor 2: Opto-type, slow (smooth programme-level glue)
+        # Compressor 2 (Opto-type): slow programme-level smoothing glue
         Compressor(
             threshold_db=params["comp_thresh_db"] + 3.0,
             ratio=style["opto_ratio"],
@@ -2107,10 +2120,13 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         M_proc = mid_eq(M[np.newaxis, :].astype(np.float32), SR)[0]
 
         # Sides EQ: roll off sub-bass (mono-safe: bass should be center),
-        # add high-shelf air to widen presence
+        # cut muddy low-mids on sides, add high-shelf air to widen presence.
+        # Research: sides low-mids (300-600Hz) are often murky; cut 2-3dB here
+        # improves clarity without affecting the vocal (which is Mid-only).
         sides_eq = Pedalboard([
-            HighpassFilter(cutoff_frequency_hz=100.0),   # bass must be mono
-            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=2.0),  # widen highs
+            HighpassFilter(cutoff_frequency_hz=100.0),              # bass must be mono
+            PeakFilter(cutoff_frequency_hz=400.0, gain_db=-2.5, q=0.8),  # muddy sides cut
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=2.0),    # widen highs
         ])
         S_proc = sides_eq(S[np.newaxis, :].astype(np.float32), SR)[0]
 
