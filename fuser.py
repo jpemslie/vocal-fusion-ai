@@ -502,17 +502,14 @@ def _kick_sub_sidechain(inst: np.ndarray, depth: float = 0.35) -> np.ndarray:
 
     # Kick detection: bandpass 80-200 Hz, envelope follow
     kick_band = sosfilt(sos_kick, inst_mono.astype(np.float64)).astype(np.float32)
+    from scipy.signal import lfilter as _lfilter
     a_atk = np.exp(-1.0 / (SR * 0.003))   # 3ms attack
     a_rel = np.exp(-1.0 / (SR * 0.080))   # 80ms release
-    env = np.zeros(len(kick_band), dtype=np.float32)
-    prev = 0.0
-    for i in range(len(kick_band)):
-        level = abs(kick_band[i])
-        if level > prev:
-            prev = (1 - a_atk) * level + a_atk * prev
-        else:
-            prev = (1 - a_rel) * level + a_rel * prev
-        env[i] = prev
+    rect = np.abs(kick_band).astype(np.float64)
+    # Two-pass vectorized asymmetric envelope (fast attack, slow release)
+    env_atk = _lfilter([1.0 - a_atk], [1.0, -a_atk], rect)
+    env = _lfilter([1.0 - a_rel], [1.0, -a_rel],
+                   np.maximum(env_atk, np.maximum.accumulate(rect) * 0.01)).astype(np.float32)
 
     # Normalize envelope → gain reduction (0 = no duck, depth = max duck)
     env_norm = env / (env.max() + 1e-9)
@@ -1668,17 +1665,21 @@ def _transient_shape(inst: np.ndarray,
     Operates per-channel to preserve stereo image.
     """
     def _env_follow(audio, attack_ms, rel_ms):
-        a = np.exp(-1.0 / (SR * attack_ms / 1000.0))
-        r = np.exp(-1.0 / (SR * rel_ms / 1000.0))
-        env = np.zeros_like(audio)
-        prev = 0.0
-        for i in range(len(audio)):
-            level = abs(audio[i])
-            if level > prev:
-                env[i] = prev = (1 - a) * level + a * prev
-            else:
-                env[i] = prev = (1 - r) * level + r * prev
-        return env
+        from scipy.signal import lfilter
+        rect = np.abs(audio).astype(np.float64)
+        # Asymmetric envelope: fast attack lfilter on rectified signal,
+        # then slow release lfilter as a second pass.
+        # Two symmetric passes approximate the asymmetric behavior:
+        # pass 1 = attack (fast peak tracking)
+        # pass 2 = release (slow decay from peaks)
+        a_atk = np.exp(-1.0 / (SR * attack_ms / 1000.0))
+        a_rel = np.exp(-1.0 / (SR * rel_ms    / 1000.0))
+        # Attack pass: one-pole LP on the rectified signal (tracks rises fast)
+        env_atk = lfilter([1.0 - a_atk], [1.0, -a_atk], rect)
+        # Release pass: one-pole LP on the envelope (holds peaks, decays slowly)
+        env = lfilter([1.0 - a_rel], [1.0, -a_rel],
+                      np.maximum(env_atk, np.maximum.accumulate(rect) * 0.01))
+        return env.astype(np.float32)
 
     result = np.zeros_like(inst)
     att_lin = 10 ** (attack_gain_db / 20.0)
