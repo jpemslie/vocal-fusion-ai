@@ -188,6 +188,7 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
     rap  = vox_char["rap_score"]         # 0–1
 
     return {
+        "_rap_score": rap,  # pass-through for ADT and other downstream use
         # FET compressor: rap/trap → faster, harder
         "fet_ratio":    float(np.interp(rap, [0, 1], [4.0, 8.0])),
         "fet_attack":   float(np.interp(rap, [0, 1], [5.0, 1.0])),
@@ -678,6 +679,101 @@ def _spectral_overlap(vox_mono: np.ndarray, inst_mono: np.ndarray,
 
 # ── Vocal Processing ──────────────────────────────────────────────────────────
 
+def _pitch_correct(vox_mono: np.ndarray, target_root: int, target_mode: str,
+                   strength: float = 0.65) -> np.ndarray:
+    """
+    Monophonic pitch correction: snap the vocal to the nearest scale degree
+    of the target key.  Applied BEFORE time-stretch so stretch artifacts don't
+    interact with pitch-correction artifacts.
+
+    Algorithm:
+      1. Detect F0 per frame via PYIN (most robust for monophonic vocals)
+      2. For each voiced frame, find the nearest chromatic scale note in the
+         target key (chromatic within ±50 cents of scale tones)
+      3. Compute the cents deviation from the nearest scale note
+      4. Apply proportional pitch shift per frame (strength=0.65 → 65% pull)
+         — leaves some natural expression; full 1.0 sounds robotic
+      5. Reconstruct audio with pyrubberband per-frame shift (if available)
+
+    Falls back to no-op if PYIN fails or pyrubberband not installed.
+    """
+    if not HAS_PYRUBBERBAND:
+        return vox_mono  # can't do per-frame shift without rubberband
+
+    try:
+        # Scale degrees for major/minor (semitone offsets from root)
+        major_scale = [0, 2, 4, 5, 7, 9, 11]
+        minor_scale = [0, 2, 3, 5, 7, 8, 10]
+        scale_degrees = major_scale if target_mode == "major" else minor_scale
+        # All chromatic scale notes in the key (all octaves)
+        scale_notes = set((target_root + d) % 12 for d in scale_degrees)
+
+        hop = 512
+        f0, voiced_flag, _ = librosa.pyin(
+            vox_mono, fmin=60, fmax=1200, sr=SR, hop_length=hop, fill_na=None)
+
+        if f0 is None or voiced_flag is None:
+            return vox_mono
+
+        # Frame duration in samples
+        frame_samples = hop
+        n_frames = len(f0)
+        out = vox_mono.copy()
+
+        i = 0
+        while i < n_frames:
+            # Find runs of voiced frames for efficient batch processing
+            if not voiced_flag[i] or not np.isfinite(f0[i]) or f0[i] <= 0:
+                i += 1
+                continue
+
+            # Detect the run length of consecutive voiced frames
+            j = i
+            while j < n_frames and voiced_flag[j] and np.isfinite(f0[j]) and f0[j] > 0:
+                j += 1
+
+            # Compute average pitch for the run
+            run_f0 = f0[i:j]
+            avg_hz = float(np.mean(run_f0))
+
+            # Convert Hz to MIDI note
+            midi_note = 12 * np.log2(avg_hz / 440.0) + 69
+            chroma = int(round(midi_note)) % 12
+
+            # Find nearest scale note
+            best_dist = 12
+            for note in scale_notes:
+                dist = (note - chroma + 6) % 12 - 6  # wrapped semitone distance
+                if abs(dist) < abs(best_dist):
+                    best_dist = dist
+
+            # Cents deviation (positive = too sharp, negative = too flat)
+            cents_off = (midi_note - (round(midi_note - best_dist))) * 100 % 100
+            if cents_off > 50:
+                cents_off -= 100
+
+            # Only correct if deviation is significant (>8 cents) to avoid killing vibrato
+            if abs(cents_off) > 8:
+                correction_semitones = -(cents_off / 100.0) * strength
+
+                s = i * frame_samples
+                e = min(j * frame_samples, len(out))
+                segment = out[s:e].astype(np.float32)
+
+                # Apply micro pitch shift to this segment
+                corrected = rb.pitch_shift(segment, SR, correction_semitones,
+                                           rbargs={'-3': ''})
+                out[s:e] = corrected[:e - s].astype(np.float32)
+
+            i = j
+
+        return out.astype(np.float32)
+
+    except Exception as e:
+        print(f"      [Pitch correction failed ({e}), skipping]", flush=True)
+        return vox_mono
+
+
 def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     """
     Spectral gating with noisereduce to remove Demucs bleed artifacts.
@@ -750,7 +846,8 @@ def _hpf_signal(audio_ch: np.ndarray, cutoff_hz: float, order: int = 4) -> np.nd
 
 
 def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
-                    params: dict, style=None) -> np.ndarray:
+                    params: dict, style=None,
+                    target_root: int = 0, target_mode: str = "major") -> np.ndarray:
     """
     Full professional vocal pipeline (v5 — style-adaptive):
       1. DeepFilterNet / noisereduce: remove bleed artifacts (per channel)
@@ -778,6 +875,16 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     vox = np.stack([
         _deepfilter_clean(vox[:, c]) for c in range(vox.shape[1])
     ], axis=1)
+
+    # Step 1b: pitch correction — snap vocal to target key BEFORE stretch
+    # Use mid channel for pitch detection, apply to both channels equally
+    vox_mid = _to_mono(vox)
+    vox_mid_corrected = _pitch_correct(vox_mid, target_root, target_mode, strength=0.65)
+    # Reconstruct stereo with the pitch-corrected mid
+    if not np.allclose(vox_mid, vox_mid_corrected):
+        ratio_corr = np.where(np.abs(vox_mid) > 1e-9,
+                              vox_mid_corrected / (vox_mid + 1e-9), 1.0).astype(np.float32)
+        vox = (vox * ratio_corr[:, np.newaxis]).astype(np.float32)
 
     # (samples, 2) → (2, samples) for pedalboard / pyrubberband
     vox_ch = vox.T.astype(np.float32)
@@ -845,8 +952,14 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     ])
     vox_ch = post_dynamics_board(vox_ch, SR).astype(np.float32)
 
-    # Step 10: subtle tape-style saturation (2nd harmonic enrichment)
-    vox_ch = (np.tanh(vox_ch * 1.3) / 1.3).astype(np.float32)
+    # Step 10: asymmetric waveshaper — adds even harmonics (2nd = "tube warmth")
+    # tanh alone only generates odd harmonics; biasing the input before tanh
+    # creates 2nd+3rd harmonic content, which is the "analog" saturation character
+    # found in tape machines and Class A tube preamps.
+    drive = 1.3
+    asym  = 0.12  # bias toward positive half-wave → 2nd harmonic generation
+    _vox_biased = vox_ch + asym * np.abs(vox_ch)
+    vox_ch = (np.tanh(drive * _vox_biased) / np.tanh(drive)).astype(np.float32)
 
     # Step 11: pre-delay reverb with HPF'd return (Abbey Road trick)
     pre_delay = int(SR * 0.020)  # 20ms pre-delay — tempo-independent
@@ -869,6 +982,47 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
 
     # Mix: dry + pre-delayed HPF'd reverb at style-adaptive wet level
     vox_ch = (vox_ch + reverb_shifted * style["reverb_wet"]).astype(np.float32)
+
+    # Step 12: Stereo ADT — Automatic Double Tracking (radio-ready width + thickness)
+    # Two copies: pitch-up (+6 cents) panned left, pitch-down (-6 cents) panned right.
+    # LFO on delay time (±2 ms @ 0.3 Hz) prevents static comb-filter notch.
+    # Research: 4-8 cents + 13-25ms delay is the "invisible" sweet spot.
+    rap = style.get("_rap_score", 0.5)
+    adt_cents = float(np.interp(rap, [0, 1], [6.0, 5.0]))  # singers slightly wider
+    adt_delay_ms = 22.0
+    adt_level = 0.20  # -14 dB — wide enough to feel, subtle enough to not fight the vocal
+
+    n_samp = vox_ch.shape[1]
+    # LFO for delay modulation — prevents static comb-filter notch
+    t = np.arange(n_samp, dtype=np.float32) / SR
+    lfo = (np.sin(2 * np.pi * 0.30 * t) * 0.002 * SR).astype(np.float32)  # ±2ms in samples
+
+    def _adt_copy(ch_audio, cents_shift, delay_base_ms, lfo_mod):
+        """Create one ADT copy: pitch shift + LFO-modulated delay."""
+        delay_base = int(delay_base_ms * SR / 1000)
+        if HAS_PYRUBBERBAND:
+            shifted = rb.pitch_shift(ch_audio, SR, cents_shift / 100.0,
+                                     rbargs={'-3': ''}).astype(np.float32)
+        else:
+            shifted = ch_audio.copy()  # skip pitch shift if no rubberband
+
+        # Build LFO-modulated delay using nearest-sample interpolation
+        delayed = np.zeros_like(shifted)
+        for s in range(delay_base, len(shifted)):
+            src = s - delay_base - int(lfo_mod[s] if s < len(lfo_mod) else 0)
+            src = max(0, min(len(shifted) - 1, src))
+            delayed[s] = shifted[src]
+        return delayed
+
+    # Mono signal for ADT input (preserves phase; stereo from L/R pan)
+    vox_mid_adt = ((vox_ch[0] + vox_ch[1]) * 0.5).astype(np.float32)
+
+    adt_L = _adt_copy(vox_mid_adt, +adt_cents, adt_delay_ms, lfo)
+    adt_R = _adt_copy(vox_mid_adt, -adt_cents, adt_delay_ms + 5.0, -lfo)
+
+    # Pan: add ADT L copy to L channel, R copy to R channel
+    vox_ch[0] = (vox_ch[0] + adt_L * adt_level).astype(np.float32)
+    vox_ch[1] = (vox_ch[1] + adt_R * adt_level).astype(np.float32)
 
     return vox_ch.T  # (samples, 2)
 
@@ -964,7 +1118,8 @@ def _parallel_compress(inst: np.ndarray) -> np.ndarray:
         Gain(gain_db=9.0),   # makeup: bring crushed level up to match dry
     ])
     crushed = crush(inst_ch, SR).T.astype(np.float32)
-    return (0.80 * inst + 0.20 * crushed).astype(np.float32)
+    # 30% wet: NY compression research shows 25-40% gives hip-hop density
+    return (0.70 * inst + 0.30 * crushed).astype(np.float32)
 
 
 def _sidechain_envelope(vox_mono: np.ndarray, n_out: int,
@@ -1154,12 +1309,14 @@ def _master(mix: np.ndarray) -> np.ndarray:
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
-    # Soft clip (tanh) — shaves peaks before the compressor
-    mix = (np.tanh(mix * 0.95) / 0.95).astype(np.float32)
+    # Soft clip: Chebyshev 3rd-order (1.5x - 0.5x³) — gentler than tanh,
+    # preserves low-level signal shape, clips peaks without hardness
+    mix_c = np.clip(mix, -1.0, 1.0)
+    mix = (1.5 * mix_c - 0.5 * mix_c ** 3).astype(np.float32)
 
-    # Glue compressor: very gentle, just for binding/density
+    # Glue compressor: SSL-style — faster attack for hip-hop punch (3ms → 1ms)
     glue = Pedalboard([
-        Compressor(threshold_db=-6.0, ratio=2.0, attack_ms=3.0, release_ms=100.0),
+        Compressor(threshold_db=-6.0, ratio=2.0, attack_ms=1.0, release_ms=80.0),
     ])
     mix = glue(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
@@ -1257,8 +1414,9 @@ def fuse(song_a: str, song_b: str, out_path: str,
           f"Sidechain depth: {sidechain_depth:.2f}", flush=True)
 
     rb_engine = "pyrubberband R3" if HAS_PYRUBBERBAND else "pedalboard (fallback)"
-    step(7, TOTAL, f"Processing vocals (DeepFilter + stretch [{rb_engine}] + style-adaptive chain)…")
-    vox = _process_vocals(vox, ratio, n_semi, vox_params, style)
+    step(7, TOTAL, f"Processing vocals (DeepFilter + pitch-correct + stretch [{rb_engine}] + style-adaptive chain)…")
+    vox = _process_vocals(vox, ratio, n_semi, vox_params, style,
+                          target_root=key_a_root, target_mode=key_a_mode)
 
     step(8, TOTAL, "Mixing (beat-align + spectral carve + M/S + sidechain + level match)…")
 
