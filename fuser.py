@@ -1343,6 +1343,51 @@ def _deess(vox: np.ndarray, threshold_db: float = -22.0,
     return (lo_all + hi_reduced).astype(np.float32)
 
 
+def _dynamic_eq_vocal(vox_ch: np.ndarray) -> np.ndarray:
+    """
+    Dynamic EQ: reduce 3kHz harshness only when that band gets loud.
+
+    Loud phrases (chest-voice belts, shouty rap) accumulate energy around 3kHz,
+    which fatigues the ear. A static cut would dull quiet phrases. A dynamic cut
+    (compressor keyed to the 3kHz band) only kicks in when it matters.
+
+    Implementation: bandpass-split at 2.5-4.5kHz, compute RMS envelope,
+    apply gain to the extracted mid band, recombine additively.
+    Approach: result = ch + bp_band * (gain - 1.0) subtracts the excess.
+
+    Research: 3-3.5kHz, Q=2.5-3, -2 to -4dB max, 10ms attack, 90ms release.
+    """
+    from scipy.signal import lfilter as _dq_lf
+    nyq = SR / 2.0
+    # Bandpass 2.5–4.5 kHz (harshness zone)
+    sos_bp = butter(4, [2500.0 / nyq, min(4500.0 / nyq, 0.999)],
+                    btype="band", output="sos")
+
+    mono = vox_ch.mean(axis=0).astype(np.float64)
+    bp_mono = sosfilt(sos_bp, mono)
+
+    # Vectorized peak-follower envelope (10ms attack, 90ms release)
+    a_atk = np.exp(-1.0 / (SR * 0.010))
+    a_rel = np.exp(-1.0 / (SR * 0.090))
+    rect = np.abs(bp_mono)
+    env_atk = _dq_lf([1.0 - a_atk], [1.0, -a_atk], rect)
+    env = _dq_lf([1.0 - a_rel], [1.0, -a_rel],
+                  np.maximum(env_atk, np.maximum.accumulate(rect) * 0.01)).astype(np.float32)
+
+    # Compute gain reduction (max -3dB, ratio ~2.5:1, dynamic threshold)
+    # Threshold computed adaptively from the 90th percentile of the envelope
+    thresh_lin = float(np.percentile(env[env > 1e-9], 80)) if np.any(env > 1e-9) else 1.0
+    over = np.clip(env / (thresh_lin + 1e-12) - 1.0, 0.0, None)  # 0 when below threshold
+    gain_db = np.clip(-over * 0.6 * 6.0, -3.0, 0.0)  # ratio ~2.5:1 max -3dB
+    gain_samp = (10 ** (gain_db / 20.0)).astype(np.float32)
+
+    # Apply: extract BP band, scale it, add the difference back
+    # result = ch + bp_ch * (gain - 1.0)  → subtracts excess from the harsh band
+    bp_all = sosfilt(sos_bp, vox_ch.astype(np.float64), axis=1).astype(np.float32)
+    delta = bp_all * (gain_samp[np.newaxis, :] - 1.0)
+    return (vox_ch + delta).astype(np.float32)
+
+
 def _multiband_compress_vocal(vox_ch: np.ndarray, style: dict) -> np.ndarray:
     """
     4-band multiband compression modeled on Waves C6 / iZotope Neutron.
@@ -1404,10 +1449,7 @@ def _hpf_signal(audio_ch: np.ndarray, cutoff_hz: float, order: int = 4) -> np.nd
     Used for the Abbey Road reverb return HPF trick.
     """
     sos = butter(order, cutoff_hz / (SR / 2), btype="high", output="sos")
-    out = np.zeros_like(audio_ch)
-    for c in range(audio_ch.shape[0]):
-        out[c] = sosfilt(sos, audio_ch[c]).astype(np.float32)
-    return out.astype(np.float32)
+    return sosfilt(sos, audio_ch, axis=1).astype(np.float32)
 
 
 def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
@@ -1534,6 +1576,12 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # Runs after the dual-stage broadband comp; refines each frequency region
     vox_ch = _multiband_compress_vocal(vox_ch, style)
 
+    # Step 8b2: dynamic EQ — reduce 3kHz harshness only on loud phrases
+    # Research: 3kHz is ISO 226 ear-sensitivity peak; belted/loud phrases accumulate
+    # harsh energy here. Dynamic EQ only cuts when energy exceeds 80th-percentile
+    # threshold — transparent on quiet phrases, controls harshness on loud ones.
+    vox_ch = _dynamic_eq_vocal(vox_ch)
+
     # Step 8c: NY parallel vocal compression — adds density without pumping
     # Blend of heavily crushed signal fills quiet gaps between syllables.
     # Research: 25-38% blend, 8:1, 3-5ms attack, 40-80ms release — standard for hip-hop vocals.
@@ -1613,20 +1661,26 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     tail_wet = style["reverb_wet"]
     vox_ch = (vox_ch + er_mix * er_wet + reverb_shifted * tail_wet).astype(np.float32)
 
-    # Step 11b: Slap-back echo — presence echo 80-100ms, no feedback.
-    # Research: 70-120ms single echo (0 feedback) at 12-18% wet adds presence
-    # and "fatness" to hip-hop vocals without sounding like reverb.
+    # Step 11b: Slap-back echo — presence echo 70-110ms, 0 feedback, HPF+shelf shaped.
+    # Research: 70-120ms single echo at 15-20% wet adds presence and "fatness".
     # BPM-synced: keep slap delay near an 8th-note (ensures rhythmic coherence).
+    # Tone-shaping on the echo RETURN (not the dry): HPF 150Hz + high-shelf -3dB @8kHz.
+    # This prevents the echo from muddying the low-mids or clashing with the dry vocal.
     eighth_note_ms = 60000.0 / max(bpm, 60.0) / 2.0
     slap_ms = float(np.clip(eighth_note_ms, 70.0, 110.0))
     slap_samp = int(SR * slap_ms / 1000.0)
-    # Slap level: rap needs slightly more fatness than singing
-    slap_level = float(np.interp(rap, [0, 1], [0.13, 0.16]))
+    slap_level = float(np.interp(rap, [0, 1], [0.14, 0.17]))  # rap gets slightly more
     slap_echo = np.concatenate([
         np.zeros((vox_ch.shape[0], slap_samp), dtype=np.float32),
         vox_ch,
     ], axis=1)[:, :vox_ch.shape[1]]
-    vox_ch = (vox_ch + slap_echo * slap_level).astype(np.float32)
+    # Tone-shape the echo return: roll off lows (150Hz HPF) and air (8kHz shelf -3dB)
+    slap_eq = Pedalboard([
+        HighpassFilter(cutoff_frequency_hz=150.0),
+        HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=-3.0),
+    ])
+    slap_echo_shaped = slap_eq(slap_echo.astype(np.float32), SR).astype(np.float32)
+    vox_ch = (vox_ch + slap_echo_shaped * slap_level).astype(np.float32)
 
     # Step 12: Stereo ADT — Automatic Double Tracking (radio-ready width + thickness)
     # Two copies: pitch-up (+6 cents) panned left, pitch-down (-6 cents) panned right.
@@ -2183,10 +2237,13 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     if mix.ndim == 2 and mix.shape[1] == 2:
         M, S = _ms_encode(mix)  # (samples,) each
 
-        # Mid EQ: cut mud at 350 Hz, subtle low-end emphasis
+        # Mid EQ: cut mud at 350 Hz, low-end warmth, and punch-through shelf.
+        # Research: +1 dB shelf at 3-5 kHz on the Mid improves mono compatibility
+        # and punch-through on phone speakers / earbuds (where M/S collapses to mono).
         mid_eq = Pedalboard([
             PeakFilter(cutoff_frequency_hz=350.0, gain_db=-1.5, q=1.2),
             LowShelfFilter(cutoff_frequency_hz=120.0, gain_db=0.5),  # sub warmth
+            HighShelfFilter(cutoff_frequency_hz=4000.0, gain_db=1.0), # +1dB mono punch-through
         ])
         M_proc = mid_eq(M[np.newaxis, :].astype(np.float32), SR)[0]
 
