@@ -682,6 +682,105 @@ def _detect_section_start(y_mono: np.ndarray, section: str = "chorus") -> int:
         return 0
 
 
+def _groove_quantize(vox: np.ndarray, inst_mono: np.ndarray,
+                     bpm: float, strength: float = 0.35) -> np.ndarray:
+    """
+    Vocal groove quantization: nudge vocal syllable onsets toward the beat grid.
+
+    Rappers and singers are naturally slightly ahead or behind the beat.
+    This function detects each vocal onset, finds the nearest beat or 8th-note
+    subdivision, and applies a small time shift to pull it toward the grid.
+
+    'strength' (0-1): 0 = no quantization, 1 = hard snap to grid
+    0.35 = subtle tightening (feels tighter but retains natural feel)
+
+    Algorithm:
+      1. Detect vocal onset positions (sample-accurate)
+      2. Compute the beat grid and 8th-note subdivisions from inst_mono
+      3. For each onset, find the nearest grid position
+      4. If offset < ±50ms (real timing, not gross error), apply time shift
+      5. Reconstruct audio by shifting segments between onsets
+    """
+    if not HAS_PYRUBBERBAND:
+        return vox  # no way to do fine-grain shifts without rubberband
+
+    try:
+        hop = 256  # smaller hop for precise onset detection
+        vox_mono = _to_mono(vox)
+
+        # Detect beat grid from instrumental
+        _, beats = librosa.beat.beat_track(y=inst_mono, sr=SR,
+                                           hop_length=hop, units="samples")
+        if len(beats) < 2:
+            return vox
+
+        # Build 8th-note grid (subdivide each beat by 2)
+        beat_period = float(np.median(np.diff(beats)))
+        eighth_period = beat_period / 2.0
+        grid = []
+        for b in beats:
+            grid.append(int(b))
+            eighth = int(b + eighth_period)
+            if eighth < len(vox_mono):
+                grid.append(eighth)
+        grid = sorted(set(grid))
+
+        # Detect vocal onsets
+        onset_samp = librosa.onset.onset_detect(
+            y=vox_mono, sr=SR, hop_length=hop, units="samples",
+            backtrack=True)
+
+        if len(onset_samp) == 0:
+            return vox
+
+        # Compute nudge amounts
+        max_nudge_ms = 50.0
+        max_nudge_samp = int(max_nudge_ms * SR / 1000)
+        nudges = {}  # onset_idx → nudge_samples
+
+        for ons in onset_samp:
+            nearest_grid = min(grid, key=lambda g: abs(g - ons))
+            raw_offset = nearest_grid - ons
+            if abs(raw_offset) <= max_nudge_samp:
+                nudge = int(raw_offset * strength)
+                nudges[int(ons)] = nudge
+
+        if not nudges:
+            return vox
+
+        # Apply nudges: shift audio segments
+        # Split at onset points and reassemble with shifts
+        result = vox.copy()
+        onset_list = sorted(nudges.keys())
+
+        for i, ons in enumerate(onset_list):
+            nudge = nudges[ons]
+            if nudge == 0:
+                continue
+            # End of this segment = next onset (or end of file)
+            seg_end = onset_list[i + 1] if i + 1 < len(onset_list) else len(vox)
+            seg_len = seg_end - ons
+
+            if seg_len < 128:
+                continue
+
+            # Shift this segment by nudge samples
+            new_start = ons + nudge
+            new_start = max(0, min(new_start, len(vox) - seg_len))
+
+            # Zero old position, write at new position
+            result[ons:seg_end] = 0.0
+            write_end = min(new_start + seg_len, len(result))
+            write_len = write_end - new_start
+            result[new_start:write_end] += vox[ons:ons + write_len]
+
+        return result.astype(np.float32)
+
+    except Exception as e:
+        print(f"      [Groove quantize failed ({e}), skipping]", flush=True)
+        return vox
+
+
 def _beat_align(inst_mono: np.ndarray, vox_stretched_mono: np.ndarray) -> tuple:
     """
     Align the first vocal onset to the nearest measure boundary in the instrumental.
@@ -1529,7 +1628,35 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
         elif lufs > -8:
             issues.append(f"Mix too loud: {lufs:.1f} LUFS (want -15 to -8)")
 
-    # ── 6. Stereo correlation (mono compatibility) ────────────────────────────
+    # ── 6. Phase cancellation check ───────────────────────────────────────────
+    # Per-band phase difference between vocal and instrumental.
+    # Bands where mean phase diff > 90° have partial cancellation in the mix.
+    try:
+        n_fft_p = 4096
+        n_p = min(len(vox_mono), len(inst_mono), n_fft_p)
+        Sv = np.fft.rfft(vox_mono[:n_p], n=n_fft_p)
+        Si = np.fft.rfft(inst_mono[:n_p], n=n_fft_p)
+        freqs_p = np.fft.rfftfreq(n_fft_p, 1.0 / SR)
+        phase_diff = np.abs(np.angle(Sv) - np.angle(Si))
+        phase_diff = np.where(phase_diff > np.pi, 2 * np.pi - phase_diff, phase_diff)
+        phase_diff_deg = np.degrees(phase_diff)
+
+        p_bands = {"bass": (80, 250), "lo_mid": (250, 800),
+                   "mid": (800, 3000), "hi_mid": (3000, 8000)}
+        phase_issues = []
+        for pname, (plo, phi) in p_bands.items():
+            pmask = (freqs_p >= plo) & (freqs_p < phi)
+            if pmask.any():
+                mean_pd = float(phase_diff_deg[pmask].mean())
+                if mean_pd > 110.0:
+                    phase_issues.append(f"{pname}:{mean_pd:.0f}°")
+        if phase_issues:
+            issues.append(f"Phase cancellation risk: {', '.join(phase_issues)} (>110° mean diff)")
+        scores["phase_issues"] = phase_issues
+    except Exception:
+        pass
+
+    # ── 7. Stereo correlation (mono compatibility) ────────────────────────────
     # A correlation below 0.5 means the mix has excessive out-of-phase content
     # and will partially cancel in mono (phone speakers, club PA mono fold).
     # Professional target: correlation > 0.7.
@@ -1717,6 +1844,14 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
     L = min(len(inst), len(vox))
     inst, vox = inst[:L], vox[:L]
+
+    # Groove quantization: nudge vocal syllables toward 8th-note grid (35% strength)
+    # Tightens timing without removing natural feel — most impactful for hip-hop/rap
+    rap_score = vox_char.get("rap_score", 0.5)
+    quant_strength = float(np.interp(rap_score, [0, 1], [0.20, 0.45]))
+    vox = _groove_quantize(vox, _to_mono(inst), bpm_a, strength=quant_strength)
+    print(f"      Groove quantize: strength={quant_strength:.2f} "
+          f"(rap={rap_score:.2f})", flush=True)
 
     # AI iterative mixer: closed-loop presence feedback, energy-envelope matching,
     # spectral carve, parallel compress, sidechain — all style-adaptive
