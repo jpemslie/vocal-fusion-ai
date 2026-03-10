@@ -2098,8 +2098,9 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
 
 def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     """
-    Mastering chain (v5):
-      M/S EQ → mastering EQ → soft clip → glue compressor → limiter → LUFS -9
+    Mastering chain (v6):
+      M/S EQ → mastering EQ → soft clip → glue comp → sub-bass limiter
+      → LUFS -9 normalize → brick-wall limiter -1.5 dBTP
 
     M/S EQ (new):
       Mid: -1.5 dB @ 350 Hz (remove mud from centered elements), sub preserved
@@ -2169,7 +2170,7 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     ])
     mix = glue(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
-    # Sub-bass limiter: limit 20-80Hz band separately BEFORE main limiter.
+    # Sub-bass limiter: limit 20-80Hz band separately before main brick-wall.
     # Prevents kick/808 from eating all the headroom and triggering brick-wall clamp.
     # Professional technique: sub-bass limiter at -3 dBFS (1-2ms attack, 60ms release).
     sos_sub_lp = butter(4, 80.0 / (SR / 2), btype="low",  output="sos")
@@ -2182,13 +2183,20 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     mix_sub_lim = sub_limiter(mix_sub.T.astype(np.float32), SR).T.astype(np.float32)
     mix = (mix_above + mix_sub_lim).astype(np.float32)
 
-    # Brick-wall limiter at -1.0 dBTP
-    limiter = Pedalboard([Limiter(threshold_db=-1.0, release_ms=50.0)])
-    mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
-
-    # LUFS normalize LAST: accounts for all gain reduction above
-    # -9.0 LUFS is hip-hop standard (-8 to -10)
+    # LUFS normalize BEFORE the brick-wall limiter.
+    # CRITICAL ORDER: normalize FIRST, then limit.
+    # If limiter came first: the normalize step could raise peaks ABOVE the
+    # limiter ceiling, causing clipping (e.g., limiter at -1 dBFS, normalize
+    # raises by +3 LU → peaks at +2 dBFS).
+    # Correct mastering order: all dynamics → LUFS normalize → brick-wall ceiling.
     mix = _lufs_normalize(mix, -9.0)
+
+    # Brick-wall limiter LAST: enforces peak ceiling after LUFS normalization.
+    # -1.5 dBTP (not -1.0) to leave headroom for inter-sample peaks:
+    # pedalboard's Limiter measures sample peaks; D/A reconstruction can add
+    # 0.5-2 dB of inter-sample overshoot. -1.5 dBTP ensures true peaks stay ≤ -0.5 dBTP.
+    limiter = Pedalboard([Limiter(threshold_db=-1.5, release_ms=50.0)])
+    mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
     return mix
 
 
