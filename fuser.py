@@ -1,5 +1,5 @@
 """
-VocalFusion Fusion Engine v3
+VocalFusion Fusion Engine v4
 ============================
 AI-driven adaptive mixing — parameters are derived from the actual audio
 content, not hardcoded presets.
@@ -15,6 +15,13 @@ Adaptive params:  Noise gate threshold, compressor settings, and sidechain
                   depth are all computed from the actual audio — not presets.
 M/S mixing:       Vocal is summed into the Mid channel only; the beat's Sides
                   are preserved untouched, keeping the stereo field intact.
+
+Vocal chain (v4, professional order):
+  HPF 80 Hz → Subtractive EQ → De-esser → FET comp → Opto comp →
+  NoiseGate → Additive EQ → Saturation → Pre-delay reverb (HPF'd return)
+
+Mastering (v4):
+  Mastering EQ → soft clip → glue compressor → LUFS -9 → brick-wall Limiter -1 dBTP
 """
 
 import hashlib
@@ -38,6 +45,12 @@ from pedalboard import (
 from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import butter, sosfilt
+
+try:
+    import pyrubberband as rb
+    HAS_PYRUBBERBAND = True
+except ImportError:
+    HAS_PYRUBBERBAND = False
 
 SR = 44100
 _BS_ROFORMER = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
@@ -363,7 +376,7 @@ def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     return nr.reduce_noise(
         y=vox_mono, sr=SR,
         stationary=False,
-        prop_decrease=0.45,   # 0.75 creates watery/metallic artifacts on melodic content
+        prop_decrease=0.35,   # 0.75 creates watery/metallic artifacts on melodic content
         n_fft=2048,
     ).astype(np.float32)
 
@@ -373,7 +386,7 @@ def _deess(vox: np.ndarray, threshold_db: float = -22.0,
     """
     Dynamic de-esser: detect sibilance energy (6.5 kHz+) per frame and apply
     proportional gain reduction when it exceeds threshold_db.
-    Placed before reverb so the tail doesn't get de-essed.
+    Placed BEFORE compression to prevent sibilance pumping the compressor.
     """
     mono = _to_mono(vox)
 
@@ -414,50 +427,92 @@ def _deess(vox: np.ndarray, threshold_db: float = -22.0,
     return out.astype(np.float32)
 
 
+def _hpf_signal(audio_ch: np.ndarray, cutoff_hz: float, order: int = 4) -> np.ndarray:
+    """
+    Apply a high-pass filter to a (channels, samples) array.
+    Used for the Abbey Road reverb return HPF trick.
+    """
+    sos = butter(order, cutoff_hz / (SR / 2), btype="high", output="sos")
+    out = np.zeros_like(audio_ch)
+    for c in range(audio_ch.shape[0]):
+        out[c] = sosfilt(sos, audio_ch[c]).astype(np.float32)
+    return out.astype(np.float32)
+
+
 def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
                     params: dict) -> np.ndarray:
     """
-    Full vocal pipeline:
+    Full professional vocal pipeline (v4 — correct chain order):
       1. noisereduce: remove Demucs bleed artifacts (per channel)
-      2. time_stretch + pitch_shift in ONE JUCE pass (no double-artefact)
-      3. HPF 100 Hz — remove rumble / low instrument bleed
-      4. Low-shelf cut -2 dB @ 200 Hz — reduce mud
-      5. Peak cut -3 dB @ 320 Hz — remove Demucs 'boxy' resonance
-      6. Peak boost +3 dB @ 3.5 kHz — presence / intelligibility
-      7. Adaptive Compressor — ratio/threshold from measured dynamic range
-      8. Adaptive NoiseGate — threshold from measured noise floor
-      9. De-esser — dynamic gain reduction above 6.5 kHz (before reverb)
-     10. Pre-delay reverb — 18 ms pre-delay separates voice from tail,
-         gives the vocal presence and depth rather than washing it out
+      2. pyrubberband R3 time-stretch + pitch-shift (one pass, formant-preserving)
+         fallback: pedalboard time_stretch
+      3. HPF 80 Hz, 24 dB/oct — remove low-end stem bleed (not 100 Hz)
+      4. Subtractive EQ: -3 dB @ 300 Hz (mud), -2 dB @ 500 Hz (boxy)
+      5. De-esser — BEFORE compression to prevent sibilance pumping the compressor
+      6. Compressor 1 (FET-type, fast): ratio=6:1, attack=2ms, release=60ms
+      7. Compressor 2 (Opto-type, slow): ratio=2.5:1, attack=20ms, release=250ms
+      8. NoiseGate (after compression)
+      9. Additive EQ (AFTER dynamics): +2.5 dB @ 3.5 kHz (presence), +2 dB shelf @ 10 kHz (air)
+     10. Subtle saturation: tanh(audio * 1.3) / 1.3 — tape 2nd harmonic enrichment
+     11. Pre-delay reverb with HPF'd return (Abbey Road trick):
+         - Reverb wet-only (room_size=0.12, damping=0.80, width=0.9)
+         - HPF reverb return at 500 Hz — prevents muddy reverb tail
+         - Pre-delay: 20ms (tempo-independent, keeps vocal intelligible)
+         - Mix at 8% wet
     """
     # Step 1: noisereduce on each channel
     vox = np.stack([
         _clean_vocal(vox[:, c]) for c in range(vox.shape[1])
     ], axis=1)
 
-    # (samples, 2) → (2, samples) for pedalboard
+    # (samples, 2) → (2, samples) for pedalboard / pyrubberband
     vox_ch = vox.T.astype(np.float32)
 
-    # Step 2: combined time-stretch + pitch-shift in one JUCE pass
-    if abs(ratio - 1.0) > 0.005 or n_semitones != 0:
-        vox_ch = pb_time_stretch(
-            vox_ch, SR,
-            stretch_factor=ratio,
-            pitch_shift_in_semitones=float(n_semitones),
-        ).astype(np.float32)
+    # Step 2: time-stretch + pitch-shift
+    # pyrubberband R3 engine gives much better formant preservation for vocals
+    if HAS_PYRUBBERBAND and (abs(ratio - 1.0) > 0.005 or n_semitones != 0):
+        vox_mono_list = []
+        for c in range(vox_ch.shape[0]):
+            y_s = rb.time_stretch(vox_ch[c], SR, ratio, rbargs={'-3': ''})
+            if n_semitones != 0:
+                y_s = rb.pitch_shift(y_s, SR, n_semitones, rbargs={'-3': ''})
+            vox_mono_list.append(y_s)
+        vox_ch = np.stack(vox_mono_list, axis=0).astype(np.float32)
+    else:
+        # Fallback: pedalboard
+        if abs(ratio - 1.0) > 0.005 or n_semitones != 0:
+            vox_ch = pb_time_stretch(
+                vox_ch, SR,
+                stretch_factor=ratio,
+                pitch_shift_in_semitones=float(n_semitones),
+            ).astype(np.float32)
 
-    # Steps 3-8: EQ + dynamics (dry — no reverb yet)
-    dry_board = Pedalboard([
-        HighpassFilter(cutoff_frequency_hz=100.0),
-        LowShelfFilter(cutoff_frequency_hz=200.0, gain_db=-2.0, q=0.7),
-        PeakFilter(cutoff_frequency_hz=320.0,  gain_db=-3.0, q=1.0),
-        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=3.0,  q=1.5),
-        HighShelfFilter(cutoff_frequency_hz=9000.0, gain_db=2.5),   # air / presence
+    # Steps 3-4: HPF + subtractive EQ (before dynamics)
+    pre_dynamics_board = Pedalboard([
+        HighpassFilter(cutoff_frequency_hz=80.0),      # 80 Hz (not 100) — low-end stem bleed
+        PeakFilter(cutoff_frequency_hz=300.0, gain_db=-3.0, q=1.2),   # mud
+        PeakFilter(cutoff_frequency_hz=500.0, gain_db=-2.0, q=1.5),   # boxy
+    ])
+    vox_ch = pre_dynamics_board(vox_ch, SR).astype(np.float32)
+
+    # Step 5: de-esser BEFORE compression (prevents sibilance pumping the compressor)
+    vox_ch = _deess(vox_ch.T, threshold_db=-22.0).T.astype(np.float32)
+
+    # Steps 6-8: dual compressor (FET → Opto) + NoiseGate
+    dynamics_board = Pedalboard([
+        # Compressor 1: FET-type, fast (catch transients, control peaks)
         Compressor(
             threshold_db=params["comp_thresh_db"],
-            ratio=params["comp_ratio"],
-            attack_ms=5.0,
-            release_ms=100.0,
+            ratio=6.0,
+            attack_ms=2.0,
+            release_ms=60.0,
+        ),
+        # Compressor 2: Opto-type, slow (smooth programme-level glue)
+        Compressor(
+            threshold_db=params["comp_thresh_db"] + 3.0,  # slightly higher thresh for Opto
+            ratio=2.5,
+            attack_ms=20.0,
+            release_ms=250.0,
         ),
         NoiseGate(
             threshold_db=params["gate_thresh_db"],
@@ -466,28 +521,38 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
             release_ms=150.0,
         ),
     ])
-    vox_dry = dry_board(vox_ch, SR).astype(np.float32)  # (2, samples)
+    vox_ch = dynamics_board(vox_ch, SR).astype(np.float32)
 
-    # Step 9: de-esser on dry signal (before reverb — don't de-ess the tail)
-    vox_dry = _deess(vox_dry.T, threshold_db=-22.0).T.astype(np.float32)
+    # Step 9: additive EQ AFTER dynamics (boosts are not compressed away)
+    post_dynamics_board = Pedalboard([
+        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=2.5, q=1.5),   # presence
+        HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=2.0),      # air
+    ])
+    vox_ch = post_dynamics_board(vox_ch, SR).astype(np.float32)
 
-    # Step 10: pre-delay reverb (18 ms gap before reverb tail starts)
-    pre_delay = int(SR * 0.018)  # 661 samples @ 44100
+    # Step 10: subtle tape-style saturation (2nd harmonic enrichment)
+    vox_ch = (np.tanh(vox_ch * 1.3) / 1.3).astype(np.float32)
+
+    # Step 11: pre-delay reverb with HPF'd return (Abbey Road trick)
+    pre_delay = int(SR * 0.020)  # 20ms pre-delay — tempo-independent
 
     # Reverb-only path (wet_level=1, dry_level=0)
     reverb_board = Pedalboard([
-        Reverb(room_size=0.15, damping=0.75, wet_level=1.0, dry_level=0.0, width=0.8),
+        Reverb(room_size=0.12, damping=0.80, wet_level=1.0, dry_level=0.0, width=0.9),
     ])
-    reverb_wet = reverb_board(vox_dry, SR).astype(np.float32)
+    reverb_wet = reverb_board(vox_ch, SR).astype(np.float32)
+
+    # Abbey Road trick: HPF the reverb RETURN at 500 Hz — prevents muddy reverb tail
+    reverb_wet = _hpf_signal(reverb_wet, cutoff_hz=500.0, order=4)
 
     # Shift reverb tail by pre_delay samples (pad front, trim end)
     reverb_shifted = np.concatenate([
         np.zeros((reverb_wet.shape[0], pre_delay), dtype=np.float32),
         reverb_wet,
-    ], axis=1)[:, :vox_dry.shape[1]]
+    ], axis=1)[:, :vox_ch.shape[1]]
 
-    # Mix: dry + pre-delayed reverb at 8% wet
-    vox_ch = (vox_dry + reverb_shifted * 0.08).astype(np.float32)
+    # Mix: dry + pre-delayed HPF'd reverb at 8% wet
+    vox_ch = (vox_ch + reverb_shifted * 0.08).astype(np.float32)
 
     return vox_ch.T  # (samples, 2)
 
@@ -633,9 +698,9 @@ def _sidechain(inst: np.ndarray, vox: np.ndarray,
     return (inst_lo + inst_hi_ducked).astype(np.float32)
 
 
-# ── Mastering ────────────────────────────────────────────────────────────────
+# ── Mastering ─────────────────────────────────────────────────────────────────
 
-def _lufs_normalize(y: np.ndarray, target: float = -11.0) -> np.ndarray:
+def _lufs_normalize(y: np.ndarray, target: float = -9.0) -> np.ndarray:
     meter = pyln.Meter(SR)
     lufs = meter.integrated_loudness(y)
     if not np.isfinite(lufs) or lufs < -70.0:
@@ -650,7 +715,7 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
     without needing a human listener. Checks:
 
       1. Beat sync   — what % of vocal onsets land within 60ms of an inst beat
-      2. Vocal level — is the vocal audible vs the mix (20-50% of mix RMS)
+      2. Vocal level — is the vocal audible vs the mix (40-70% of mix RMS)
       3. Spectral    — are all 5 frequency bands within commercial reference ranges
       4. Clipping    — any true peaks above -0.2 dBTP?
       5. LUFS        — is the integrated loudness in the -15 to -8 range?
@@ -709,10 +774,10 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
     ir = _rms(inst_mono)
     vp = vr / (ir + vr + 1e-9)
     scores["vocal_presence"] = round(vp * 100, 1)
-    if vp < 0.20:
-        issues.append(f"Vocal buried: {vp:.0%} of combined energy (want 25-45%)")
-    elif vp > 0.50:
-        issues.append(f"Vocal overpowers beat: {vp:.0%} of combined energy (want 25-45%)")
+    if vp < 0.40:
+        issues.append(f"Vocal buried: {vp:.0%} of combined energy (want 40-70%)")
+    elif vp > 0.70:
+        issues.append(f"Vocal overpowers beat: {vp:.0%} of combined energy (want 40-70%)")
 
     # ── 3. Spectral balance ───────────────────────────────────────────────────
     clip_s = min(len(mix_mono), SR * 60)
@@ -759,17 +824,36 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
 
 
 def _master(mix: np.ndarray) -> np.ndarray:
-    """Mastering EQ → soft clip → LUFS -11 → brick-wall Limiter -1 dBTP."""
-    # Mastering EQ: slight Lo-Mid cut to clean up warmth, air boost to open up HF
+    """
+    Mastering chain (v4):
+      EQ → soft clip → glue compressor → limiter → LUFS -9 (final normalize)
+
+    LUFS normalize goes LAST so it accounts for all gain reduction from the
+    glue compressor and limiter. Hip-hop target: -8 to -10 LUFS.
+    """
+    # Mastering EQ
     master_eq = Pedalboard([
         PeakFilter(cutoff_frequency_hz=600.0, gain_db=-1.0, q=0.8),
         HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=1.5),
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # Soft clip (tanh) — shaves peaks before the compressor
     mix = (np.tanh(mix * 0.95) / 0.95).astype(np.float32)
-    mix = _lufs_normalize(mix, -11.0)
+
+    # Glue compressor: very gentle, just for binding/density
+    glue = Pedalboard([
+        Compressor(threshold_db=-6.0, ratio=2.0, attack_ms=3.0, release_ms=100.0),
+    ])
+    mix = glue(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # Brick-wall limiter at -1.0 dBTP
     limiter = Pedalboard([Limiter(threshold_db=-1.0, release_ms=50.0)])
     mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # LUFS normalize LAST: accounts for all gain reduction above
+    # -9.0 LUFS is hip-hop standard (-8 to -10)
+    mix = _lufs_normalize(mix, -9.0)
     return mix
 
 
@@ -827,6 +911,11 @@ def fuse(song_a: str, song_b: str, out_path: str,
     print(f"      BPM ratio: {ratio:.4f}   pitch shift: {n_semi:+d} semitones",
           flush=True)
 
+    # Key compatibility warning: large shifts risk harmonic clashing
+    if abs(n_semi) > 3:
+        print(f"WARNING: {n_semi} semitone shift is large — may cause pitch artifacts "
+              f"or harmonic clashing", flush=True)
+
     step(6, TOTAL, "Analyzing stems for adaptive parameters…")
     vox_params = _analyze_vocal_stem(vox)
     overlap    = _spectral_overlap(_to_mono(vox), _to_mono(inst))
@@ -839,7 +928,8 @@ def fuse(song_a: str, song_b: str, out_path: str,
           f"Spectral overlap: {overlap:.3f}  "
           f"Sidechain depth: {sidechain_depth:.2f}", flush=True)
 
-    step(7, TOTAL, "Processing vocals (denoise + stretch + pitch + EQ + gate + reverb)…")
+    rb_engine = "pyrubberband R3" if HAS_PYRUBBERBAND else "pedalboard (fallback)"
+    step(7, TOTAL, f"Processing vocals (denoise + stretch + pitch [{rb_engine}] + EQ + gate + reverb)…")
     vox = _process_vocals(vox, ratio, n_semi, vox_params)
 
     step(8, TOTAL, "Mixing (beat-align + spectral carve + M/S + sidechain + level match)…")
@@ -860,16 +950,14 @@ def fuse(song_a: str, song_b: str, out_path: str,
     L = min(len(inst), len(vox))
     inst, vox = inst[:L], vox[:L]
 
-    # Level match: target vocal at ~35% of combined stem energy.
-    # Use full-signal RMS (not active-only) so silence gaps don't inflate the ratio.
-    # Separated vocal stems are much quieter than instrumentals; active_rms comparison
-    # was blowing up the multiplier and making the vocal 2–3× too loud.
+    # Level match: vocal 3-6 dB louder than instrumental (research: 1.41-2× inst_rms).
+    # Since spectral carving reduces the instrumental after this level set, 1.2×
+    # is the appropriate starting point — vocal ends up perceptually forward in the mix.
+    # Using plain _rms (not _active_rms): silence gaps must not inflate the multiplier.
     ir = _rms(_to_mono(inst))
     vr = _rms(_to_mono(vox))
     if vr > 1e-9:
-        # target_ratio: vox/inst so that vox/(inst+vox) ≈ 35%
-        # → vox/inst = 0.35/(1-0.35) = 0.538 ≈ 0.55
-        vox = (vox * (ir * 0.55 / vr)).astype(np.float32)
+        vox = (vox * (ir * 1.2 / vr)).astype(np.float32)
 
     # Content-aware spectral carve on instrumental
     inst = _adaptive_spectral_carve(inst, vox, carve_db=5.0)
@@ -899,16 +987,16 @@ def fuse(song_a: str, song_b: str, out_path: str,
     print("\n── Auto Quality Evaluation ─────────────────────────────────────", flush=True)
     ev = _auto_evaluate(mix, inst, vox, bpm_a)
     print(f"  Beat sync:      {ev['beat_sync_pct']}%  (want >45%)", flush=True)
-    print(f"  Vocal presence: {ev['vocal_presence']}%  (want 20-50%)", flush=True)
+    print(f"  Vocal presence: {ev['vocal_presence']}%  (want 40-70%)", flush=True)
     print(f"  LUFS:           {ev['lufs']} dB", flush=True)
     print(f"  Peak:           {ev['peak_dBFS']} dBFS", flush=True)
     print(f"  Bands:          {ev['bands']}", flush=True)
     if ev["issues"]:
         print("  ISSUES:", flush=True)
         for iss in ev["issues"]:
-            print(f"    ✗ {iss}", flush=True)
+            print(f"    x {iss}", flush=True)
     else:
-        print("  ✓ All checks passed", flush=True)
+        print("  All checks passed", flush=True)
     print(f"  Overall: {'PASS' if ev['pass'] else 'FAIL'}", flush=True)
 
     return out_path
