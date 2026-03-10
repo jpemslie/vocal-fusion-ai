@@ -207,9 +207,10 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         "air_db":       float(np.interp(rap, [0, 1], [2.5, 1.5])),
 
         # Reverb: rap/trap → tighter room; singing/pop → lusher plate
-        "reverb_room":  float(np.interp(rap, [0, 1], [0.18, 0.08])),
-        "reverb_damp":  float(np.interp(rap, [0, 1], [0.70, 0.85])),
-        "reverb_wet":   float(np.interp(rap, [0, 1], [0.10, 0.06])),
+        # Research: trap/drill = 3-5% wet; R&B/singing = 15-22% wet
+        "reverb_room":  float(np.interp(rap, [0, 1], [0.20, 0.07])),
+        "reverb_damp":  float(np.interp(rap, [0, 1], [0.65, 0.88])),
+        "reverb_wet":   float(np.interp(rap, [0, 1], [0.18, 0.03])),
 
         # Spectral carve: more bass-heavy → carve deeper in bass range
         "carve_db":     float(np.interp(bass, [0, 1], [4.0, 6.0])),
