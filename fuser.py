@@ -988,6 +988,59 @@ def _pitch_correct(vox_mono: np.ndarray, target_root: int, target_mode: str,
         return vox_mono
 
 
+def _consonant_enhance(vox_ch: np.ndarray, boost_db: float = 3.0,
+                        lo_hz: float = 4000.0, hi_hz: float = 9000.0,
+                        fast_ms: float = 0.8, slow_ms: float = 30.0) -> np.ndarray:
+    """
+    Consonant transient enhancement: boost "t", "d", "k", "s" attack transients
+    in the 4-9 kHz band WITHOUT boosting sustained hi-hat or cymbal noise.
+
+    The key insight: consonants are impulsive (fast attack, rapid decay < 30ms).
+    Hi-hats and cymbals are sustained (slow attack or sustained envelope).
+    Dual envelope detection isolates transient events from sustained noise.
+
+    This technique gives rap/vocal clarity without adding harshness.
+    """
+    sos_bp = butter(4, [lo_hz / (SR / 2), min(hi_hz / (SR / 2), 0.999)],
+                    btype="band", output="sos")
+    result = vox_ch.copy()
+
+    # Use mono sum for detection
+    mono = vox_ch.mean(axis=0).astype(np.float64)
+    band = sosfilt(sos_bp, mono)
+
+    # Dual envelope: fast = transients, slow = sustained
+    a_fast = np.exp(-1.0 / (SR * fast_ms / 1000.0))
+    a_slow = np.exp(-1.0 / (SR * slow_ms / 1000.0))
+    r      = np.exp(-1.0 / (SR * 40.0   / 1000.0))  # shared release
+
+    fast_env = np.zeros(len(band), dtype=np.float64)
+    slow_env = np.zeros(len(band), dtype=np.float64)
+    prev_f = prev_s = 0.0
+    for i in range(len(band)):
+        level = abs(band[i])
+        prev_f = (1 - a_fast) * level + a_fast * prev_f if level > prev_f \
+                 else (1 - r) * level + r * prev_f
+        prev_s = (1 - a_slow) * level + a_slow * prev_s if level > prev_s \
+                 else (1 - r) * level + r * prev_s
+        fast_env[i] = prev_f
+        slow_env[i] = prev_s
+
+    # Transient mask: where fast >> slow = consonant burst
+    diff = fast_env - slow_env
+    diff_norm = np.clip(diff / (slow_env + 1e-9), 0, 3.0) / 3.0  # 0-1
+
+    # Gain: boost only during transient events
+    boost_lin = 10 ** (boost_db / 20.0)
+    gain = (1.0 + (boost_lin - 1.0) * diff_norm).astype(np.float32)
+
+    # Apply gain to both channels
+    for c in range(result.shape[0]):
+        result[c] = (result[c] * gain).astype(np.float32)
+
+    return result.astype(np.float32)
+
+
 def _harmonic_excite(audio_ch: np.ndarray, crossover_hz: float = 3000.0,
                      drive: float = 2.0, mix_level: float = 0.12) -> np.ndarray:
     """
@@ -1263,7 +1316,12 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     ])
     vox_ch = post_dynamics_board(vox_ch, SR).astype(np.float32)
 
-    # Step 9b: harmonic exciter (Aphex-style) — adds upper harmonics stripped by
+    # Step 9b: consonant enhancement — boost "t","d","k" transients in 4-9kHz
+    # without boosting sustained hi-hats (dual envelope differentiates them)
+    consonant_boost = float(np.interp(style.get("_rap_score", 0.5), [0, 1], [2.0, 3.5]))
+    vox_ch = _consonant_enhance(vox_ch, boost_db=consonant_boost)
+
+    # Step 9c: harmonic exciter (Aphex-style) — adds upper harmonics stripped by
     # stem separation and digital processing. Crossover at 3kHz, 12% mix level.
     vox_ch = _harmonic_excite(vox_ch, crossover_hz=3000.0,
                                drive=2.0, mix_level=0.12)
