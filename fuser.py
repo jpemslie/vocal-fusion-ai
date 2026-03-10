@@ -1679,13 +1679,38 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
 
 def _master(mix: np.ndarray) -> np.ndarray:
     """
-    Mastering chain (v4):
-      EQ → soft clip → glue compressor → limiter → LUFS -9 (final normalize)
+    Mastering chain (v5):
+      M/S EQ → mastering EQ → soft clip → glue compressor → limiter → LUFS -9
 
-    LUFS normalize goes LAST so it accounts for all gain reduction from the
-    glue compressor and limiter. Hip-hop target: -8 to -10 LUFS.
+    M/S EQ (new):
+      Mid: -1.5 dB @ 350 Hz (remove mud from centered elements), sub preserved
+      Sides: +2 dB @ 8 kHz shelf (widen highs), -3 dB @ 100 Hz (mono-safe bass)
+
+    LUFS normalize goes LAST so it accounts for all gain reduction.
+    Hip-hop target: -9 LUFS (-8 to -10).
     """
-    # Mastering EQ
+    # M/S EQ: separate processing for Mid and Sides channels
+    if mix.ndim == 2 and mix.shape[1] == 2:
+        M, S = _ms_encode(mix)  # (samples,) each
+
+        # Mid EQ: cut mud at 350 Hz, subtle low-end emphasis
+        mid_eq = Pedalboard([
+            PeakFilter(cutoff_frequency_hz=350.0, gain_db=-1.5, q=1.2),
+            LowShelfFilter(cutoff_frequency_hz=120.0, gain_db=0.5),  # sub warmth
+        ])
+        M_proc = mid_eq(M[np.newaxis, :].astype(np.float32), SR)[0]
+
+        # Sides EQ: roll off sub-bass (mono-safe: bass should be center),
+        # add high-shelf air to widen presence
+        sides_eq = Pedalboard([
+            HighpassFilter(cutoff_frequency_hz=100.0),   # bass must be mono
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=2.0),  # widen highs
+        ])
+        S_proc = sides_eq(S[np.newaxis, :].astype(np.float32), SR)[0]
+
+        mix = _ms_decode(M_proc.astype(np.float32), S_proc.astype(np.float32))
+
+    # Mastering EQ (broadband)
     master_eq = Pedalboard([
         PeakFilter(cutoff_frequency_hz=600.0, gain_db=-1.0, q=0.8),
         HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=1.5),
