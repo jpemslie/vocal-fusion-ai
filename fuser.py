@@ -1525,7 +1525,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
             threshold_db=params["gate_thresh_db"],
             ratio=2.0,        # expander (was 10.0 hard gate) — natural decay
             attack_ms=5.0,    # slightly slower than gate to avoid clicking
-            release_ms=200.0, # slower release = smoother fade on word endings
+            release_ms=150.0, # 150ms = natural word-ending fade (research: 200ms slightly long)
         ),
     ])
     vox_ch = dynamics_board(vox_ch, SR).astype(np.float32)
@@ -2125,9 +2125,9 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         # Research: sides low-mids (300-600Hz) are often murky; cut 2-3dB here
         # improves clarity without affecting the vocal (which is Mid-only).
         sides_eq = Pedalboard([
-            HighpassFilter(cutoff_frequency_hz=100.0),              # bass must be mono
+            HighpassFilter(cutoff_frequency_hz=120.0),              # 120Hz mono-safe (safer than 100Hz)
             PeakFilter(cutoff_frequency_hz=400.0, gain_db=-2.5, q=0.8),  # muddy sides cut
-            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=2.0),    # widen highs
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=2.5),    # +2.5dB (research: 2.5-3dB pro range)
         ])
         S_proc = sides_eq(S[np.newaxis, :].astype(np.float32), SR)[0]
 
