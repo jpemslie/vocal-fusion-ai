@@ -1507,11 +1507,15 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
             attack_ms=style["opto_attack"],
             release_ms=style["opto_release"],
         ),
+        # Soft expander instead of hard gate (ratio 2:1 instead of 10:1).
+        # Research: hard gates (10:1) create audible click/chop on word endings.
+        # A 2:1 downward expander reduces level below threshold gradually —
+        # sounds like the natural decay of a voice, not a switch being cut.
         NoiseGate(
             threshold_db=params["gate_thresh_db"],
-            ratio=10.0,
-            attack_ms=3.0,
-            release_ms=150.0,
+            ratio=2.0,        # expander (was 10.0 hard gate) — natural decay
+            attack_ms=5.0,    # slightly slower than gate to avoid clicking
+            release_ms=200.0, # slower release = smoother fade on word endings
         ),
     ])
     vox_ch = dynamics_board(vox_ch, SR).astype(np.float32)
@@ -1522,7 +1526,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
 
     # Step 8c: NY parallel vocal compression — adds density without pumping
     # Blend of heavily crushed signal fills quiet gaps between syllables.
-    # Research: 25-38% blend, 8:1, fast attack, 100ms release — standard for hip-hop vocals.
+    # Research: 25-38% blend, 8:1, 3-5ms attack, 40-80ms release — standard for hip-hop vocals.
     rap = style.get("_rap_score", 0.5)
     vox_ch = _parallel_compress_vocal(vox_ch, rap_score=rap)
 
@@ -1800,8 +1804,8 @@ def _parallel_compress(inst: np.ndarray) -> np.ndarray:
         Gain(gain_db=9.0),   # makeup: bring crushed level up to match dry
     ])
     crushed = crush(inst_ch, SR).T.astype(np.float32)
-    # 30% wet: NY compression research shows 25-40% gives hip-hop density
-    return (0.70 * inst + 0.30 * crushed).astype(np.float32)
+    # 33% wet: NY compression research shows 30-35% is the hip-hop density sweet spot
+    return (0.67 * inst + 0.33 * crushed).astype(np.float32)
 
 
 def _parallel_compress_vocal(vox_ch: np.ndarray, rap_score: float = 0.5) -> np.ndarray:
@@ -1822,7 +1826,9 @@ def _parallel_compress_vocal(vox_ch: np.ndarray, rap_score: float = 0.5) -> np.n
     blend = float(np.interp(rap_score, [0, 1], [0.25, 0.38]))
 
     crush = Pedalboard([
-        Compressor(threshold_db=-25.0, ratio=8.0, attack_ms=5.0, release_ms=100.0),
+        # Research: 8:1+, 3-5ms attack, 40-80ms release (50ms starting point)
+        # Threshold -25dB: crushes almost everything, levels out dynamics fully
+        Compressor(threshold_db=-25.0, ratio=8.0, attack_ms=4.0, release_ms=50.0),
     ])
     crushed = crush(vox_ch, SR).astype(np.float32)
 
@@ -2076,7 +2082,7 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
     return scores
 
 
-def _master(mix: np.ndarray) -> np.ndarray:
+def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     """
     Mastering chain (v5):
       M/S EQ → mastering EQ → soft clip → glue compressor → limiter → LUFS -9
@@ -2135,9 +2141,14 @@ def _master(mix: np.ndarray) -> np.ndarray:
     mix_c = np.clip(mix, -1.0, 1.0)
     mix = (1.5 * mix_c - 0.5 * mix_c ** 3).astype(np.float32)
 
-    # Glue compressor: SSL-style — faster attack for hip-hop punch (3ms → 1ms)
+    # Glue compressor: BPM-synced release (60-70% of beat interval).
+    # Research: at 140 BPM (429ms/beat), target release ~250ms.
+    # At 80 BPM (750ms/beat), target ~450ms.
+    # Attack 10ms: fast enough to catch snare body but passes kick transient (slam).
+    beat_ms = 60000.0 / max(bpm, 60.0)
+    glue_release_ms = float(np.clip(beat_ms * 0.60, 50.0, 400.0))
     glue = Pedalboard([
-        Compressor(threshold_db=-6.0, ratio=2.0, attack_ms=1.0, release_ms=80.0),
+        Compressor(threshold_db=-6.0, ratio=2.0, attack_ms=10.0, release_ms=glue_release_ms),
     ])
     mix = glue(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
@@ -2314,7 +2325,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     mix = _fade(mix, fade_s=2.0)
 
     step(9, TOTAL, "Mastering…")
-    mix = _master(mix)
+    mix = _master(mix, bpm=bpm_a)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     sf.write(out_path, mix, SR, subtype="PCM_24")
