@@ -1415,10 +1415,25 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     _vox_biased = vox_ch + asym * np.abs(vox_ch)
     vox_ch = (np.tanh(drive * _vox_biased) / np.tanh(drive)).astype(np.float32)
 
-    # Step 11: pre-delay reverb with HPF'd return (Abbey Road trick)
-    pre_delay = int(SR * 0.020)  # 20ms pre-delay — tempo-independent
+    # Step 11: early reflections + pre-delay reverb with HPF'd return
+    #
+    # Early reflections (7ms, 14ms, 21ms at -3/-6/-9 dB) arrive BEFORE the
+    # diffuse reverb tail and "glue" the vocal to the acoustic space.
+    # Research: ER are the perceptually dominant quality factor in reverb.
+    pre_delay = int(SR * 0.020)  # 20ms pre-delay for reverb tail
+    er_levels = [(-3.0, 0.007), (-6.0, 0.014), (-9.0, 0.021)]  # (dB, sec)
 
-    # Reverb-only path (wet_level=1, dry_level=0)
+    er_mix = np.zeros_like(vox_ch)
+    for er_db, er_t in er_levels:
+        er_samp  = int(SR * er_t)
+        er_level = 10 ** (er_db / 20.0)
+        er_pad   = np.concatenate([
+            np.zeros((vox_ch.shape[0], er_samp), dtype=np.float32),
+            vox_ch,
+        ], axis=1)[:, :vox_ch.shape[1]]
+        er_mix += er_pad * er_level
+
+    # Reverb tail only (wet_level=1, dry_level=0)
     reverb_board = Pedalboard([
         Reverb(room_size=style["reverb_room"], damping=style["reverb_damp"],
                wet_level=1.0, dry_level=0.0, width=0.9),
@@ -1428,14 +1443,16 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # Abbey Road trick: HPF the reverb RETURN at 500 Hz — prevents muddy reverb tail
     reverb_wet = _hpf_signal(reverb_wet, cutoff_hz=500.0, order=4)
 
-    # Shift reverb tail by pre_delay samples (pad front, trim end)
+    # Pre-delay the diffuse tail (separate from early reflections)
     reverb_shifted = np.concatenate([
         np.zeros((reverb_wet.shape[0], pre_delay), dtype=np.float32),
         reverb_wet,
     ], axis=1)[:, :vox_ch.shape[1]]
 
-    # Mix: dry + pre-delayed HPF'd reverb at style-adaptive wet level
-    vox_ch = (vox_ch + reverb_shifted * style["reverb_wet"]).astype(np.float32)
+    # Mix: dry + early reflections + pre-delayed HPF'd diffuse tail
+    er_wet = style["reverb_wet"] * 0.4    # ER slightly quieter than tail
+    tail_wet = style["reverb_wet"]
+    vox_ch = (vox_ch + er_mix * er_wet + reverb_shifted * tail_wet).astype(np.float32)
 
     # Step 12: Stereo ADT — Automatic Double Tracking (radio-ready width + thickness)
     # Two copies: pitch-up (+6 cents) panned left, pitch-down (-6 cents) panned right.
