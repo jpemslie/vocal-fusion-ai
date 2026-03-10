@@ -988,6 +988,61 @@ def _pitch_correct(vox_mono: np.ndarray, target_root: int, target_mode: str,
         return vox_mono
 
 
+def _breath_reduce(vox_ch: np.ndarray, reduction_db: float = 8.0) -> np.ndarray:
+    """
+    Reduce breath noise between vocal phrases without gating on the voice itself.
+
+    Breath noise has two characteristics that distinguish it from voiced speech:
+      1. High spectral flatness (noise-like, not harmonic)
+      2. Low mid-frequency energy (no F1/F2 vowel formants in 300-2500 Hz)
+
+    Frames that are both flat AND mid-frequency-quiet are attenuated.
+    This avoids gating on consonants (which are also noisy but have more energy)
+    or the beginning of syllables (which have mid-frequency energy rising).
+
+    Not a hard gate — uses smooth gain to prevent pumping.
+    """
+    hop = 1024
+    n_fft = 2048
+    vox_mid = vox_ch.mean(axis=0).astype(np.float32)
+
+    # Compute frame-level features
+    S = np.abs(librosa.stft(vox_mid, n_fft=n_fft, hop_length=hop))
+    freqs = librosa.fft_frequencies(sr=SR, n_fft=n_fft)
+
+    # Spectral flatness per frame (0=pure tone, 1=noise)
+    flatness = librosa.feature.spectral_flatness(S=S)[0]
+
+    # Mid-band energy (300-2500 Hz) per frame
+    mid_mask = (freqs >= 300) & (freqs < 2500)
+    mid_energy = S[mid_mask].mean(axis=0)
+
+    # Normalize mid energy 0-1
+    mid_norm = mid_energy / (mid_energy.max() + 1e-9)
+
+    # Breath probability: high flatness AND low mid energy → breath
+    breath_prob = flatness * (1.0 - mid_norm)
+    breath_prob = gaussian_filter1d(breath_prob.astype(np.float64), sigma=3).astype(np.float32)
+
+    # Gain: 1.0 where voice, reduction where breath
+    reduction_lin = 10 ** (-reduction_db / 20.0)
+    frame_gain = 1.0 - (1.0 - reduction_lin) * np.clip(breath_prob, 0, 1)
+
+    # Interpolate frame gains to sample resolution
+    x_frames = np.arange(len(frame_gain), dtype=np.float64) * hop
+    x_samp   = np.arange(len(vox_mid), dtype=np.float64)
+    gain_samp = interp1d(
+        x_frames, frame_gain, kind="linear",
+        bounds_error=False, fill_value=(frame_gain[0], frame_gain[-1])
+    )(x_samp).astype(np.float32)
+
+    result = np.zeros_like(vox_ch)
+    for c in range(vox_ch.shape[0]):
+        result[c] = (vox_ch[c] * gain_samp).astype(np.float32)
+
+    return result.astype(np.float32)
+
+
 def _consonant_enhance(vox_ch: np.ndarray, boost_db: float = 3.0,
                         lo_hz: float = 4000.0, hi_hz: float = 9000.0,
                         fast_ms: float = 0.8, slow_ms: float = 30.0) -> np.ndarray:
@@ -1236,7 +1291,10 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         _deepfilter_clean(vox[:, c]) for c in range(vox.shape[1])
     ], axis=1)
 
-    # Step 1b: pitch correction — snap vocal to target key BEFORE stretch
+    # Step 1b: breath reduction — attenuate breath noise between phrases
+    vox = _breath_reduce(vox.T, reduction_db=8.0).T.astype(np.float32)
+
+    # Step 1d: pitch correction — snap vocal to target key BEFORE stretch
     # Use mid channel for pitch detection, apply to both channels equally
     vox_mid = _to_mono(vox)
     vox_mid_corrected = _pitch_correct(vox_mid, target_root, target_mode, strength=0.65)
