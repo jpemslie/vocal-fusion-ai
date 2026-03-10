@@ -349,8 +349,9 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
 
         # Process instrumental
         inst_c = _adaptive_spectral_carve(inst, vox_scaled, carve_db=carve_db)
-        # Restore drum transients softened by stem separation (attack +4dB, sustain -2dB)
-        inst_c = _transient_shape(inst_c, attack_gain_db=4.0, sustain_gain_db=-2.0)
+        # Restore drum transients softened by stem separation (attack +4dB, sustain -3dB)
+        # Research: -3 to -5 dB sustain reduction = tight, punchy hip-hop drums
+        inst_c = _transient_shape(inst_c, attack_gain_db=4.0, sustain_gain_db=-3.0)
         # Sub-bass management: kick transient sidechains 20-80Hz sub-bass
         inst_c = _kick_sub_sidechain(inst_c, depth=0.35)
         inst_c = _parallel_compress(inst_c)
@@ -376,10 +377,19 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         else:
             level_mult = max(level_mult * 0.85, 0.5)
 
-    # Final M/S mix
+    # Final M/S mix with dynamic stereo width
+    # Research: during vocal sections, narrow the beat's stereo field slightly
+    # so the vocal (always mono/Mid) has room to command attention.
+    # During instrumental breaks: full width (vocal env = low → width_gain ≈ 1.0)
+    # During vocal phrases:    80% width (vocal env = high → width_gain ≈ 0.80)
+    # 80ms window + slow attack/release = smooth, inaudible narrowing transitions.
+    vox_mono_ref = _to_mono(vox_scaled)
+    width_gain = _sidechain_envelope(vox_mono_ref, len(inst_c), depth=0.20,
+                                     window_ms=80, attack_ms=30.0, release_ms=300.0)
     inst_M, inst_S = _ms_encode(inst_c)
     vox_M, _       = _ms_encode(vox_scaled)
-    mix = _ms_decode(inst_M + vox_M, inst_S)
+    inst_S_dynamic = (inst_S * width_gain).astype(np.float32)
+    mix = _ms_decode(inst_M + vox_M, inst_S_dynamic)
     return mix
 
 
@@ -1904,27 +1914,34 @@ def _sidechain(inst: np.ndarray, vox: np.ndarray,
                depth: float, window_ms: int = 40,
                attack_ms: float = 10.0, release_ms: float = 100.0) -> np.ndarray:
     """
-    Multiband sidechain: duck only the mids/highs (200 Hz+) when vocal is loud.
-    Bass/sub-bass (< 200 Hz) pass through unaffected — kick and sub stay punchy.
-    depth is computed adaptively from spectral overlap.
-    attack_ms/release_ms: smoothing to prevent pumping at phrase boundaries.
+    Triband sidechain: duck only 200Hz-5kHz when vocal is loud.
+
+    - Sub/bass (<200Hz): no ducking — kick and sub stay punchy
+    - Mid zone (200Hz-5kHz): full depth — vocal and beat share this space most
+    - High (>5kHz): no ducking — hi-hats and air don't compete with vocal
+
+    Research (SSL/Neve engineers): multiband sidechain on drum bus, keyed to vocal,
+    targeting 300-600Hz and 1-5kHz (vocal "meat"). Ducking hi-hats is wasteful
+    and makes the beat sound thin when the vocal enters.
     """
-    # Split at 200 Hz (Linkwitz-Riley style: LP + HP, order 4)
-    crossover = 200.0
-    sos_lo = butter(4, crossover / (SR / 2), btype="low",  output="sos")
-    sos_hi = butter(4, crossover / (SR / 2), btype="high", output="sos")
+    sos_lo     = butter(4, 200.0  / (SR / 2), btype="low",  output="sos")
+    sos_mid_hp = butter(4, 200.0  / (SR / 2), btype="high", output="sos")
+    sos_mid_lp = butter(4, 5000.0 / (SR / 2), btype="low",  output="sos")
+    sos_hi     = butter(4, 5000.0 / (SR / 2), btype="high", output="sos")
 
-    inst_lo = sosfilt(sos_lo, inst, axis=0).astype(np.float32)  # kick, sub-bass
-    inst_hi = sosfilt(sos_hi, inst, axis=0).astype(np.float32)  # everything else
+    inst_lo  = sosfilt(sos_lo, inst, axis=0).astype(np.float32)   # < 200Hz: unaffected
+    inst_mid = sosfilt(sos_mid_lp,
+                       sosfilt(sos_mid_hp, inst, axis=0),
+                       axis=0).astype(np.float32)                  # 200Hz-5kHz: ducked
+    inst_hi  = sosfilt(sos_hi, inst, axis=0).astype(np.float32)   # > 5kHz: unaffected
 
-    # Sidechain gain from vocal envelope (only applied to mids/highs)
     vox_mono = _to_mono(vox)
     gain = _sidechain_envelope(vox_mono, len(inst), depth, window_ms,
                                 attack_ms=attack_ms, release_ms=release_ms)
 
-    inst_hi_ducked = (inst_hi * gain[:, np.newaxis]).astype(np.float32)
+    inst_mid_ducked = (inst_mid * gain[:, np.newaxis]).astype(np.float32)
 
-    return (inst_lo + inst_hi_ducked).astype(np.float32)
+    return (inst_lo + inst_mid_ducked + inst_hi).astype(np.float32)
 
 
 # ── Mastering ─────────────────────────────────────────────────────────────────
