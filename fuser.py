@@ -1640,18 +1640,30 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     def _adt_copy(ch_audio, cents_shift, delay_base_ms, lfo_mod):
         """Create one ADT copy: pitch shift + LFO-modulated delay."""
         delay_base = int(delay_base_ms * SR / 1000)
+        n_semi_adt = cents_shift / 100.0
         if HAS_PYRUBBERBAND:
-            shifted = rb.pitch_shift(ch_audio, SR, cents_shift / 100.0,
+            shifted = rb.pitch_shift(ch_audio, SR, n_semi_adt,
                                      rbargs={'-3': ''}).astype(np.float32)
         else:
-            shifted = ch_audio.copy()  # skip pitch shift if no rubberband
+            # Pedalboard fallback: pitch shift only (no time stretch)
+            shifted = pb_time_stretch(
+                ch_audio[np.newaxis, :].astype(np.float32), SR,
+                stretch_factor=1.0,
+                pitch_shift_in_semitones=float(n_semi_adt),
+                high_quality=True,
+            )[0].astype(np.float32)
+            # Trim/pad to original length
+            if len(shifted) > len(ch_audio):
+                shifted = shifted[:len(ch_audio)]
+            elif len(shifted) < len(ch_audio):
+                shifted = np.pad(shifted, (0, len(ch_audio) - len(shifted)))
 
-        # Build LFO-modulated delay using nearest-sample interpolation
-        delayed = np.zeros_like(shifted)
-        for s in range(delay_base, len(shifted)):
-            src = s - delay_base - int(lfo_mod[s] if s < len(lfo_mod) else 0)
-            src = max(0, min(len(shifted) - 1, src))
-            delayed[s] = shifted[src]
+        # Vectorized LFO-modulated delay (replaces sample-by-sample loop)
+        lfo_int = lfo_mod[:len(shifted)].astype(np.int32)
+        indices  = np.arange(len(shifted), dtype=np.int64)
+        src_idx  = np.clip(indices - delay_base - lfo_int, 0, len(shifted) - 1)
+        delayed  = shifted[src_idx].astype(np.float32)
+        delayed[:delay_base] = 0.0  # enforce pre-delay silence
         return delayed
 
     # Mono signal for ADT input (preserves phase; stereo from L/R pan)
