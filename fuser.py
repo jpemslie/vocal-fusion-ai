@@ -348,6 +348,8 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
 
         # Process instrumental
         inst_c = _adaptive_spectral_carve(inst, vox_scaled, carve_db=carve_db)
+        # Restore drum transients softened by stem separation (attack +4dB, sustain -2dB)
+        inst_c = _transient_shape(inst_c, attack_gain_db=4.0, sustain_gain_db=-2.0)
         inst_c = _parallel_compress(inst_c)
         inst_c = _sidechain(inst_c, vox_scaled,
                             depth=sidechain_depth * style["sidechain_mult"])
@@ -1090,6 +1092,57 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
 
 # ── Instrumental Processing ───────────────────────────────────────────────────
 
+def _transient_shape(inst: np.ndarray,
+                     attack_gain_db: float = 4.0,
+                     sustain_gain_db: float = -2.0,
+                     fast_ms: float = 1.0,
+                     slow_ms: float = 20.0,
+                     release_ms: float = 80.0) -> np.ndarray:
+    """
+    SPL Transient Designer-style transient shaping for the instrumental.
+
+    Stem separation (Demucs/BS-Roformer) softens drum transients by 2-4 dB.
+    This function restores attack definition by computing two envelope followers:
+      - Fast follower (1 ms attack):  tracks transient peaks
+      - Slow follower (20 ms attack): tracks sustained body
+    The difference fast - slow identifies transient vs sustain content.
+    Gain is applied proportionally to boost attack, reduce sustain.
+
+    Operates per-channel to preserve stereo image.
+    """
+    def _env_follow(audio, attack_ms, rel_ms):
+        a = np.exp(-1.0 / (SR * attack_ms / 1000.0))
+        r = np.exp(-1.0 / (SR * rel_ms / 1000.0))
+        env = np.zeros_like(audio)
+        prev = 0.0
+        for i in range(len(audio)):
+            level = abs(audio[i])
+            if level > prev:
+                env[i] = prev = (1 - a) * level + a * prev
+            else:
+                env[i] = prev = (1 - r) * level + r * prev
+        return env
+
+    result = np.zeros_like(inst)
+    att_lin = 10 ** (attack_gain_db / 20.0)
+    sus_lin = 10 ** (sustain_gain_db / 20.0)
+
+    for c in range(inst.shape[1]):
+        ch = inst[:, c].astype(np.float64)
+        fast_env = _env_follow(ch, fast_ms, release_ms)
+        slow_env = _env_follow(ch, slow_ms, release_ms)
+
+        # Transient mask: how much is fast vs slow (normalized 0-1)
+        total = fast_env + slow_env + 1e-12
+        transient_mask = fast_env / total   # high during transients
+        sustain_mask   = slow_env / total   # high during sustain
+
+        gain = transient_mask * att_lin + sustain_mask * sus_lin
+        result[:, c] = (ch * gain).astype(np.float32)
+
+    return result.astype(np.float32)
+
+
 def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
                               carve_db: float = 5.0,
                               smooth_sigma: float = 2.5) -> np.ndarray:
@@ -1349,6 +1402,22 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
             issues.append(f"Mix too quiet: {lufs:.1f} LUFS (want -15 to -8)")
         elif lufs > -8:
             issues.append(f"Mix too loud: {lufs:.1f} LUFS (want -15 to -8)")
+
+    # ── 6. Stereo correlation (mono compatibility) ────────────────────────────
+    # A correlation below 0.5 means the mix has excessive out-of-phase content
+    # and will partially cancel in mono (phone speakers, club PA mono fold).
+    # Professional target: correlation > 0.7.
+    if mix.ndim == 2 and mix.shape[1] == 2:
+        L = mix[:, 0].astype(np.float64)
+        R = mix[:, 1].astype(np.float64)
+        corr_num = float(np.mean(L * R))
+        corr_den = float(np.sqrt(np.mean(L ** 2) * np.mean(R ** 2)) + 1e-12)
+        stereo_corr = corr_num / corr_den
+        scores["stereo_corr"] = round(stereo_corr, 3)
+        if stereo_corr < 0.5:
+            issues.append(f"STEREO CORR FAIL: {stereo_corr:.2f} (mono cancel risk, want >0.7)")
+        elif stereo_corr < 0.7:
+            issues.append(f"Stereo corr marginal: {stereo_corr:.2f} (want >0.7 for mono safe)")
 
     scores["issues"] = issues
     scores["pass"]   = not any("FAIL" in i or "CLIP" in i for i in issues)
