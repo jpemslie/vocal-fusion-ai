@@ -586,14 +586,57 @@ def _separate_demucs(audio_path: str, out_dir: Path) -> None:
 # ── Analysis ──────────────────────────────────────────────────────────────────
 
 def detect_bpm(y_mono: np.ndarray) -> float:
-    onset_env = librosa.onset.onset_strength(y=y_mono, sr=SR, hop_length=512)
-    tempo = float(librosa.feature.rhythm.tempo(
-        onset_envelope=onset_env, sr=SR, hop_length=512)[0])
-    while tempo > 180.0:
-        tempo /= 2
-    while tempo < 60.0:
-        tempo *= 2
-    return tempo
+    """
+    Robust BPM detection for hip-hop/trap (typically 70-200 BPM actual).
+
+    Uses two-stage approach to handle half-tempo detection:
+    1. Primary: librosa.beat.beat_track (most robust for musical content)
+    2. Fallback: onset-envelope tempo if beat_track gives unreasonable result
+    3. Half-tempo correction: if detected BPM suggests half-tempo, try doubling
+
+    Hip-hop half-tempo problem: 140 BPM trap often detected as 70 BPM because
+    the hi-hat pattern runs at 140 but the kick/snare pattern matches 70 BPM
+    equally well. We resolve this by checking which is closer to 90-160 BPM range.
+    """
+    hop = 512
+    onset_env = librosa.onset.onset_strength(y=y_mono, sr=SR, hop_length=hop)
+
+    # Method 1: beat_track (more robust, uses beat autocorrelation)
+    bpm_bt, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=SR,
+                                         hop_length=hop)
+    bpm_bt = float(bpm_bt)
+
+    # Method 2: tempo from onset envelope (faster, less robust)
+    bpm_oe = float(librosa.feature.rhythm.tempo(
+        onset_envelope=onset_env, sr=SR, hop_length=hop)[0])
+
+    # Pick the one closer to the hip-hop range (90-170 BPM)
+    def distance_to_hiphop(bpm):
+        bpm = float(bpm)
+        return min(abs(bpm - 90), abs(bpm - 140), abs(bpm - 170))
+
+    bpm = bpm_bt if distance_to_hiphop(bpm_bt) <= distance_to_hiphop(bpm_oe) else bpm_oe
+
+    # Normalize range (handle half/double tempo detection)
+    while bpm > 200.0:
+        bpm /= 2
+    while bpm < 70.0:
+        bpm *= 2
+
+    # Half-tempo check: if 70-89 BPM, check if 2× is more plausible for hip-hop
+    # Hip-hop BPM range: most trap is 130-170, most hip-hop 85-115
+    # If detected is 70-84: likely half of 140-168 (trap) — if onset density suggests
+    # high onset rate (many hi-hats), double it
+    if 70.0 <= bpm < 88.0:
+        onset_rate = len(librosa.onset.onset_detect(
+            onset_envelope=onset_env, sr=SR, hop_length=hop)) / (len(y_mono) / SR)
+        # Trap has >4 onsets/second due to hi-hats; regular hip-hop has 2-4
+        if onset_rate > 4.5:
+            bpm *= 2.0
+            print(f"      BPM half-tempo corrected: ×2 (onset_rate={onset_rate:.1f}/s)",
+                  flush=True)
+
+    return float(bpm)
 
 
 def _best_ratio(bpm_a: float, bpm_b: float) -> float:
