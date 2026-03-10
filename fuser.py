@@ -52,6 +52,13 @@ try:
 except ImportError:
     HAS_PYRUBBERBAND = False
 
+try:
+    from df.enhance import enhance, init_df as _df_init_df
+    import torch as _torch
+    HAS_DEEPFILTER = True
+except Exception:
+    HAS_DEEPFILTER = False
+
 SR = 44100
 _BS_ROFORMER = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 
@@ -60,6 +67,309 @@ _KS_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
 _KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
                        2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 _NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+# ── AI Content Analysis ───────────────────────────────────────────────────────
+
+def _analyze_beat_character(beat_mono: np.ndarray, bpm: float) -> dict:
+    """
+    Derive continuous style scores from the beat's audio content.
+    Returns scores 0–1 that drive ALL adaptive parameter decisions.
+
+    Instead of hard genre buckets (trap/pop/hiphop), we compute a feature
+    vector and map it continuously to processing parameters.  This avoids
+    misclassification edge cases and produces more nuanced adaptation.
+
+    Scores:
+      aggressiveness  0=soft/downtempo  1=hard/trap/drill
+      bass_weight     0=light bass      1=heavy 808/sub dominant
+      brightness      0=warm/dark       1=bright/crispy hi-hats
+    """
+    clip = beat_mono[:SR * 30]  # first 30 s is enough
+
+    # ── Spectral features ──────────────────────────────────────────────────────
+    S = np.abs(librosa.stft(clip, n_fft=2048, hop_length=512))
+    freqs = librosa.fft_frequencies(sr=SR)
+
+    def _band_energy(lo, hi):
+        m = (freqs >= lo) & (freqs < hi)
+        return float(S[m].mean()) if m.any() else 0.0
+
+    total_e  = _band_energy(20, 20000) + 1e-9
+    sub_e    = _band_energy(20,  80)          # kick sub / 808
+    bass_e   = _band_energy(80,  250)
+    hihat_e  = _band_energy(8000, 16000)      # hi-hats / cymbals
+    centroid = float(librosa.feature.spectral_centroid(S=S, sr=SR).mean())
+
+    # Zero crossing rate — hi-hats / noise drive ZCR up
+    zcr = float(librosa.feature.zero_crossing_rate(clip).mean())
+
+    # ── Continuous scores ──────────────────────────────────────────────────────
+    # Aggressiveness: high BPM + high ZCR + high centroid → trap/drill
+    bpm_score        = np.clip((bpm - 80) / 80, 0, 1)   # 80 BPM=0, 160 BPM=1
+    zcr_score        = np.clip((zcr - 0.05) / 0.25, 0, 1)
+    centroid_score   = np.clip((centroid - 1500) / 3000, 0, 1)
+    aggressiveness   = float(np.mean([bpm_score, zcr_score, centroid_score]))
+
+    # Bass weight: sub + bass energy relative to total
+    bass_weight = float(np.clip((sub_e + bass_e) / total_e * 5, 0, 1))
+
+    # Brightness: hi-hat energy relative to total
+    brightness = float(np.clip(hihat_e / total_e * 20, 0, 1))
+
+    return {
+        "aggressiveness": round(aggressiveness, 3),
+        "bass_weight":    round(bass_weight, 3),
+        "brightness":     round(brightness, 3),
+        "bpm":            bpm,
+        "centroid_hz":    round(centroid, 0),
+        "zcr":            round(zcr, 4),
+    }
+
+
+def _analyze_vocal_character(vox_mono: np.ndarray) -> dict:
+    """
+    Detect vocal delivery style from the separated vocal stem.
+
+    rap_score 0=pure singing  1=pure rap/spoken-word
+
+    Features:
+      - ZCR variance:  rap has rapid ZCR changes (percussive syllables)
+      - Spectral flatness: rap is more noise-like (higher flatness)
+      - Onset rate: rap has more onsets per second
+      - Pitch range: singing spans wider semitone range than rap
+    """
+    clip = vox_mono[:SR * 30]
+
+    zcr        = librosa.feature.zero_crossing_rate(clip)[0]
+    zcr_var    = float(np.var(zcr))
+
+    flatness   = float(librosa.feature.spectral_flatness(y=clip).mean())
+
+    onsets     = librosa.onset.onset_detect(y=clip, sr=SR, hop_length=512, units="time")
+    onset_rate = len(onsets) / (len(clip) / SR + 1e-9)  # onsets per second
+
+    # Pitch range via PYIN fundamental
+    try:
+        f0, voiced, _ = librosa.pyin(clip, fmin=60, fmax=1200,
+                                     sr=SR, hop_length=512, fill_na=None)
+        f0_voiced = f0[voiced] if voiced is not None else np.array([])
+        if len(f0_voiced) > 20:
+            pitch_range_semitones = float(
+                12 * np.log2(f0_voiced.max() / (f0_voiced.min() + 1e-9)))
+        else:
+            pitch_range_semitones = 5.0
+    except Exception:
+        pitch_range_semitones = 8.0
+
+    # Normalize each feature → rap score contribution
+    zcr_var_score  = np.clip(zcr_var / 0.02, 0, 1)
+    flat_score     = np.clip((flatness - 0.01) / 0.06, 0, 1)
+    onset_score    = np.clip((onset_rate - 1.0) / 5.0, 0, 1)
+    pitch_score    = np.clip(1.0 - (pitch_range_semitones - 3) / 15, 0, 1)
+
+    rap_score = float(np.mean([zcr_var_score, flat_score, onset_score, pitch_score]))
+
+    return {
+        "rap_score":    round(rap_score, 3),
+        "onset_rate":   round(onset_rate, 2),
+        "flatness":     round(float(flatness), 4),
+        "pitch_range":  round(pitch_range_semitones, 1),
+    }
+
+
+def _style_params(beat_char: dict, vox_char: dict) -> dict:
+    """
+    Map continuous style scores → concrete DSP parameter values.
+    All parameters derived from audio content — nothing hardcoded.
+    """
+    agg  = beat_char["aggressiveness"]   # 0–1
+    bass = beat_char["bass_weight"]      # 0–1
+    rap  = vox_char["rap_score"]         # 0–1
+
+    return {
+        # FET compressor: rap/trap → faster, harder
+        "fet_ratio":    float(np.interp(rap, [0, 1], [4.0, 8.0])),
+        "fet_attack":   float(np.interp(rap, [0, 1], [5.0, 1.0])),
+        "fet_release":  float(np.interp(agg, [0, 1], [100.0, 40.0])),
+
+        # Opto compressor: more gentle always, but faster for aggressive
+        "opto_ratio":   float(np.interp(agg, [0, 1], [2.0, 3.0])),
+        "opto_attack":  float(np.interp(agg, [0, 1], [30.0, 15.0])),
+        "opto_release": float(np.interp(agg, [0, 1], [300.0, 150.0])),
+
+        # Presence boost: rap needs more mid-presence for intelligibility
+        "presence_db":  float(np.interp(rap, [0, 1], [2.0, 3.5])),
+        "presence_hz":  float(np.interp(rap, [0, 1], [4000.0, 3000.0])),
+
+        # Air shelf: singing benefits from more air than rap
+        "air_db":       float(np.interp(rap, [0, 1], [2.5, 1.5])),
+
+        # Reverb: rap/trap → tighter room; singing/pop → lusher plate
+        "reverb_room":  float(np.interp(rap, [0, 1], [0.18, 0.08])),
+        "reverb_damp":  float(np.interp(rap, [0, 1], [0.70, 0.85])),
+        "reverb_wet":   float(np.interp(rap, [0, 1], [0.10, 0.06])),
+
+        # Spectral carve: more bass-heavy → carve deeper in bass range
+        "carve_db":     float(np.interp(bass, [0, 1], [4.0, 6.0])),
+
+        # Sidechain: aggressive beat → more sidechain duck
+        "sidechain_mult": float(np.interp(agg, [0, 1], [0.9, 1.2])),
+
+        # Vocal level: rap sits louder relative to beat
+        "vocal_level":  float(np.interp(rap, [0, 1], [1.1, 1.4])),
+    }
+
+
+def _smart_key_shift(n_semi: int, key_b_root: int, key_b_mode: str,
+                     key_a_root: int, key_a_mode: str) -> tuple:
+    """
+    If the direct semitone shift is large (>3), try alternate harmonic
+    relationships that might be more compatible:
+      - Try parallel mode: if B is minor, try its relative major (+3 semitones)
+      - Try octave-equivalent: n_semi - 12 or n_semi + 12
+    Returns (best_n_semi, explanation).
+    """
+    if abs(n_semi) <= 3:
+        return n_semi, "compatible"
+
+    candidates = [n_semi]
+
+    # Relative major/minor: same key signature, different root
+    if key_b_mode == "minor":
+        rel = semitones_to_shift(key_b_root, "major", key_a_root, key_a_mode)
+        candidates.append(rel)
+    else:
+        rel = semitones_to_shift(key_b_root, "minor", key_a_root, key_a_mode)
+        candidates.append(rel)
+
+    # Octave-wrapped alternatives
+    for c in list(candidates):
+        if c > 6:
+            candidates.append(c - 12)
+        elif c < -6:
+            candidates.append(c + 12)
+
+    # Pick the smallest absolute shift
+    best = min(candidates, key=abs)
+    if best != n_semi:
+        return best, f"re-mapped {n_semi:+d} → {best:+d} semitones (better harmonic fit)"
+    return n_semi, f"{n_semi:+d} semitones (large shift — harmonic clash risk)"
+
+
+def _deepfilter_clean(vox_mono: np.ndarray) -> np.ndarray:
+    """
+    Clean vocal stem using DeepFilterNet (neural noise suppression) if available.
+    Handles musical noise and bleed artifacts far better than spectral gating.
+    Falls back to noisereduce if DeepFilterNet is not installed.
+    """
+    if not HAS_DEEPFILTER:
+        return _clean_vocal(vox_mono)
+
+    try:
+        import soxr
+        model, df_state, _ = _df_init_df()
+        # DeepFilterNet expects 48 kHz
+        vox_48k = soxr.resample(vox_mono.astype(np.float32), SR, 48000).astype(np.float32)
+        t = _torch.from_numpy(vox_48k).unsqueeze(0)
+        enhanced = enhance(model, df_state, t).squeeze(0).numpy()
+        return soxr.resample(enhanced, 48000, SR).astype(np.float32)
+    except Exception as e:
+        print(f"      [DeepFilter failed ({e}), using noisereduce]", flush=True)
+        return _clean_vocal(vox_mono)
+
+
+def _energy_match_envelope(inst: np.ndarray, vox: np.ndarray,
+                            target_ratio: float = 1.2,
+                            window_s: float = 2.0) -> np.ndarray:
+    """
+    Dynamic level matching: scale the vocal in overlapping windows so that
+    locally vox_rms ≈ target_ratio × inst_rms.
+
+    This creates natural breathing — the vocal follows the beat's energy
+    envelope rather than sitting at a static level.  Loud drop sections
+    get a louder vocal; breakdown sections let the beat breathe.
+
+    Gain is smoothed (σ=3 frames) to prevent audible pumping.
+    """
+    win = int(SR * window_s)
+    hop = win // 4
+    n   = min(len(inst), len(vox))
+
+    inst_mono = _to_mono(inst[:n])
+    vox_mono  = _to_mono(vox[:n])
+    vox_out   = vox[:n].copy()
+
+    n_frames = max(1, (n + hop - 1) // hop)
+    gains = np.ones(n_frames, dtype=np.float32)
+
+    for i in range(n_frames):
+        s, e = i * hop, min(i * hop + win, n)
+        ir = _rms(inst_mono[s:e])
+        vr = _rms(vox_mono[s:e])
+        if vr > 1e-9 and ir > 1e-9:
+            gains[i] = np.clip((ir * target_ratio) / vr, 0.4, 4.0)
+
+    gains = gaussian_filter1d(gains.astype(np.float64), sigma=3.0).astype(np.float32)
+
+    x_f = np.arange(n_frames, dtype=np.float64) * hop
+    x_s = np.arange(n, dtype=np.float64)
+    gain_samp = interp1d(
+        x_f, gains, kind="linear",
+        bounds_error=False, fill_value=(gains[0], gains[-1])
+    )(x_s).astype(np.float32)
+
+    return (vox_out * gain_samp[:, np.newaxis]).astype(np.float32)
+
+
+def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
+                   style: dict, sidechain_depth: float,
+                   bpm_a: float, max_iter: int = 3) -> np.ndarray:
+    """
+    Closed-loop mixer: produce a mix, evaluate vocal presence,
+    adjust level multiplier, repeat until target is met.
+
+    Eliminates the manual trial-and-error of finding the right vocal level.
+    Target vocal presence: 40–65% of combined stem energy.
+    """
+    level_mult = style["vocal_level"]
+    carve_db   = style["carve_db"]
+
+    for iteration in range(max_iter):
+        # Apply energy-envelope matching then static scalar
+        ir = _rms(_to_mono(inst))
+        vr = _rms(_to_mono(vox))
+        vox_scaled = (vox * (ir * level_mult / (vr + 1e-9))).astype(np.float32)
+
+        # Dynamic envelope: vocal tracks beat energy locally
+        vox_scaled = _energy_match_envelope(inst, vox_scaled,
+                                            target_ratio=level_mult)
+
+        # Process instrumental
+        inst_c = _adaptive_spectral_carve(inst, vox_scaled, carve_db=carve_db)
+        inst_c = _parallel_compress(inst_c)
+        inst_c = _sidechain(inst_c, vox_scaled,
+                            depth=sidechain_depth * style["sidechain_mult"])
+
+        # Evaluate presence
+        vp = _rms(_to_mono(vox_scaled)) / (
+             _rms(_to_mono(inst_c)) + _rms(_to_mono(vox_scaled)) + 1e-9)
+
+        print(f"      Mix iter {iteration+1}: presence={vp:.0%}  "
+              f"level_mult={level_mult:.2f}  carve={carve_db:.1f}dB", flush=True)
+
+        if 0.40 <= vp <= 0.65 or iteration == max_iter - 1:
+            break
+        elif vp < 0.40:
+            level_mult = min(level_mult * 1.18, 3.0)
+        else:
+            level_mult = max(level_mult * 0.85, 0.5)
+
+    # Final M/S mix
+    inst_M, inst_S = _ms_encode(inst_c)
+    vox_M, _       = _ms_encode(vox_scaled)
+    mix = _ms_decode(inst_M + vox_M, inst_S)
+    return mix
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -440,29 +750,33 @@ def _hpf_signal(audio_ch: np.ndarray, cutoff_hz: float, order: int = 4) -> np.nd
 
 
 def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
-                    params: dict) -> np.ndarray:
+                    params: dict, style=None) -> np.ndarray:
     """
-    Full professional vocal pipeline (v4 — correct chain order):
-      1. noisereduce: remove Demucs bleed artifacts (per channel)
-      2. pyrubberband R3 time-stretch + pitch-shift (one pass, formant-preserving)
+    Full professional vocal pipeline (v5 — style-adaptive):
+      1. DeepFilterNet / noisereduce: remove bleed artifacts (per channel)
+      2. pyrubberband R3 time-stretch + pitch-shift (formant-preserving)
          fallback: pedalboard time_stretch
-      3. HPF 80 Hz, 24 dB/oct — remove low-end stem bleed (not 100 Hz)
+      3. HPF 80 Hz, 24 dB/oct
       4. Subtractive EQ: -3 dB @ 300 Hz (mud), -2 dB @ 500 Hz (boxy)
-      5. De-esser — BEFORE compression to prevent sibilance pumping the compressor
-      6. Compressor 1 (FET-type, fast): ratio=6:1, attack=2ms, release=60ms
-      7. Compressor 2 (Opto-type, slow): ratio=2.5:1, attack=20ms, release=250ms
-      8. NoiseGate (after compression)
-      9. Additive EQ (AFTER dynamics): +2.5 dB @ 3.5 kHz (presence), +2 dB shelf @ 10 kHz (air)
-     10. Subtle saturation: tanh(audio * 1.3) / 1.3 — tape 2nd harmonic enrichment
-     11. Pre-delay reverb with HPF'd return (Abbey Road trick):
-         - Reverb wet-only (room_size=0.12, damping=0.80, width=0.9)
-         - HPF reverb return at 500 Hz — prevents muddy reverb tail
-         - Pre-delay: 20ms (tempo-independent, keeps vocal intelligible)
-         - Mix at 8% wet
+      5. De-esser (BEFORE compression)
+      6. Compressor 1 (FET-type): style-adaptive ratio/attack/release
+      7. Compressor 2 (Opto-type): style-adaptive ratio/attack/release
+      8. NoiseGate
+      9. Additive EQ: style-adaptive presence boost + air shelf
+     10. Subtle saturation
+     11. Pre-delay reverb: style-adaptive room/damp/wet, HPF'd return
     """
-    # Step 1: noisereduce on each channel
+    if style is None:
+        style = {
+            "fet_ratio": 6.0, "fet_attack": 2.0, "fet_release": 60.0,
+            "opto_ratio": 2.5, "opto_attack": 20.0, "opto_release": 250.0,
+            "presence_db": 2.5, "presence_hz": 3500.0,
+            "air_db": 2.0, "reverb_room": 0.12, "reverb_damp": 0.80, "reverb_wet": 0.08,
+        }
+
+    # Step 1: neural noise suppression (DeepFilter) or fallback noisereduce
     vox = np.stack([
-        _clean_vocal(vox[:, c]) for c in range(vox.shape[1])
+        _deepfilter_clean(vox[:, c]) for c in range(vox.shape[1])
     ], axis=1)
 
     # (samples, 2) → (2, samples) for pedalboard / pyrubberband
@@ -498,21 +812,21 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # Step 5: de-esser BEFORE compression (prevents sibilance pumping the compressor)
     vox_ch = _deess(vox_ch.T, threshold_db=-22.0).T.astype(np.float32)
 
-    # Steps 6-8: dual compressor (FET → Opto) + NoiseGate
+    # Steps 6-8: dual compressor (FET → Opto) + NoiseGate — style-adaptive
     dynamics_board = Pedalboard([
         # Compressor 1: FET-type, fast (catch transients, control peaks)
         Compressor(
             threshold_db=params["comp_thresh_db"],
-            ratio=6.0,
-            attack_ms=2.0,
-            release_ms=60.0,
+            ratio=style["fet_ratio"],
+            attack_ms=style["fet_attack"],
+            release_ms=style["fet_release"],
         ),
         # Compressor 2: Opto-type, slow (smooth programme-level glue)
         Compressor(
-            threshold_db=params["comp_thresh_db"] + 3.0,  # slightly higher thresh for Opto
-            ratio=2.5,
-            attack_ms=20.0,
-            release_ms=250.0,
+            threshold_db=params["comp_thresh_db"] + 3.0,
+            ratio=style["opto_ratio"],
+            attack_ms=style["opto_attack"],
+            release_ms=style["opto_release"],
         ),
         NoiseGate(
             threshold_db=params["gate_thresh_db"],
@@ -523,10 +837,11 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     ])
     vox_ch = dynamics_board(vox_ch, SR).astype(np.float32)
 
-    # Step 9: additive EQ AFTER dynamics (boosts are not compressed away)
+    # Step 9: additive EQ AFTER dynamics — style-adaptive presence + air
     post_dynamics_board = Pedalboard([
-        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=2.5, q=1.5),   # presence
-        HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=2.0),      # air
+        PeakFilter(cutoff_frequency_hz=style["presence_hz"],
+                   gain_db=style["presence_db"], q=1.5),
+        HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=style["air_db"]),
     ])
     vox_ch = post_dynamics_board(vox_ch, SR).astype(np.float32)
 
@@ -538,7 +853,8 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
 
     # Reverb-only path (wet_level=1, dry_level=0)
     reverb_board = Pedalboard([
-        Reverb(room_size=0.12, damping=0.80, wet_level=1.0, dry_level=0.0, width=0.9),
+        Reverb(room_size=style["reverb_room"], damping=style["reverb_damp"],
+               wet_level=1.0, dry_level=0.0, width=0.9),
     ])
     reverb_wet = reverb_board(vox_ch, SR).astype(np.float32)
 
@@ -551,8 +867,8 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         reverb_wet,
     ], axis=1)[:, :vox_ch.shape[1]]
 
-    # Mix: dry + pre-delayed HPF'd reverb at 8% wet
-    vox_ch = (vox_ch + reverb_shifted * 0.08).astype(np.float32)
+    # Mix: dry + pre-delayed HPF'd reverb at style-adaptive wet level
+    vox_ch = (vox_ch + reverb_shifted * style["reverb_wet"]).astype(np.float32)
 
     return vox_ch.T  # (samples, 2)
 
@@ -911,26 +1227,38 @@ def fuse(song_a: str, song_b: str, out_path: str,
     print(f"      BPM ratio: {ratio:.4f}   pitch shift: {n_semi:+d} semitones",
           flush=True)
 
-    # Key compatibility warning: large shifts risk harmonic clashing
-    if abs(n_semi) > 3:
-        print(f"WARNING: {n_semi} semitone shift is large — may cause pitch artifacts "
-              f"or harmonic clashing", flush=True)
+    # Smart key shift: find best harmonic alternative if shift is large
+    n_semi, key_msg = _smart_key_shift(n_semi, key_b_root, key_b_mode,
+                                        key_a_root, key_a_mode)
+    print(f"      Key: {key_msg}", flush=True)
 
-    step(6, TOTAL, "Analyzing stems for adaptive parameters…")
+    step(6, TOTAL, "Analyzing audio content for AI-adaptive parameters…")
+    # AI content analysis: derive all DSP parameters from actual audio
+    beat_char  = _analyze_beat_character(full_a, bpm_a)
+    vox_char   = _analyze_vocal_character(_to_mono(stems_b["vocals"]))
+    style      = _style_params(beat_char, vox_char)
     vox_params = _analyze_vocal_stem(vox)
     overlap    = _spectral_overlap(_to_mono(vox), _to_mono(inst))
-    # Spectral carve already handles freq-specific competition (up to -5 dB).
-    # Sidechain adds broadband duck on top — keep it light (max -2.5 dB) so
-    # the combined effect stays within 7-8 dB, not the 9+ dB of the old code.
     sidechain_depth = float(np.clip(overlap * 0.4, 0.10, 0.22))
+    print(f"      Beat: agg={beat_char['aggressiveness']:.2f}  "
+          f"bass={beat_char['bass_weight']:.2f}  "
+          f"brightness={beat_char['brightness']:.2f}", flush=True)
+    print(f"      Vocal: rap_score={vox_char['rap_score']:.2f}  "
+          f"onset_rate={vox_char['onset_rate']:.1f}/s  "
+          f"pitch_range={vox_char['pitch_range']:.0f}st", flush=True)
+    print(f"      Style → FET {style['fet_ratio']:.1f}:1  "
+          f"reverb_room={style['reverb_room']:.2f}  "
+          f"reverb_wet={style['reverb_wet']:.2f}  "
+          f"carve={style['carve_db']:.1f}dB  "
+          f"vocal_level={style['vocal_level']:.2f}", flush=True)
     print(f"      Gate thresh: {vox_params['gate_thresh_db']:.1f} dB  "
           f"Comp ratio: {vox_params['comp_ratio']:.1f}:1  "
           f"Spectral overlap: {overlap:.3f}  "
           f"Sidechain depth: {sidechain_depth:.2f}", flush=True)
 
     rb_engine = "pyrubberband R3" if HAS_PYRUBBERBAND else "pedalboard (fallback)"
-    step(7, TOTAL, f"Processing vocals (denoise + stretch + pitch [{rb_engine}] + EQ + gate + reverb)…")
-    vox = _process_vocals(vox, ratio, n_semi, vox_params)
+    step(7, TOTAL, f"Processing vocals (DeepFilter + stretch [{rb_engine}] + style-adaptive chain)…")
+    vox = _process_vocals(vox, ratio, n_semi, vox_params, style)
 
     step(8, TOTAL, "Mixing (beat-align + spectral carve + M/S + sidechain + level match)…")
 
@@ -950,29 +1278,9 @@ def fuse(song_a: str, song_b: str, out_path: str,
     L = min(len(inst), len(vox))
     inst, vox = inst[:L], vox[:L]
 
-    # Level match: vocal 3-6 dB louder than instrumental (research: 1.41-2× inst_rms).
-    # Since spectral carving reduces the instrumental after this level set, 1.2×
-    # is the appropriate starting point — vocal ends up perceptually forward in the mix.
-    # Using plain _rms (not _active_rms): silence gaps must not inflate the multiplier.
-    ir = _rms(_to_mono(inst))
-    vr = _rms(_to_mono(vox))
-    if vr > 1e-9:
-        vox = (vox * (ir * 1.2 / vr)).astype(np.float32)
-
-    # Content-aware spectral carve on instrumental
-    inst = _adaptive_spectral_carve(inst, vox, carve_db=5.0)
-
-    # Parallel compression: restore punch/density lost after carving
-    inst = _parallel_compress(inst)
-
-    # Multiband sidechain duck (only mids/highs — bass stays punchy)
-    inst = _sidechain(inst, vox, depth=sidechain_depth)
-
-    # M/S mix: vocal into Mid only, beat Sides preserved
-    inst_M, inst_S = _ms_encode(inst)
-    vox_M, _       = _ms_encode(vox)
-    mix_M = inst_M + vox_M
-    mix = _ms_decode(mix_M, inst_S)
+    # AI iterative mixer: closed-loop presence feedback, energy-envelope matching,
+    # spectral carve, parallel compress, sidechain — all style-adaptive
+    mix = _iterative_mix(inst, vox, style, sidechain_depth, bpm_a)
 
     mix = _fade(mix, fade_s=2.0)
 
