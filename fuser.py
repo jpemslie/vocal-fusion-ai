@@ -1114,16 +1114,15 @@ def _harmonic_excite(audio_ch: np.ndarray, crossover_hz: float = 3000.0,
     """
     Aphex Aural Exciter-style harmonic excitement.
 
-    Generates upper harmonics (3–16 kHz) that are present in the original recording
-    but were attenuated or removed by stem separation, compression, and digital processing.
+    Correct algorithm (based on research into Aphex patents):
+      1. HP filter above crossover to isolate high-frequency content
+      2. Normalize → saturate (asymmetric tube style = even+odd harmonics) → restore gain
+      3. Subtract original HP band from saturated signal → ONLY new harmonic content
+      4. Re-HP the harmonics (remove any low-freq saturation artifacts)
+      5. Mix new harmonics at mix_level under dry signal
 
-    Algorithm (reverse-engineered from patents):
-      1. HP filter above crossover_hz to isolate high-frequency content only
-      2. Apply asymmetric soft saturation (odd+even harmonics → 4x, 8x, etc.)
-      3. Mix generated harmonics at mix_level under the original signal
-
-    This adds the "air" and "presence" that makes vocals cut through on earbuds
-    and streaming platforms where the high-shelf EQ alone isn't enough.
+    Key improvement over simple saturation+HP: subtracting the original preserves
+    the original signal entirely while adding only the new harmonics on top.
 
     audio_ch: (n_channels, n_samples) float32
     """
@@ -1131,18 +1130,28 @@ def _harmonic_excite(audio_ch: np.ndarray, crossover_hz: float = 3000.0,
     result = audio_ch.copy()
 
     for c in range(audio_ch.shape[0]):
-        ch = audio_ch[c]
-        # HP filter: isolate frequencies above crossover
-        hp = sosfilt(sos_hp, ch.astype(np.float64)).astype(np.float32)
+        ch = audio_ch[c].astype(np.float64)
+        # Step 1: HP filter
+        hp_band = sosfilt(sos_hp, ch)
 
-        # Asymmetric drive: bias + tanh generates 2nd harmonic + higher
-        driven = np.tanh(drive * (hp + 0.1 * np.abs(hp))) * 0.8
+        # Step 2: normalize, saturate (asymmetric = even harmonics), restore
+        peak = np.max(np.abs(hp_band)) + 1e-9
+        hp_norm = hp_band / peak
+        # Asymmetric drive: positive half gets softer clip → 2nd harmonic (warmth)
+        pos = hp_norm > 0
+        saturated = np.where(pos,
+                             np.tanh(hp_norm * drive * 0.8),
+                             np.tanh(hp_norm * drive * 1.2))
+        saturated = saturated * peak
 
-        # HP filter the driven output again (remove any low-freq artifacts)
-        harmonics = sosfilt(sos_hp, driven.astype(np.float64)).astype(np.float32)
+        # Step 3: subtract original → only new harmonic content
+        harmonics_only = saturated - hp_band
 
-        # Mix generated harmonics into the original at low level
-        result[c] = (ch + harmonics * mix_level).astype(np.float32)
+        # Step 4: re-HP to remove any low-freq artifacts from saturation
+        harmonics_only = sosfilt(sos_hp, harmonics_only).astype(np.float32)
+
+        # Step 5: mix harmonics into original
+        result[c] = (ch + harmonics_only * mix_level).astype(np.float32)
 
     return result.astype(np.float32)
 
