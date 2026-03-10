@@ -567,6 +567,67 @@ def semitones_to_shift(src_root, src_mode, dst_root, dst_mode) -> int:
     return diff - 12 if diff > 6 else diff
 
 
+def _detect_section_start(y_mono: np.ndarray, section: str = "chorus") -> int:
+    """
+    Detect the sample position of the first 'chorus' (or 'verse') in the track.
+
+    Uses librosa's recurrence-based segmentation + a composite energy/centroid/onset
+    score to classify each segment as chorus-like (high energy) or verse-like (quieter).
+
+    Returns sample index of the first matching section boundary, or 0 on failure.
+    """
+    try:
+        hop = 512
+        mfcc = librosa.feature.mfcc(y=y_mono, sr=SR, n_mfcc=13, hop_length=hop)
+
+        # Agglomerative segmentation — aim for ~6-8 sections
+        n_sections = 7
+        boundaries = librosa.segment.agglomerative(mfcc, k=n_sections)
+
+        if len(boundaries) < 2:
+            return 0
+
+        # Composite score per segment: energy + centroid + onset density
+        rms      = librosa.feature.rms(y=y_mono, hop_length=hop)[0]
+        centroid = librosa.feature.spectral_centroid(y=y_mono, sr=SR, hop_length=hop)[0]
+        onsets   = librosa.onset.onset_detect(y=y_mono, sr=SR, hop_length=hop)
+
+        def znorm(x):
+            return (x - x.mean()) / (x.std() + 1e-8)
+
+        rms_n  = znorm(rms)
+        cen_n  = znorm(centroid)
+
+        # Per-segment onset density
+        onset_density = np.zeros(len(rms), dtype=np.float32)
+        win = max(1, int(SR * 2.0 / hop))
+        for o in onsets:
+            onset_density[max(0, o - win // 2): o + win // 2] += 1
+        ond_n = znorm(onset_density)
+
+        composite = rms_n + cen_n + ond_n  # higher = more chorus-like
+
+        seg_scores = []
+        for i in range(len(boundaries) - 1):
+            s, e = boundaries[i], boundaries[i + 1]
+            seg_scores.append(float(composite[s:e].mean()))
+
+        # Normalize: positive scores = chorus, negative = verse
+        median_score = float(np.median(seg_scores))
+        target_high = section == "chorus"  # chorus = above median
+
+        for i, score in enumerate(seg_scores):
+            is_chorus = score > median_score
+            if is_chorus == target_high:
+                # Return first sample of this boundary
+                frame_s = int(boundaries[i])
+                return int(librosa.frames_to_samples(frame_s, hop_length=hop))
+
+        return 0
+    except Exception:
+        return 0
+
+
 def _beat_align(inst_mono: np.ndarray, vox_stretched_mono: np.ndarray) -> tuple:
     """
     Align the first vocal onset to the nearest measure boundary in the instrumental.
@@ -1418,20 +1479,46 @@ def fuse(song_a: str, song_b: str, out_path: str,
     vox = _process_vocals(vox, ratio, n_semi, vox_params, style,
                           target_root=key_a_root, target_mode=key_a_mode)
 
-    step(8, TOTAL, "Mixing (beat-align + spectral carve + M/S + sidechain + level match)…")
+    step(8, TOTAL, "Mixing (chorus-align + beat-snap + spectral carve + M/S + sidechain)…")
 
-    # Beat-grid alignment: use the ACTUAL STRETCHED vocal stem to find when
-    # the singer first comes in, then align that to the nearest measure boundary.
-    vox_pre, inst_pre = _beat_align(full_a, _to_mono(vox))
+    # ── Stage 1: Structural alignment (chorus-to-chorus) ───────────────────────
+    # Detect the first chorus start in both tracks. Aligning chorus-to-chorus
+    # ensures the most energetic part of the vocal lands on the most energetic
+    # part of the beat, rather than aligning by bar-1 which might be an intro.
     silence = lambda n: np.zeros((n, 2), dtype=np.float32)
+
+    chorus_inst = _detect_section_start(full_a, section="chorus")
+    chorus_vox  = _detect_section_start(full_b, section="chorus")
+    print(f"      Chorus starts → inst: {chorus_inst/SR:.1f}s  "
+          f"vocal: {chorus_vox/SR:.1f}s", flush=True)
+
+    if chorus_inst > 0 and chorus_vox > 0:
+        # Trim/pad so both choruses start at the same position
+        if chorus_inst >= chorus_vox:
+            # inst chorus is later — prepend silence to vocal to match
+            pad_vox = chorus_inst - chorus_vox
+            vox = np.concatenate([silence(pad_vox), vox], axis=0)
+            print(f"      Structural align: +{pad_vox/SR*1000:.0f} ms pad to vocal", flush=True)
+        else:
+            # vocal chorus is later — trim inst start
+            trim_inst = chorus_vox - chorus_inst
+            inst = inst[trim_inst:]
+            print(f"      Structural align: trim {trim_inst/SR*1000:.0f} ms from beat start", flush=True)
+    else:
+        print(f"      Structural align: section detection inconclusive, using beat-align", flush=True)
+
+    # ── Stage 2: Fine beat-grid alignment (bar-level snap) ─────────────────────
+    # After chorus alignment, snap the vocal to the nearest measure boundary
+    # within the instrumental's beat grid.
+    vox_pre, inst_pre = _beat_align(_to_mono(inst), _to_mono(vox))
     if vox_pre > 0:
         vox = np.concatenate([silence(vox_pre), vox], axis=0)
-        print(f"      Beat-align: prepend {vox_pre/SR*1000:.0f} ms to vocal", flush=True)
+        print(f"      Beat-align: +{vox_pre/SR*1000:.0f} ms pad to vocal", flush=True)
     elif inst_pre > 0:
         inst = np.concatenate([silence(inst_pre), inst], axis=0)
-        print(f"      Beat-align: prepend {inst_pre/SR*1000:.0f} ms to beat", flush=True)
+        print(f"      Beat-align: +{inst_pre/SR*1000:.0f} ms pad to beat", flush=True)
     else:
-        print(f"      Beat-align: no offset needed", flush=True)
+        print(f"      Beat-align: no fine offset needed", flush=True)
 
     L = min(len(inst), len(vox))
     inst, vox = inst[:L], vox[:L]
