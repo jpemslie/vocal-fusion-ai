@@ -748,31 +748,44 @@ def _groove_quantize(vox: np.ndarray, inst_mono: np.ndarray,
         if not nudges:
             return vox
 
-        # Apply nudges: shift audio segments
-        # Split at onset points and reassemble with shifts
+        # Apply nudges: shift audio segments with crossfade to prevent clicks
         result = vox.copy()
         onset_list = sorted(nudges.keys())
+        xfade = max(64, int(SR * 0.003))  # 3ms crossfade window
 
         for i, ons in enumerate(onset_list):
             nudge = nudges[ons]
             if nudge == 0:
                 continue
-            # End of this segment = next onset (or end of file)
             seg_end = onset_list[i + 1] if i + 1 < len(onset_list) else len(vox)
             seg_len = seg_end - ons
 
-            if seg_len < 128:
+            if seg_len < xfade * 2:
                 continue
 
-            # Shift this segment by nudge samples
             new_start = ons + nudge
             new_start = max(0, min(new_start, len(vox) - seg_len))
 
-            # Zero old position, write at new position
-            result[ons:seg_end] = 0.0
+            # Extract segment from original
+            seg = vox[ons:ons + seg_len].copy()
+
+            # Crossfade ramp for smooth transition (prevents click at boundaries)
+            fade_in  = np.linspace(0, 1, xfade, dtype=np.float32)
+            fade_out = np.linspace(1, 0, xfade, dtype=np.float32)
+
+            # Fade out the old position in result
+            result[ons:ons + xfade] = (result[ons:ons + xfade].T * fade_out).T
+            result[ons + xfade:seg_end] = 0.0
+
+            # Fade in the new position
             write_end = min(new_start + seg_len, len(result))
             write_len = write_end - new_start
-            result[new_start:write_end] += vox[ons:ons + write_len]
+            if write_len <= 0:
+                continue
+            seg_write = seg[:write_len].copy()
+            seg_write[:xfade] = (seg_write[:xfade].T * fade_in).T
+            result[new_start:write_end] = (
+                result[new_start:write_end] + seg_write).astype(np.float32)
 
         return result.astype(np.float32)
 
