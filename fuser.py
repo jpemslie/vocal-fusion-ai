@@ -1627,7 +1627,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # LFO on delay time (±2 ms @ 0.3 Hz) prevents static comb-filter notch.
     # Research: 4-8 cents + 13-25ms delay is the "invisible" sweet spot.
     rap = style.get("_rap_score", 0.5)
-    adt_cents = float(np.interp(rap, [0, 1], [6.0, 5.0]))  # singers slightly wider
+    adt_cents = float(np.interp(rap, [0, 1], [9.0, 8.0]))  # research: 8-10 cents is natural sweet spot
     adt_delay_ms = 22.0
     adt_level = 0.20  # -14 dB — wide enough to feel, subtle enough to not fight the vocal
 
@@ -1975,7 +1975,7 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
       2. Vocal level — is the vocal audible vs the mix (40-70% of mix RMS)
       3. Spectral    — are all 5 frequency bands within commercial reference ranges
       4. Clipping    — any true peaks above -0.2 dBTP?
-      5. LUFS        — is the integrated loudness in the -15 to -8 range?
+      5. LUFS        — is the integrated loudness in the -15 to -8 range? (target -10)
     """
     issues = []
     scores = {}
@@ -2124,6 +2124,42 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
     return scores
 
 
+def _multiband_master_compress(mix: np.ndarray) -> np.ndarray:
+    """
+    4-band mastering compression for hip-hop — gentle, transparent control.
+
+    Philosophy: ratios 1.2–2:1, target 1–3 dB GR per band (not the 6–10 dB
+    used in mixing bus compression). Goal is tonal balance, not loudness.
+
+    Professional hip-hop crossover points:
+      Sub (20-80Hz):   kick/808 compete here; slow attack lets transients through
+      LowMid (80-200Hz): body/punch zone; very gentle
+      Mid (200-5kHz):  vocal and snare compete; medium
+      High (5-20kHz):  hi-hats/air; barely touched
+
+    Applied after mastering EQ, before harmonic saturation and soft clip.
+    """
+    nyq = SR / 2.0
+    # (lo_hz, hi_hz, threshold_db, ratio, attack_ms, release_ms)
+    band_defs = [
+        (20,    80,   -6.0, 2.0, 90.0, 200.0),   # Sub: slow attack = kick passes through
+        (80,    200,  -7.0, 1.5, 50.0, 100.0),   # LowMid: gentle body control
+        (200,   5000, -8.0, 1.5, 30.0,  80.0),   # Mid: snare/vocal zone, moderate
+        (5000, 20000, -9.0, 1.3, 20.0,  50.0),   # High: hi-hats, very gentle
+    ]
+    out = np.zeros_like(mix)
+    for lo, hi, thresh, ratio, atk, rel in band_defs:
+        lo_n = lo / nyq
+        hi_n = min(hi / nyq, 0.999)
+        sos_lp = butter(4, hi_n, btype="low",  output="sos")
+        sos_hp = butter(4, lo_n, btype="high", output="sos")
+        band = sosfilt(sos_lp, sosfilt(sos_hp, mix, axis=0), axis=0).astype(np.float32)
+        comp = Pedalboard([Compressor(threshold_db=thresh, ratio=ratio,
+                                      attack_ms=atk, release_ms=rel)])
+        out += comp(band.T.astype(np.float32), SR).T.astype(np.float32)
+    return out.astype(np.float32)
+
+
 def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     """
     Mastering chain (v6):
@@ -2173,9 +2209,22 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
+    # 4-band mastering compression: gentle tonal balance (1-3 dB GR per band)
+    # Placed after mastering EQ so it controls, not changes, the tonal balance
+    mix = _multiband_master_compress(mix)
+
     # Maxx Bass: synthesize 2nd/3rd harmonics from sub-bass for small speaker audibility
     # Blend 30%: bass audible on earbuds, subtle enough not to muddy the mix
     mix = _maxx_bass(mix, fundamental_lo=40.0, fundamental_hi=100.0, blend=0.30)
+
+    # Even-harmonic (tape-style) pre-saturation: 2nd harmonic warmth, ~0.3% THD.
+    # tanh generates odd harmonics (3rd, 5th). Asymmetric bias before tanh adds
+    # even harmonics (2nd, 4th) — the warmth signature of tape and class-A circuits.
+    # Research: even harmonics sound "warm"; odd harmonics sound "harsh".
+    # drive=0.25 is very subtle — adds character without audible distortion.
+    _bias = 0.06  # 6% asymmetry = tape character (lower = less colored)
+    mix_biased = (mix + _bias * np.abs(mix)).astype(np.float64)
+    mix = (np.tanh(0.25 * mix_biased) / np.tanh(0.25)).astype(np.float32)
 
     # Mastering harmonic exciter: gentle upper-harmonic generation on full mix
     # Crossover higher (5kHz) and lower level (7%) than vocal chain
@@ -2217,7 +2266,9 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # limiter ceiling, causing clipping (e.g., limiter at -1 dBFS, normalize
     # raises by +3 LU → peaks at +2 dBFS).
     # Correct mastering order: all dynamics → LUFS normalize → brick-wall ceiling.
-    mix = _lufs_normalize(mix, -9.0)
+    # Target: -10 LUFS (streaming-optimized; Spotify/Apple/YouTube normalize to -14 LUFS,
+    # so -10 is within 4 LU of the norm — keeps dynamics while remaining competitive).
+    mix = _lufs_normalize(mix, -10.0)
 
     # Brick-wall limiter LAST: enforces peak ceiling after LUFS normalization.
     # -1.5 dBTP (not -1.0) to leave headroom for inter-sample peaks:
