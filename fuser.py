@@ -350,6 +350,8 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         inst_c = _adaptive_spectral_carve(inst, vox_scaled, carve_db=carve_db)
         # Restore drum transients softened by stem separation (attack +4dB, sustain -2dB)
         inst_c = _transient_shape(inst_c, attack_gain_db=4.0, sustain_gain_db=-2.0)
+        # Sub-bass management: kick transient sidechains 20-80Hz sub-bass
+        inst_c = _kick_sub_sidechain(inst_c, depth=0.35)
         inst_c = _parallel_compress(inst_c)
         inst_c = _sidechain(inst_c, vox_scaled,
                             depth=sidechain_depth * style["sidechain_mult"])
@@ -411,6 +413,56 @@ def _ms_decode(M: np.ndarray, S: np.ndarray) -> np.ndarray:
     L = (M + S) / np.sqrt(2)
     R = (M - S) / np.sqrt(2)
     return np.stack([L, R], axis=1).astype(np.float32)
+
+
+def _kick_sub_sidechain(inst: np.ndarray, depth: float = 0.35) -> np.ndarray:
+    """
+    Sub-bass management: kick transient sidechains the 20-80 Hz sub-bass range.
+
+    In hip-hop, the kick and 808/sub-bass compete for headroom in 40-80 Hz.
+    Without management: both hit simultaneously → limiter clamps → both lose punch.
+
+    Method:
+      - Detect kick transients from the 80-200 Hz "click" band
+      - When a kick fires, duck the 20-80 Hz sub-bass by up to 'depth'
+      - Duck curve: fast attack (3ms), slow release (80ms) — kick-style ADSR
+
+    This technique is used universally in professional hip-hop mastering.
+    """
+    sos_kick = butter(4, [80 / (SR / 2), 200 / (SR / 2)],
+                      btype="band", output="sos")
+    sos_sub_lp = butter(4, 80 / (SR / 2), btype="low",  output="sos")
+    sos_sub_hp = butter(4, 20 / (SR / 2), btype="high", output="sos")
+
+    inst_mono = _to_mono(inst)
+
+    # Kick detection: bandpass 80-200 Hz, envelope follow
+    kick_band = sosfilt(sos_kick, inst_mono.astype(np.float64)).astype(np.float32)
+    a_atk = np.exp(-1.0 / (SR * 0.003))   # 3ms attack
+    a_rel = np.exp(-1.0 / (SR * 0.080))   # 80ms release
+    env = np.zeros(len(kick_band), dtype=np.float32)
+    prev = 0.0
+    for i in range(len(kick_band)):
+        level = abs(kick_band[i])
+        if level > prev:
+            prev = (1 - a_atk) * level + a_atk * prev
+        else:
+            prev = (1 - a_rel) * level + a_rel * prev
+        env[i] = prev
+
+    # Normalize envelope → gain reduction (0 = no duck, depth = max duck)
+    env_norm = env / (env.max() + 1e-9)
+    gain = 1.0 - depth * env_norm  # 1.0 = no change, (1-depth) = max reduction
+
+    # Apply gain only to sub-bass (20-80 Hz) of each channel
+    result = inst.copy()
+    for c in range(inst.shape[1]):
+        ch = inst[:, c].astype(np.float64)
+        sub = sosfilt(sos_sub_hp, sosfilt(sos_sub_lp, ch))
+        above_sub = ch - sub
+        result[:, c] = (above_sub + sub * gain).astype(np.float32)
+
+    return result.astype(np.float32)
 
 
 # ── Stem Separation ───────────────────────────────────────────────────────────
@@ -911,12 +963,16 @@ def _multiband_compress_vocal(vox_ch: np.ndarray, style: dict) -> np.ndarray:
     """
     rap = style.get("_rap_score", 0.5)
 
-    # Band settings: (lo_hz, hi_hz, threshold_db, ratio, attack_ms, release_ms)
+    # Band crossovers match iZotope Neutron defaults (research-backed):
+    # Band 1:   80-400 Hz  — body/chest (post-HPF; removes boxiness)
+    # Band 2:  400-2500 Hz — CORE INTELLIGIBILITY (protects formants/consonants)
+    # Band 3: 2500-8000 Hz — presence/de-essing (tightest for sibilance control)
+    # Band 4: 8000-20000Hz — air (very gentle; protects brightness)
     bands_def = [
-        (80,    250,  -24.0, 2.5, 10.0, 200.0),   # body — gentle
-        (250,  2000,  -20.0, float(np.interp(rap, [0,1], [3.0, 4.0])), 5.0, 100.0),
-        (2000, 8000,  -18.0, float(np.interp(rap, [0,1], [3.5, 5.0])), 2.0,  60.0),
-        (8000, 20000, -28.0, 2.0, 15.0, 300.0),   # air — very gentle
+        (80,    400,  -24.0, 3.0, 10.0, 150.0),
+        (400,  2500,  -20.0, 2.0,  8.0, 120.0),   # gentlest — protects intelligibility
+        (2500, 8000,  -18.0, float(np.interp(rap, [0,1], [3.5, 5.0])), 2.0, 60.0),
+        (8000, 20000, -28.0, 2.0, 15.0, 300.0),
     ]
 
     n_ch, n_samp = vox_ch.shape
@@ -1151,7 +1207,7 @@ def _transient_shape(inst: np.ndarray,
                      attack_gain_db: float = 4.0,
                      sustain_gain_db: float = -2.0,
                      fast_ms: float = 1.0,
-                     slow_ms: float = 20.0,
+                     slow_ms: float = 80.0,
                      release_ms: float = 80.0) -> np.ndarray:
     """
     SPL Transient Designer-style transient shaping for the instrumental.
