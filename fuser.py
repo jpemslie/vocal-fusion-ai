@@ -415,6 +415,64 @@ def _ms_decode(M: np.ndarray, S: np.ndarray) -> np.ndarray:
     return np.stack([L, R], axis=1).astype(np.float32)
 
 
+def _maxx_bass(mix: np.ndarray, fundamental_lo: float = 40.0,
+               fundamental_hi: float = 100.0, blend: float = 0.30) -> np.ndarray:
+    """
+    Waves Maxx Bass-style harmonic bass synthesis for small speaker compatibility.
+
+    Sub-bass (40-80 Hz) is inaudible on earbuds, laptop speakers, and phone speakers.
+    This function synthesizes 2nd and 3rd harmonics (80-300 Hz) from the fundamental,
+    making bass "felt" on any speaker system.
+
+    Used universally in mastering for streaming (Spotify, Apple Music) where
+    listeners use earbuds that can't reproduce below 100 Hz.
+
+    Algorithm:
+      1. Bandpass the fundamental range (40-100 Hz)
+      2. Apply heavy asymmetric saturation → generates 2x, 3x, 4x harmonics
+      3. Bandpass to keep only harmonics (remove fundamental from saturated output)
+      4. Blend harmonics into the original at blend level
+
+    mix: (samples, 2) float32 stereo
+    """
+    nyq = SR / 2.0
+    sos_fund = butter(4, [fundamental_lo / nyq, fundamental_hi / nyq],
+                      btype="band", output="sos")
+
+    # Harmonics should be above fundamental and below 500Hz
+    h2_lo = fundamental_lo * 1.8
+    h3_hi = min(fundamental_hi * 3.5, 500.0)
+    sos_harm = butter(4, [h2_lo / nyq, h3_hi / nyq],
+                      btype="band", output="sos")
+
+    result = mix.copy()
+    for c in range(mix.shape[1]):
+        ch = mix[:, c].astype(np.float64)
+
+        # Extract fundamental
+        fund = sosfilt(sos_fund, ch)
+        peak = np.max(np.abs(fund)) + 1e-9
+        fund_norm = fund / peak
+
+        # Heavy asymmetric saturation → 2nd (2×) and 3rd (3×) harmonics
+        # Asymmetric: positive gets softer clip (2nd harmonic dominant)
+        pos = fund_norm > 0
+        saturated = np.where(pos,
+                             np.tanh(fund_norm * 4.0 * 0.7),
+                             np.tanh(fund_norm * 4.0 * 1.3))
+        saturated = saturated * peak
+
+        # Remove the fundamental from saturated (keep only harmonics)
+        harmonics = saturated - fund
+
+        # Bandpass to 2nd+3rd harmonic range only
+        harmonics = sosfilt(sos_harm, harmonics)
+
+        result[:, c] = (ch + harmonics * blend).astype(np.float32)
+
+    return result.astype(np.float32)
+
+
 def _kick_sub_sidechain(inst: np.ndarray, depth: float = 0.35) -> np.ndarray:
     """
     Sub-bass management: kick transient sidechains the 20-80 Hz sub-bass range.
@@ -1962,6 +2020,10 @@ def _master(mix: np.ndarray) -> np.ndarray:
         HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=1.5),    # air
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # Maxx Bass: synthesize 2nd/3rd harmonics from sub-bass for small speaker audibility
+    # Blend 30%: bass audible on earbuds, subtle enough not to muddy the mix
+    mix = _maxx_bass(mix, fundamental_lo=40.0, fundamental_hi=100.0, blend=0.30)
 
     # Mastering harmonic exciter: gentle upper-harmonic generation on full mix
     # Crossover higher (5kHz) and lower level (7%) than vocal chain
