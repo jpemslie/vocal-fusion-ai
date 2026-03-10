@@ -1892,6 +1892,19 @@ def _master(mix: np.ndarray) -> np.ndarray:
     ])
     mix = glue(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
+    # Sub-bass limiter: limit 20-80Hz band separately BEFORE main limiter.
+    # Prevents kick/808 from eating all the headroom and triggering brick-wall clamp.
+    # Professional technique: sub-bass limiter at -3 dBFS (1-2ms attack, 60ms release).
+    sos_sub_lp = butter(4, 80.0 / (SR / 2), btype="low",  output="sos")
+    sos_sub_hp = butter(4, 20.0 / (SR / 2), btype="high", output="sos")
+    sub_limiter = Pedalboard([
+        Limiter(threshold_db=-3.0, release_ms=60.0),
+    ])
+    mix_sub   = sosfilt(sos_sub_hp, sosfilt(sos_sub_lp, mix, axis=0), axis=0).astype(np.float32)
+    mix_above = (mix - mix_sub).astype(np.float32)
+    mix_sub_lim = sub_limiter(mix_sub.T.astype(np.float32), SR).T.astype(np.float32)
+    mix = (mix_above + mix_sub_lim).astype(np.float32)
+
     # Brick-wall limiter at -1.0 dBTP
     limiter = Pedalboard([Limiter(threshold_db=-1.0, release_ms=50.0)])
     mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
@@ -2052,7 +2065,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     mix = _master(mix)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    sf.write(out_path, mix, SR, subtype="PCM_16")
+    sf.write(out_path, mix, SR, subtype="PCM_24")
     print(f"Done → {out_path}", flush=True)
 
     # ── Auto quality evaluation ──────────────────────────────────────────────
