@@ -1554,6 +1554,22 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     vox_ch = vox.T.astype(np.float32)
 
     # Step 2: time-stretch + pitch-shift
+    # Critical pre-processing when pitch-shifting: strip HF bleed BEFORE shift.
+    # Demucs vocal stems contain 17-24% hi-hat/cymbal bleed in 6-20kHz range.
+    # When pyrubberband pitch-shifts by N semitones, the bleed gets shifted too —
+    # a 8kHz hi-hat shifted -3 semitones sounds metallic/scratchy and clashes
+    # with the beat's natural hi-hats. Solution: LPF at 5kHz before shifting.
+    # The vocal body (fundamental + formants) is almost entirely below 5kHz.
+    if n_semitones != 0:
+        # 8kHz (not 5kHz): keeps vocal sibilance (s/sh at 5-8kHz), removes hi-hat
+        # bleed zone (8-16kHz). Pitch-shifted hi-hats sound scratchy/metallic;
+        # pitch-shifted sibilance sounds much more natural (it's broadband noise).
+        sos_pre_shift_lpf = butter(4, 8000.0 / (SR / 2), btype="low", output="sos")
+        vox_ch = np.stack([
+            sosfilt(sos_pre_shift_lpf, vox_ch[c]).astype(np.float32)
+            for c in range(vox_ch.shape[0])
+        ], axis=0)
+
     # pyrubberband R3 engine gives much better formant preservation for vocals
     if HAS_PYRUBBERBAND and (abs(ratio - 1.0) > 0.005 or n_semitones != 0):
         vox_mono_list = []
@@ -1669,7 +1685,6 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # without touching the bleed-contaminated high end.
     # Applied in Mid channel only (M/S) — Side channel has more artifacts.
     try:
-        from scipy.signal import butter, sosfilt
         nyq = SR / 2.0
         sos_lo = butter(4, 400.0 / nyq, btype="high", output="sos")
         sos_hi = butter(4, 2500.0 / nyq, btype="low",  output="sos")
