@@ -2421,6 +2421,42 @@ def fuse(song_a: str, song_b: str, out_path: str,
                                         key_a_root, key_a_mode)
     print(f"      Key: {key_msg}", flush=True)
 
+    # Stretch direction: vocals are fragile, beats are robust.
+    # If BPM gap > 8%, stretch the INSTRUMENTAL to match the vocal's tempo
+    # instead of stretching the vocal. Beats handle time-stretching much
+    # better than human voices (no formant/intelligibility sensitivity).
+    VOCAL_STRETCH_LIMIT = 1.08   # ±8%: beyond this, stretch the beat instead
+    stretch_vocal = ratio
+    stretch_inst  = 1.0
+    if abs(ratio - 1.0) > (VOCAL_STRETCH_LIMIT - 1.0):
+        # Invert: keep vocal at 1.0x, slow/speed beat by inverse ratio
+        stretch_inst  = 1.0 / ratio
+        stretch_vocal = 1.0
+        print(f"      [Stretch mode] Large BPM gap ({abs(ratio-1)*100:.0f}%): "
+              f"stretching BEAT by {stretch_inst:.3f}x, vocals stay natural speed.",
+              flush=True)
+        if HAS_PYRUBBERBAND:
+            stretched_inst = []
+            for c in range(inst.shape[1]):
+                stretched_inst.append(
+                    rb.time_stretch(inst[:, c].astype(np.float32), SR,
+                                    stretch_inst, rbargs={'-3': ''})
+                )
+            # Trim/pad all channels to same length
+            min_len_si = min(len(s) for s in stretched_inst)
+            inst = np.stack([s[:min_len_si] for s in stretched_inst],
+                            axis=1).astype(np.float32)
+        else:
+            from pedalboard.io import AudioFile
+            from pedalboard import time_stretch as pb_ts
+            inst_ch = pb_time_stretch(
+                inst.T.astype(np.float32), SR,
+                stretch_factor=stretch_inst,
+            ).T.astype(np.float32)
+            inst = inst_ch
+        print(f"      Beat stretched: {inst.shape[0]/SR:.1f}s at {bpm_a/stretch_inst:.1f} BPM",
+              flush=True)
+
     step(6, TOTAL, "Analyzing audio content for AI-adaptive parameters…")
     # AI content analysis: derive all DSP parameters from actual audio
     beat_char  = _analyze_beat_character(full_a, bpm_a)
@@ -2451,7 +2487,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     predelay_ms = min(60000.0 / max(bpm_a, 60.0) / 16.0, 40.0)
     step(7, TOTAL, f"Processing vocals (DeepFilter + pitch-correct + stretch [{rb_engine}] + NY-comp + "
          f"split-band de-esser + BPM-reverb {predelay_ms:.0f}ms)…")
-    vox = _process_vocals(vox, ratio, n_semi, vox_params, style,
+    vox = _process_vocals(vox, stretch_vocal, n_semi, vox_params, style,
                           target_root=key_a_root, target_mode=key_a_mode,
                           bpm=bpm_a)
     vox = _check(vox, "post-vocal-chain")
