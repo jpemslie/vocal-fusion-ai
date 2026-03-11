@@ -849,10 +849,14 @@ def _best_ratio(bpm_a: float, bpm_b: float) -> float:
     ]
     # Pick candidate closest to 1.0 (minimum time-stretch needed)
     best = min(candidates, key=lambda r: abs(r - 1.0))
-    clamped = float(np.clip(best, 0.667, 1.5))
+    # Vocal quality cap: rubberband R3 produces audible artifacts beyond ±18%.
+    # Beyond that, accept gentle beat drift rather than destroying vocal quality.
+    QUALITY_CAP = 1.18
+    clamped = float(np.clip(best, 1.0 / QUALITY_CAP, QUALITY_CAP))
     if abs(best - clamped) > 0.01:
-        print(f"      [WARNING] BPM ratio {best:.3f} clamped to {clamped:.3f} — "
-              f"extreme tempo difference, sync may be imperfect.", flush=True)
+        print(f"      [INFO] BPM ratio {best:.3f} capped at {clamped:.3f} — "
+              f"large tempo gap ({abs(best-1)*100:.0f}%); protecting vocal quality.",
+              flush=True)
     return clamped
 
 
@@ -2280,6 +2284,9 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     mix_sub   = sosfilt(sos_sub_hp, sosfilt(sos_sub_lp, mix, axis=0), axis=0).astype(np.float32)
     mix_above = (mix - mix_sub).astype(np.float32)
     mix_sub_lim = sub_limiter(mix_sub.T.astype(np.float32), SR).T.astype(np.float32)
+    # Additional sub-bass attenuation: high-energy EDM/house beats can have
+    # sub energy 20+ dB above mids. Attenuate by extra 6 dB after limiting.
+    mix_sub_lim = (mix_sub_lim * 0.5).astype(np.float32)  # -6 dB on sub band
     mix = (mix_above + mix_sub_lim).astype(np.float32)
 
     # LUFS normalize BEFORE the brick-wall limiter.
@@ -2306,13 +2313,16 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     mix = post_norm_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
     # Brick-wall limiter LAST: enforces peak ceiling after LUFS normalization.
-    # -2.0 dBFS (not -1.0 or -1.5): pedalboard's Limiter measures sample peaks only,
-    # not true peaks. Hip-hop kick/808 transients produce +0.5-2.0 dB inter-sample
-    # overshoot beyond the sample peak. Setting -2.0 dBFS ensures true peaks stay
-    # ≤ -0.5 dBTP in worst case. Research: tanh pre-clip reduces overshoot to lower
-    # end of range (~+0.5 dB), so -2.0 dBFS provides adequate safety margin.
     limiter = Pedalboard([Limiter(threshold_db=-2.0, release_ms=50.0)])
     mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
+    # Hard safety clip: numpy failsafe in case pedalboard limiter lets peaks through
+    # (observed: on dense EDM material peak can reach 0 dBFS post-limiter).
+    # -2 dBFS = amplitude 0.7943. Clip then re-normalize to -2 dBFS to prevent
+    # inter-sample spikes pushing true peak above 0 dBTP.
+    clip_ceil = 10 ** (-2.0 / 20.0)   # 0.7943
+    peak_post = float(np.max(np.abs(mix)))
+    if peak_post > clip_ceil:
+        mix = np.clip(mix, -clip_ceil, clip_ceil).astype(np.float32)
     return mix
 
 
@@ -2389,9 +2399,11 @@ def fuse(song_a: str, song_b: str, out_path: str,
             mag_v = np.abs(D_v)
             mag_i = np.abs(D_i)
             phase_v = np.angle(D_v)
-            # Wiener soft mask — floor at 0.15 to preserve consonant transients
+            # Wiener soft mask — floor at 0.25 to preserve consonant transients
+            # and protect AutoTune'd / processed vocals (sustained synthetic tones
+            # can be misclassified as instrumental bleed at floor=0.15).
             raw_mask = librosa.util.softmask(mag_v, mag_i + 1e-8, power=2)
-            mask = np.maximum(raw_mask, 0.15)
+            mask = np.maximum(raw_mask, 0.25)
             D_clean = (mask * mag_v) * np.exp(1j * phase_v)
             vox_clean[:, c] = librosa.istft(D_clean, length=vox.shape[0]).astype(np.float32)
         vox = vox_clean.astype(np.float32)

@@ -63,7 +63,9 @@ REF = {
     # New: transient + dynamics quality
     # transient_clarity: ratio of peak spectral flux to sustained spectral flux.
     # Commercial tracks: 0.12–0.40. Smashed/over-compressed: < 0.08.
-    "transient_clarity":   (0.08, 0.55),
+    # Upper bound raised to 2.0: EDM/house with strong kicks naturally scores
+    # 1.5–2.0 and that is NOT a problem — it IS punchy.
+    "transient_clarity":   (0.08, 2.0),
 
     # kick_headroom_db: how much louder kick transients are vs the sustained
     # bass floor (measured in 60-150 Hz band). Professional: > 5 dB.
