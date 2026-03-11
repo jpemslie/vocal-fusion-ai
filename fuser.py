@@ -230,7 +230,7 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         # Research: trap/drill = 3-5% wet; R&B/singing = 15-22% wet
         "reverb_room":  float(np.interp(rap, [0, 1], [0.20, 0.07])),
         "reverb_damp":  float(np.interp(rap, [0, 1], [0.65, 0.88])),
-        "reverb_wet":   float(np.interp(rap, [0, 1], [0.18, 0.03])),
+        "reverb_wet":   float(np.interp(rap, [0, 1], [0.10, 0.03])),  # reduced: slap echo covers presence, tail just for space
 
         # Spectral carve: more bass-heavy → carve deeper in bass range
         "carve_db":     float(np.interp(bass, [0, 1], [4.0, 6.0])),
@@ -238,11 +238,12 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         # Sidechain: aggressive beat → more sidechain duck
         "sidechain_mult": float(np.interp(agg, [0, 1], [0.9, 1.2])),
 
-        # Vocal level: rap sits louder relative to beat.
-        # Increased [1.1,1.4]→[1.5,2.0]: vocals need to cut through the beat clearly.
-        # The QA "19% vocal presence" warning is misleading — it measures raw stems
-        # before level scaling. After scaling, vocal is ~ir * vocal_level / vr.
-        "vocal_level":  float(np.interp(rap, [0, 1], [1.5, 2.0])),
+        # Vocal level: scale vocal to roughly match beat RMS (ratio ~1.0).
+        # Research: vocals sit 0-3 dB above beat in commercial hip-hop.
+        # Previous [1.5, 2.0] was making vocal 50-100% louder than beat RMS,
+        # combined with energy_match_envelope amplifying further in loud sections
+        # = vocal crushes the beat on every drop/chorus.
+        "vocal_level":  float(np.interp(rap, [0, 1], [0.85, 1.05])),
 
         # Complementary EQ: cut instrumental at vocal fundamental zone.
         # Research: male F0 body 200-350 Hz → cut at 280 Hz; female → 380 Hz.
@@ -338,7 +339,10 @@ def _energy_match_envelope(inst: np.ndarray, vox: np.ndarray,
         ir = _rms(inst_mono[s:e])
         vr = _rms(vox_mono[s:e])
         if vr > 1e-9 and ir > 1e-9:
-            gains[i] = np.clip((ir * target_ratio) / vr, 0.4, 4.0)
+            # Cap at 1.5× max gain: prevents vocal from overshooting beat in
+            # loud sections. The static scalar already set the global level;
+            # this is just fine-tuning per-window, not dramatic amplification.
+            gains[i] = np.clip((ir * target_ratio) / vr, 0.5, 1.5)
 
     gains = gaussian_filter1d(gains.astype(np.float64), sigma=3.0).astype(np.float32)
 
@@ -1712,7 +1716,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     eighth_note_ms = 60000.0 / max(bpm, 60.0) / 2.0
     slap_ms = float(np.clip(eighth_note_ms, 70.0, 110.0))
     slap_samp = int(SR * slap_ms / 1000.0)
-    slap_level = float(np.interp(rap, [0, 1], [0.14, 0.17]))  # rap gets slightly more
+    slap_level = float(np.interp(rap, [0, 1], [0.08, 0.11]))  # reduced: was stacking too much with reverb tail
     slap_echo = np.concatenate([
         np.zeros((vox_ch.shape[0], slap_samp), dtype=np.float32),
         vox_ch,
@@ -1730,9 +1734,9 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # LFO on delay time (±2 ms @ 0.3 Hz) prevents static comb-filter notch.
     # Research: 4-8 cents + 13-25ms delay is the "invisible" sweet spot.
     rap = style.get("_rap_score", 0.5)
-    adt_cents = float(np.interp(rap, [0, 1], [9.0, 8.0]))  # research: 8-10 cents is natural sweet spot
+    adt_cents = float(np.interp(rap, [0, 1], [5.0, 4.0]))  # 4-6 cents: natural doubling, not chorus
     adt_delay_ms = 22.0
-    adt_level = 0.20  # -14 dB — wide enough to feel, subtle enough to not fight the vocal
+    adt_level = 0.14  # -17 dB — subtle stereo width without chorus-effect thickening
 
     n_samp = vox_ch.shape[1]
     # LFO for delay modulation — prevents static comb-filter notch
@@ -2457,7 +2461,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     style      = _style_params(beat_char, vox_char)
     vox_params = _analyze_vocal_stem(vox)
     overlap    = _spectral_overlap(_to_mono(vox), _to_mono(inst))
-    sidechain_depth = float(np.clip(overlap * 0.4, 0.10, 0.22))
+    sidechain_depth = float(np.clip(overlap * 0.3, 0.07, 0.15))  # reduced: was over-ducking beat during vocals
     print(f"      Beat: agg={beat_char['aggressiveness']:.2f}  "
           f"bass={beat_char['bass_weight']:.2f}  "
           f"brightness={beat_char['brightness']:.2f}", flush=True)
