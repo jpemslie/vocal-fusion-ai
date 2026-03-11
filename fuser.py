@@ -209,8 +209,10 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
     return {
         "_rap_score": rap,  # pass-through for ADT and other downstream use
         # FET compressor: rap/trap → faster, harder
+        # Attack minimum 3ms (research): below 3ms kills consonant transients,
+        # voice becomes a flat wall of sound. 1ms attack was the prior minimum.
         "fet_ratio":    float(np.interp(rap, [0, 1], [4.0, 8.0])),
-        "fet_attack":   float(np.interp(rap, [0, 1], [5.0, 1.0])),
+        "fet_attack":   float(np.interp(rap, [0, 1], [5.0, 3.0])),
         "fet_release":  float(np.interp(agg, [0, 1], [100.0, 40.0])),
 
         # Opto compressor: more gentle always, but faster for aggressive
@@ -218,13 +220,14 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         "opto_attack":  float(np.interp(agg, [0, 1], [30.0, 15.0])),
         "opto_release": float(np.interp(agg, [0, 1], [300.0, 150.0])),
 
-        # Presence boost: rap needs more mid-presence for intelligibility
-        "presence_db":  float(np.interp(rap, [0, 1], [2.0, 3.5])),
+        # Presence boost: spectral analysis shows Hi-Mid already +2.3 dB above
+        # inputs, so reduce boost. Presence at 3-4 kHz only needs +1-2 dB.
+        "presence_db":  float(np.interp(rap, [0, 1], [1.0, 2.0])),
         "presence_hz":  float(np.interp(rap, [0, 1], [4000.0, 3000.0])),
 
-        # Air shelf: singing benefits from more air than rap
-        # Reduced [2.5,1.5]→[1.5,1.0]: was stacking with harmonic excite causing HF excess
-        "air_db":       float(np.interp(rap, [0, 1], [1.5, 1.0])),
+        # Air shelf: mix is -4.8 dB darker than inputs in 6-20kHz band.
+        # Boost air to compensate for HF stripped by Demucs mask + de-esser.
+        "air_db":       float(np.interp(rap, [0, 1], [3.0, 2.0])),
 
         # Reverb: rap/trap → tighter room; singing/pop → lusher plate
         # Research: trap/drill = 3-5% wet; R&B/singing = 15-22% wet
@@ -238,12 +241,11 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         # Sidechain: aggressive beat → more sidechain duck
         "sidechain_mult": float(np.interp(agg, [0, 1], [0.9, 1.2])),
 
-        # Vocal level: scale vocal to roughly match beat RMS (ratio ~1.0).
-        # Research: vocals sit 0-3 dB above beat in commercial hip-hop.
-        # Previous [1.5, 2.0] was making vocal 50-100% louder than beat RMS,
-        # combined with energy_match_envelope amplifying further in loud sections
-        # = vocal crushes the beat on every drop/chorus.
-        "vocal_level":  float(np.interp(rap, [0, 1], [0.85, 1.05])),
+        # Vocal level: research says vocals sit 2-4 dB above beat bus.
+        # Linear 1.0 = same RMS as beat. Compression adds 2-3 dB perceived loudness,
+        # so 1.0-1.3 gets vocal to 2-4 dB apparent advantage without crushing beat.
+        # Previous 1.5-2.0 was 4-6 dB raw before processing → way too loud.
+        "vocal_level":  float(np.interp(rap, [0, 1], [1.0, 1.3])),
 
         # Complementary EQ: cut instrumental at vocal fundamental zone.
         # Research: male F0 body 200-350 Hz → cut at 280 Hz; female → 380 Hz.
@@ -397,7 +399,7 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         inst_c = _transient_shape(inst_c, attack_gain_db=0.0, sustain_gain_db=-2.0)
         inst_c = _check(inst_c, f"iter{iteration+1}/transient-shape")
         # Sub-bass management: kick transient sidechains 20-80Hz sub-bass
-        inst_c = _kick_sub_sidechain(inst_c, depth=0.35)
+        inst_c = _kick_sub_sidechain(inst_c, depth=0.20)  # reduced 0.35→0.20: was causing -2dB bass deficit
         inst_c = _parallel_compress(inst_c)
         # Style-adaptive sidechain window: rap syllables are faster, need tighter tracking
         # Release stays constant (100ms) to prevent pumping between phrases
@@ -1571,8 +1573,13 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
             ).astype(np.float32)
 
     # Steps 3-4: HPF + subtractive EQ (before dynamics)
+    # +1.5 dB at 250 Hz (Q=0.8): restores low-mid body that Demucs mask removes.
+    # Demucs is conservative in 200-500 Hz (heavy vocal/instrument overlap) and
+    # attenuates overtones here → vocal sounds "telephone thin". The 300 Hz cut
+    # (-3 dB) is complementary: restore warmth at 200-280 Hz, cut mud at 280-320 Hz.
     pre_dynamics_board = Pedalboard([
         HighpassFilter(cutoff_frequency_hz=80.0),      # 80 Hz (not 100) — low-end stem bleed
+        PeakFilter(cutoff_frequency_hz=250.0, gain_db=+1.5, q=0.8),   # restore Demucs mask attenuation
         PeakFilter(cutoff_frequency_hz=300.0, gain_db=-3.0, q=1.2),   # mud
         PeakFilter(cutoff_frequency_hz=500.0, gain_db=-2.0, q=1.5),   # boxy
     ])
@@ -1654,14 +1661,34 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     consonant_boost = 0.0
     vox_ch = _consonant_enhance(vox_ch, boost_db=consonant_boost)
 
-    # Step 9c: harmonic exciter (Aphex-style) — adds upper harmonics stripped by
-    # stem separation and digital processing. Crossover at 3kHz.
-    # Vocal harmonic exciter REMOVED: stacks with consonant enhance and other
-    # saturation stages causing intermodulation distortion (static artifacts).
+    # Step 9c: safe mid-band harmonic exciter — restores warmth stripped by Demucs mask
+    # Research: standard exciters on AI stems create static because they process
+    # the bleed-contaminated 3kHz+ range. Safe approach: bandpass-isolate 400-2500 Hz,
+    # apply tanh saturation (drive 0.12), blend at 15% parallel. This adds 2nd/3rd
+    # harmonics of vocal formants (landing in 800-5kHz range = presence/warmth)
+    # without touching the bleed-contaminated high end.
+    # Applied in Mid channel only (M/S) — Side channel has more artifacts.
+    try:
+        from scipy.signal import butter, sosfilt
+        nyq = SR / 2.0
+        sos_lo = butter(4, 400.0 / nyq, btype="high", output="sos")
+        sos_hi = butter(4, 2500.0 / nyq, btype="low",  output="sos")
+        mid_ex = vox_ch.mean(axis=0)   # Mid = mono average
+        side_ex = vox_ch[0] - vox_ch[1]  # Side (preserved unprocessed)
+        band = sosfilt(sos_lo, sosfilt(sos_hi, mid_ex))  # 400-2500 Hz isolation
+        saturated = np.tanh(band * (1.0 + 0.12))  # tanh drive 0.12
+        harmonics = (saturated - band).astype(np.float32)  # only NEW content
+        mid_out = (mid_ex + harmonics * 0.15).astype(np.float32)  # 15% parallel blend
+        # Rebuild stereo: L = (Mid + Side)/2, R = (Mid - Side)/2
+        vox_ch = np.stack([
+            ((mid_out + side_ex) / 2.0).astype(np.float32),
+            ((mid_out - side_ex) / 2.0).astype(np.float32),
+        ], axis=0)
+    except Exception:
+        pass  # fall through if anything goes wrong
 
-    # Step 10: vocal waveshaper REMOVED — saturation on already-noisy Demucs stems
-    # generates intermodulation distortion. The stem has music bleed; saturating it
-    # amplifies those artifacts into audible static on every vocal phrase.
+    # Step 10: vocal waveshaper REMOVED — full-band saturation on Demucs stems
+    # amplifies music bleed into static. Replaced by Step 9c (mid-band only).
 
     # Step 11: early reflections + pre-delay reverb with HPF'd return
     #
@@ -1885,24 +1912,24 @@ def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
     vocal_mask = gaussian_filter1d(vocal_mask.astype(np.float64),
                                     sigma=smooth_sigma, axis=1).astype(np.float32)
 
-    # Frequency weighting: prioritize 2-4 kHz (core intelligibility) most,
-    # full weight 300 Hz - 8 kHz with extra weight on consonant range (1-5 kHz).
+    # Frequency weighting: carve ONLY the vocal intelligibility zone (300 Hz–5 kHz).
     # Research: 2-4 kHz is the ear canal resonance peak (3.3 kHz) and the
     # single most important band for vocal intelligibility in a dense mix.
+    # STOP AT 5 kHz: above 5 kHz is air/cymbals from the beat. Spectral analysis
+    # showed the mix was -5 dB dark in 6-20kHz band partly because this carve
+    # was extending to 8kHz and cutting beat HF content during vocal sections.
     freqs = librosa.fft_frequencies(sr=SR, n_fft=n_fft)
     freq_w = np.zeros(len(freqs), dtype=np.float32)
     for i, f in enumerate(freqs):
-        if f < 300 or f > 8000:
-            freq_w[i] = 0.0
+        if f < 300 or f > 5000:
+            freq_w[i] = 0.0                             # no carve outside 300-5kHz
         elif f < 600:
             freq_w[i] = (f - 300) / 300 * 0.6         # ramp up (60% max below 600)
         elif f < 1000:
             freq_w[i] = 0.6 + (f - 600) / 400 * 0.4   # ramp to 1.0 at 1kHz
-        elif f <= 5000:
+        else:
             freq_w[i] = 1.0 + 0.5 * float(np.clip(
                 1.0 - abs(np.log2(f / 3000)) * 2, 0, 1))  # peak at 3kHz (1.5× weight)
-        elif f <= 8000:
-            freq_w[i] = 1.0 - (f - 5000) / 3000        # taper above 5kHz
 
     # Effective gain: 1.0 where vocal is absent, (1 - max_cut) where vocal is loud
     max_cut = 1.0 - 10 ** (-carve_db / 20.0)   # carve_db=5 → max_cut≈0.44
@@ -2310,7 +2337,7 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         sides_eq = Pedalboard([
             HighpassFilter(cutoff_frequency_hz=120.0),              # 120Hz mono-safe (safer than 100Hz)
             PeakFilter(cutoff_frequency_hz=400.0, gain_db=-2.5, q=0.8),  # muddy sides cut
-            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=-1.0),    # -1.0dB: corrective cut (was +1.5, caused HF excess)
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=+1.0),    # +1.0dB: add air to sides (was -1.0 to tame old exciters)
         ])
         S_proc = sides_eq(S[np.newaxis, :].astype(np.float32), SR)[0]
 
@@ -2323,8 +2350,11 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     master_eq = Pedalboard([
         PeakFilter(cutoff_frequency_hz=250.0,  gain_db=-0.5,  q=0.8),  # mud cut
         PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5,  q=2.5), # fatigue notch
-        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.0,  q=1.0), # Hi-Mid correction (reduced -2.5→-2.0: shelf now covers top of band)
-        HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-6.0),    # High correction: shelf moved 7k→6k to cover dominant 6-8kHz content
+        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.0,  q=1.0), # Hi-Mid correction
+        # High shelf: was -6 dB when harmonic exciters/waveshapers were active.
+        # Those are all removed; mix is now -3 dB dark in High band vs inputs.
+        # Reduce to -1.5 dB (just control HF limiter peak, not tonal correction).
+        HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-1.5),
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
@@ -2376,12 +2406,13 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # so -10 is within 4 LU of the norm — keeps dynamics while remaining competitive).
     mix = _lufs_normalize(mix, -10.0)
 
-    # Post-normalize HF correction: applied AFTER LUFS normalize so normalization
-    # cannot compensate and undo the cut (pre-normalize EQ cuts get partially restored
-    # by LUFS normalize since cutting HF lowers K-weighted LUFS, which the normalize
-    # then boosts back). This shelf directly targets the measured residual HF excess:
-    # High (6-20k) was +4.6 dB above reference after all pre-normalize processing.
-    post_norm_eq = Pedalboard([HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-5.5)])
+    # Post-normalize HF gentle control: -3.0 dB at 6kHz (down from -5.5 dB).
+    # Previous -5.5 dB was calibrated for harmonic exciters/waveshaper HF excess.
+    # Those are removed. Spectral data shows High band was -6.9 dB (too dark).
+    # With master EQ shelf reduced to -1.5 and sides EQ adding +1 dB air,
+    # the mix overshot to +0.3 dB. Apply -3 dB post-normalize to land at ~-2.7 dB
+    # (between inputs at -4.0 and -1.5 dB — natural midpoint).
+    post_norm_eq = Pedalboard([HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-3.0)])
     mix = post_norm_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
     # Brick-wall limiter LAST: enforces peak ceiling after LUFS normalization.
