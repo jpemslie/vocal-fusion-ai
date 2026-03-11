@@ -395,13 +395,16 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         # Process instrumental
         inst_c = _adaptive_spectral_carve(inst, vox_scaled, carve_db=carve_db)
         inst_c = _check(inst_c, f"iter{iteration+1}/spectral-carve")
-        # Complementary EQ: fixed reciprocal cut at vocal fundamental zone.
-        # Research: male body 200-350 Hz → -3 dB @ 280 Hz; female → -3 dB @ 380 Hz.
-        # Operates alongside the dynamic Wiener carve (which targets 300 Hz-8 kHz)
-        # to guarantee a clear pocket at the vocal's fundamental regardless of content.
-        # Reduced -3.0→-1.5 dB: was over-cutting Lo-Mid vs reference
-        _comp_eq = Pedalboard([PeakFilter(cutoff_frequency_hz=style["comp_eq_hz"],
-                                          gain_db=-1.5, q=1.2)])
+        # Complementary EQ: two cuts carve a clear vocal pocket in the beat.
+        # 1. Fundamental zone cut (gender-adaptive): clears body/low-mid masking
+        # 2. Presence zone cut at 1200 Hz (Q=0.8): clears vocal intelligibility zone.
+        #    At high volume, Fletcher-Munson makes 1-2kHz beat energy mask the vocal
+        #    harder. -2.5 dB here is barely audible on its own but makes a clear gap
+        #    for the vocal to sit in. This is the #1 fix for "vocals unclear loud".
+        _comp_eq = Pedalboard([
+            PeakFilter(cutoff_frequency_hz=style["comp_eq_hz"], gain_db=-1.5, q=1.2),
+            PeakFilter(cutoff_frequency_hz=1200.0, gain_db=-2.5, q=0.8),
+        ])
         inst_c = _comp_eq(inst_c.T.astype(np.float32), SR).T.astype(np.float32)
         # Transient shaper: sustain reduction only (no attack boost).
         # attack_gain_db=0: the function was silently disabled (btype crash) throughout
@@ -2008,12 +2011,15 @@ def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
         if f < 300 or f > 5000:
             freq_w[i] = 0.0                             # no carve outside 300-5kHz
         elif f < 600:
-            freq_w[i] = (f - 300) / 300 * 0.6         # ramp up (60% max below 600)
+            freq_w[i] = (f - 300) / 300 * 0.7         # ramp up (70% max below 600)
         elif f < 1000:
-            freq_w[i] = 0.6 + (f - 600) / 400 * 0.4   # ramp to 1.0 at 1kHz
+            freq_w[i] = 0.7 + (f - 600) / 400 * 0.3   # ramp to 1.0 at 1kHz
         else:
-            freq_w[i] = 1.0 + 0.5 * float(np.clip(
-                1.0 - abs(np.log2(f / 3000)) * 2, 0, 1))  # peak at 3kHz (1.5× weight)
+            # 2-4kHz: peak weight raised 1.5 → 2.0 (vocal presence zone)
+            # At high volume, Fletcher-Munson makes bass dominate and mask this zone.
+            # Deeper carve here creates a clear vocal pocket that holds up loud.
+            freq_w[i] = 1.0 + 1.0 * float(np.clip(
+                1.0 - abs(np.log2(f / 3000)) * 1.5, 0, 1))  # peak 2.0× at 3kHz
 
     # Effective gain: 1.0 where vocal is absent, (1 - max_cut) where vocal is loud
     max_cut = 1.0 - 10 ** (-carve_db / 20.0)   # carve_db=5 → max_cut≈0.44
@@ -2058,9 +2064,10 @@ def _parallel_compress(inst: np.ndarray) -> np.ndarray:
         Gain(gain_db=9.0),   # makeup: bring crushed level up to match dry
     ])
     crushed = crush(inst_ch, SR).T.astype(np.float32)
-    # Reverted to v17 20% wet: 33% was generating HF harmonics from heavy compression
-    # that pushed High band +7-10 dB above reference. 80/20 matches v17 tested behavior.
-    return (0.80 * inst + 0.20 * crushed).astype(np.float32)
+    # 8% wet: was 20% which sounds dense at low volume but "smashed together" loud.
+    # The crushed signal fills in transient gaps — at high SPL this makes every
+    # hit blend into the next. 8% adds just enough glue without destroying punch.
+    return (0.92 * inst + 0.08 * crushed).astype(np.float32)
 
 
 def _parallel_compress_vocal(vox_ch: np.ndarray, rap_score: float = 0.5) -> np.ndarray:
@@ -2462,8 +2469,12 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # Attack 10ms: fast enough to catch snare body but passes kick transient (slam).
     beat_ms = 60000.0 / max(bpm, 60.0)
     glue_release_ms = float(np.clip(beat_ms * 0.60, 50.0, 400.0))
+    # Glue comp: softer than before (-6/2:1 → -10/1.5:1).
+    # -6 dBFS threshold was firing on the entire mix body and smashing the beat.
+    # -10 dBFS threshold only catches true peak transients. 1.5:1 is barely
+    # audible as compression — it "glues" without "squashing".
     glue = Pedalboard([
-        Compressor(threshold_db=-6.0, ratio=2.0, attack_ms=10.0, release_ms=glue_release_ms),
+        Compressor(threshold_db=-10.0, ratio=1.5, attack_ms=15.0, release_ms=glue_release_ms),
     ])
     mix = glue(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
@@ -2488,7 +2499,11 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # Correct mastering order: all dynamics → LUFS normalize → brick-wall ceiling.
     # Target: -10 LUFS (streaming-optimized; Spotify/Apple/YouTube normalize to -14 LUFS,
     # so -10 is within 4 LU of the norm — keeps dynamics while remaining competitive).
-    mix = _lufs_normalize(mix, -10.0)
+    # Target -12 LUFS (was -10). 2 dB more headroom before the brick-wall limiter
+    # means transients pass through — kick hits harder, snare cracks more, vocals
+    # don't get smashed at the ceiling. Streaming platforms normalize to -14 LUFS
+    # anyway, so -12 is still competitive without destroying dynamics.
+    mix = _lufs_normalize(mix, -12.0)
 
     # Post-normalize HF gentle control: -3.0 dB at 6kHz (down from -5.5 dB).
     # Previous -5.5 dB was calibrated for harmonic exciters/waveshaper HF excess.
