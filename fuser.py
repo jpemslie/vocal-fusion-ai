@@ -2559,29 +2559,39 @@ def fuse(song_a: str, song_b: str, out_path: str,
     inst = stems_a["no_vocals"]   # (samples, 2)
     vox  = stems_b["vocals"]      # (samples, 2)
 
-    # HPSS Wiener bleed cleanup — remove instrumental bleed from vocal stem.
-    # Demucs/MDX vocal stems contain 17-24% percussion/hi-hat bleed at 6-20kHz.
-    # HPSS splits the stem into harmonic (vocal body) + percussive (bleed) components
-    # using a soft Wiener mask. margin=3.0: aggressive enough to suppress drum transients
-    # without notching out consonants. Applied per-channel for stereo preservation.
-    print("      Cleaning vocal bleed with HPSS Wiener mask…", flush=True)
+    # Two-stem Wiener bleed removal.
+    # HPSS (harmonic/percussive split) muffles the vocal because it can't distinguish
+    # vocal harmonics from instrumental harmonics — it attenuates both.
+    #
+    # We have the ACTUAL instrumental stem (inst). Use it directly:
+    # mask(t,f) = V(t,f)^2 / (V(t,f)^2 + I(t,f)^2)   [Wiener optimal filter]
+    #
+    # Where vocal power > instrumental power → mask ≈ 1 (keep — vocal owns this bin)
+    # Where instrumental power > vocal power → mask ≈ 0 (suppress bleed)
+    # Floor at 0.15 → never fully zero any bin → preserves consonant transients
+    #
+    # This is the theoretically optimal single-channel estimate given both sources.
+    print("      Removing vocal bleed with two-stem Wiener mask…", flush=True)
     try:
+        n_fft_ws = 2048
         vox_clean = np.zeros_like(vox)
-        vox_mono_ref = _to_mono(vox)
-        D_ref = librosa.stft(vox_mono_ref, n_fft=2048)
-        mag_ref, _ = librosa.magphase(D_ref)
-        H_ref, P_ref = librosa.decompose.hpss(mag_ref, margin=3.0)
-        # Soft Wiener mask derived from mono (consistent between channels)
-        vocal_mask = librosa.util.softmask(H_ref, P_ref + librosa.util.tiny(H_ref), power=2)
+        min_len = min(vox.shape[0], inst.shape[0])
         for c in range(vox.shape[1]):
-            D_c = librosa.stft(vox[:, c], n_fft=2048)
-            mag_c, phase_c = librosa.magphase(D_c)
-            mag_c_clean = vocal_mask * mag_c
-            vox_clean[:, c] = librosa.istft(mag_c_clean * phase_c, length=vox.shape[0])
+            ic = min(c, inst.shape[1] - 1)
+            D_v = librosa.stft(vox[:min_len, c], n_fft=n_fft_ws)
+            D_i = librosa.stft(inst[:min_len, ic], n_fft=n_fft_ws)
+            mag_v = np.abs(D_v)
+            mag_i = np.abs(D_i)
+            phase_v = np.angle(D_v)
+            # Wiener soft mask — floor at 0.15 to preserve consonant transients
+            raw_mask = librosa.util.softmask(mag_v, mag_i + 1e-8, power=2)
+            mask = np.maximum(raw_mask, 0.15)
+            D_clean = (mask * mag_v) * np.exp(1j * phase_v)
+            vox_clean[:, c] = librosa.istft(D_clean, length=vox.shape[0]).astype(np.float32)
         vox = vox_clean.astype(np.float32)
-        print("      HPSS bleed cleanup done.", flush=True)
+        print("      Two-stem Wiener done.", flush=True)
     except Exception as _e:
-        print(f"      [HPSS bleed cleanup failed: {_e} — skipping]", flush=True)
+        print(f"      [Two-stem Wiener failed: {_e} — skipping]", flush=True)
 
     ratio   = _best_ratio(bpm_a, bpm_b)
     n_semi  = semitones_to_shift(key_b_root, key_b_mode, key_a_root, key_a_mode)
