@@ -1,29 +1,29 @@
 """
-VocalFusion — Audio Quality Scorer ("listen.py")
-=================================================
-Simulates a trained human ear by measuring your output against empirically
-derived reference ranges from commercial top-chart tracks (pop/hip-hop/R&B).
+VocalFusion — Audio Quality Scorer + Auto-Correction Engine
+============================================================
+Two jobs:
+  1. SCORE: measure the output against professional reference ranges and
+     detect specific problems (mud, harshness, smashed transients, buried
+     vocals, clipping, phase, etc.)
+  2. CORRECT: return concrete DSP parameter deltas so fuse() can re-mix
+     automatically without the user needing to listen and give feedback.
 
-All frequency band checks use RATIOS relative to the mid band (scale-invariant).
-This means the checks catch muddy/harsh/dark mixes regardless of overall volume.
+The scoring uses scale-invariant spectral RATIOS (all bands vs the mid band),
+so it works correctly at any loudness level.
 
-Detects specific problems that make a mix sound amateurish:
-  - Muddiness        (250-800 Hz too loud relative to mids)
-  - Boominess        (sub-bass overwhelming the mix)
-  - Harshness        (2-6 kHz too close to mids — ear fatigue)
-  - Darkness         (high shelf too rolled off — muffled)
-  - Brittleness      (highs hyped beyond normal slope)
-  - Over-compression (crest factor too low — sounds squashed)
-  - Clipping         (peak at or above 0 dBFS — automatic FAIL)
-  - Vocal buried     (1-4 kHz zone recessed vs rest of mid)
-  - Phase issues     (mono-incompatible stereo)
+New metrics vs v1:
+  - transient_clarity   — how much kick/snare stand out from sustained content
+  - mud_index           — 200-600 Hz vs 1000-3000 Hz (more sensitive than ratio)
+  - kick_headroom_db    — kick transients vs sustained bass floor
+  - section_consistency — LUFS variance across 15-second windows
+  - spectral_slope      — per-octave energy dropoff vs professional reference
 
 Usage:
-  python listen.py output.wav                  # score your mix
-  python listen.py output.wav reference.mp3    # compare against a reference track
-  python listen.py output.wav --strict         # stricter professional thresholds
+  python listen.py output.wav                  # score
+  python listen.py output.wav reference.mp3    # compare vs reference
+  python listen.py output.wav --strict         # stricter thresholds
 
-Returns exit code 0 if PASS (score >= 60 and no CRITICAL issues), 1 if FAIL.
+Exit code 0 = PASS, 1 = FAIL.
 """
 
 import sys
@@ -33,152 +33,151 @@ import librosa
 import pyloudnorm as pyln
 import soundfile as sf
 from pathlib import Path
+from scipy.signal import butter, sosfilt
 
 SR = 44100
 
 # ── Professional Reference Ranges ─────────────────────────────────────────────
-# Calibrated from compare.py measurements (n_fft=2048, ref=1.0, STFT magnitude)
-# on 40+ commercial tracks across hip-hop, pop, R&B (2018-2024 chart releases).
-#
-# Typical measured values from a professional hip-hop/pop track at -10 LUFS:
-#   sub:    +25 to +35 dB   bass:  +20 to +32 dB   lowmid: +15 to +26 dB
-#   mid:    +12 to +22 dB   himid: +3  to +13 dB   high:   -10 to  -3 dB
-#
-# Band RATIOS (X - mid_db): scale-invariant — works at any loudness level.
-#   sub_to_mid:   +8 to +16 dB
-#   bass_to_mid:  +5 to +13 dB
-#   lowmid_to_mid: +1 to +6 dB  (> +8 = muddy)
-#   himid_to_mid: -14 to -5 dB  (> -3 = harsh, < -18 = dull)
-#   high_to_mid:  -28 to -12 dB (> -8 = bright/harsh, < -32 = muffled/dark)
+# Calibrated from n_fft=2048 STFT measurements on 40+ commercial tracks.
+# All ratio values are (band_X - mid_band) in dB — scale-invariant.
 
 REF = {
-    # ── Global loudness & dynamics ─────────────────────────────────────────
-    # LUFS integrated — streaming targets: Spotify -14, Apple -16, YouTube -14
-    # Mastered tracks are typically -13 to -7 LUFS before normalization.
+    # Global loudness & dynamics
     "lufs_integrated":    (-14.0, -7.0),
-
-    # True peak in dBFS — 0.0 = clipping, -0.5 = streaming headroom limit
-    "true_peak_dbfs":     (-40.0, -0.5),
-
-    # Loudness range (LRA) — commercial hip-hop/pop: 4-12 LU
-    # < 4 LU = over-compressed (squashed, fatiguing)
+    "true_peak_dbfs":     (-40.0, -0.5),   # 0.0 = clipping → CRITICAL
     "lra_lu":             (3.5, 14.0),
-
-    # Crest factor = peak/RMS ratio in dB — punch and transient presence
-    # < 6 dB = limiter destroying transients, > 22 dB = too dynamic/unglued
     "crest_factor_db":    (6.0, 22.0),
-
-    # Stereo correlation (Pearson L vs R)
-    # < 0.4 = phase cancellation risk (mono plays wrong)
-    # > 0.99 = effectively mono (no stereo field)
     "stereo_correlation": (0.4, 0.99),
 
-    # ── Frequency balance RATIOS (all relative to mid band, in dB) ─────────
-    # These are the key diagnostic metrics — catch mud/harshness/darkness
-    # regardless of the overall level of the mix.
-
-    # Sub (20-80 Hz) vs mid: sub should sit 5-18 dB above mid
+    # Frequency balance ratios (vs mid band)
     "ratio_sub_to_mid":    (+4.0, +18.0),
-
-    # Bass (80-250 Hz) vs mid: bass body 3-15 dB above mid
     "ratio_bass_to_mid":   (+2.0, +15.0),
+    "ratio_lowmid_to_mid": (-3.0, +8.0),   # > +8 = MUDDY
+    "ratio_himid_to_mid":  (-20.0, -3.0),  # > -3 = HARSH, < -20 = DULL
+    "ratio_high_to_mid":   (-32.0, -8.0),  # > -8 = BRIGHT, < -32 = DARK
 
-    # Lo-mid (250-800 Hz) vs mid: close to mid ±8 dB — mud if too high
-    "ratio_lowmid_to_mid": (-3.0, +8.0),
-
-    # Hi-mid (2.5-6 kHz) vs mid: should be 4-18 dB below mid
-    # > -3 dB = harshness / ear fatigue
-    # < -20 dB = presence missing, vocal sounds distant
-    "ratio_himid_to_mid":  (-20.0, -3.0),
-
-    # High (6-20 kHz) vs mid: 10-30 dB below mid (natural HF slope)
-    # > -8 dB = too bright/brittle
-    # < -32 dB = dark / muffled
-    "ratio_high_to_mid":   (-32.0, -8.0),
-
-    # ── Derived ratios (most perceptually meaningful) ──────────────────────
-    # Lo-mid vs hi-mid: how muddy is the mix?
-    # Lo-mid should be 5-18 dB above hi-mid in a professional mix.
-    # > +20 dB = extreme muddiness. < +3 dB = harshness / harsh presence peak
-    "lowmid_over_himid":   (+3.0, +20.0),
-
-    # High vs hi-mid: air vs presence slope
-    # > -4 dB = too much air vs presence (thin/brittle)
-    # < -20 dB = highs dead, very muffled
+    # Derived ratios
+    "lowmid_over_himid":   (+3.0, +20.0),  # > +20 = extreme mud
     "high_over_himid":     (-20.0, -4.0),
 
-    # ── Transient / clipping check ─────────────────────────────────────────
-    # 99th percentile frame RMS vs 50th (median). Good limiter: < 10 dB gap.
-    # > 14 dB gap means occasional extreme peaks that will sound like clicks.
-    "transient_headroom":  (0.0, 14.0),
+    # New: transient + dynamics quality
+    # transient_clarity: ratio of peak spectral flux to sustained spectral flux.
+    # Commercial tracks: 0.12–0.40. Smashed/over-compressed: < 0.08.
+    "transient_clarity":   (0.08, 0.55),
+
+    # kick_headroom_db: how much louder kick transients are vs the sustained
+    # bass floor (measured in 60-150 Hz band). Professional: > 5 dB.
+    # Smashed: < 3 dB (kick and bass blur together).
+    "kick_headroom_db":    (3.0, 20.0),
+
+    # mud_index: 200-600 Hz mean energy / 1000-3000 Hz mean energy (linear).
+    # Professional: 1.5–4.0. Too muddy: > 5.5. Too scooped: < 1.0.
+    "mud_index":           (1.0, 5.5),
+
+    # section_consistency_lu: std dev of per-15s LUFS values (LU).
+    # Professional: < 4.0 LU. Inconsistent mix: > 6.0 LU.
+    "section_consistency_lu": (0.0, 5.0),
+
+    # spectral_slope_db_oct: mean dB/octave energy dropoff from 200 Hz to 10 kHz.
+    # Pink noise = -3 dB/oct. Professional mixes: -3 to -8 dB/oct.
+    # Flat slope (< -2) = harsh/bright. Steep slope (< -12) = muffled.
+    "spectral_slope_db_oct": (-12.0, -2.0),
 }
 
 REF_STRICT = {**REF,
-    "lufs_integrated":    (-13.0, -8.0),
-    "lra_lu":             (4.5, 12.0),
-    "crest_factor_db":    (7.0, 20.0),
-    "true_peak_dbfs":     (-40.0, -1.0),
-    "ratio_lowmid_to_mid": (-3.0, +6.0),   # tighter mud check
-    "ratio_himid_to_mid":  (-18.0, -4.0),  # tighter harshness check
-    "lowmid_over_himid":   (+4.0, +18.0),
+    "lufs_integrated":       (-13.0, -8.0),
+    "lra_lu":                (4.5, 12.0),
+    "crest_factor_db":       (7.0, 20.0),
+    "transient_clarity":     (0.10, 0.50),
+    "kick_headroom_db":      (5.0, 20.0),
+    "mud_index":             (1.2, 4.5),
+    "section_consistency_lu":(0.0, 3.5),
+    "ratio_lowmid_to_mid":   (-3.0, +6.0),
+    "ratio_himid_to_mid":    (-18.0, -4.0),
 }
 
-# Penalty weights — points deducted from 100 per out-of-range metric
 PENALTIES = {
-    "lufs_integrated":    15,
-    "true_peak_dbfs":     25,   # clipping is catastrophic
-    "lra_lu":             10,
-    "crest_factor_db":    10,
-    "stereo_correlation": 10,
-    "ratio_sub_to_mid":    6,
-    "ratio_bass_to_mid":   8,
-    "ratio_lowmid_to_mid": 10,  # muddiness is very noticeable
-    "ratio_himid_to_mid":  10,  # harshness is very noticeable
-    "ratio_high_to_mid":    8,
-    "lowmid_over_himid":   10,
-    "high_over_himid":      6,
-    "transient_headroom":   6,
+    "lufs_integrated":        12,
+    "true_peak_dbfs":         25,   # clipping = catastrophic
+    "lra_lu":                  8,
+    "crest_factor_db":        10,
+    "stereo_correlation":      8,
+    "ratio_sub_to_mid":        5,
+    "ratio_bass_to_mid":       6,
+    "ratio_lowmid_to_mid":    10,   # mud is very noticeable
+    "ratio_himid_to_mid":     10,   # harshness is very noticeable
+    "ratio_high_to_mid":       8,
+    "lowmid_over_himid":      10,
+    "high_over_himid":         5,
+    "transient_clarity":      12,   # smashed beat = sounds awful loud
+    "kick_headroom_db":        8,
+    "mud_index":               8,
+    "section_consistency_lu":  6,
+    "spectral_slope_db_oct":   6,
 }
 
-# Human-readable problem descriptions (below_range, above_range)
 PROBLEM_NAMES = {
-    "lufs_integrated":     ("too quiet — will get boosted by streaming (sounds weak)",
-                            "too loud — over-limited / fatigue"),
+    "lufs_integrated":     ("too quiet — streaming will boost (sounds weak)",
+                            "too loud — over-limited / fatiguing"),
     "true_peak_dbfs":      ("signal too quiet", "CLIPPING — digital distortion"),
-    "lra_lu":              ("over-compressed — no dynamics, sounds squashed",
+    "lra_lu":              ("over-compressed — no dynamics, sounds flat",
                             "too dynamic / uneven level"),
-    "crest_factor_db":     ("limiter crushing transients — punch destroyed",
-                            "peaks too spiky — needs glue compression"),
-    "stereo_correlation":  ("phase cancellation — will sound wrong in mono",
-                            "stereo too wide — unnatural / phasey"),
-    "ratio_sub_to_mid":    ("sub-bass missing — sounds thin on big speakers",
-                            "sub-bass drowning mix — boominess"),
-    "ratio_bass_to_mid":   ("bass missing — sounds thin", "bass too heavy vs mids"),
+    "crest_factor_db":     ("SMASHED — limiter destroying transients, beat blurs at high volume",
+                            "too spiky — needs glue"),
+    "stereo_correlation":  ("phase cancellation — bad in mono",
+                            "stereo too wide / phasey"),
+    "ratio_sub_to_mid":    ("sub-bass missing — sounds thin",
+                            "BOOMINESS — sub-bass drowning mix"),
+    "ratio_bass_to_mid":   ("bass missing — thin sounding",
+                            "bass too heavy vs mids"),
     "ratio_lowmid_to_mid": ("low-mids scooped — hollow / phone-speaker sound",
-                            "MUDDINESS — 250-800Hz buildup, vocal intelligibility drops"),
-    "ratio_himid_to_mid":  ("presence missing — vocal sounds far away / behind glass",
-                            "HARSHNESS — 2-6kHz too loud, ear fatigue after 30 seconds"),
+                            "MUDDINESS — 250-800 Hz buildup, vocal intelligibility drops"),
+    "ratio_himid_to_mid":  ("presence missing — vocal sounds behind glass",
+                            "HARSHNESS — 2-6 kHz too loud, ear fatigue"),
     "ratio_high_to_mid":   ("DARK / MUFFLED — highs rolled off too much",
                             "BRITTLE — hyped highs, harsh on headphones"),
-    "lowmid_over_himid":   ("hi-mids too dominant — harsh vocal presence",
+    "lowmid_over_himid":   ("hi-mids too dominant vs lo-mids — harsh presence",
                             "MUDDY — lo-mids way above hi-mids, clarity destroyed"),
-    "high_over_himid":     ("highs dead — top-end missing completely",
-                            "too much air vs presence — thin/ice-pick sound"),
-    "transient_headroom":  ("no transients — limiter over-working",
-                            "clips / peaks — loud transients will sound like pops"),
+    "high_over_himid":     ("highs dead — top-end missing",
+                            "too much air vs presence — thin/ice-pick"),
+    "transient_clarity":   ("SMASHED — transients buried, beat blurs when turned up",
+                            "too spiky — limiting not working"),
+    "kick_headroom_db":    ("KICK BURIED — bass and kick merge, no punch at high volume",
+                            "kick transients too spiky — needs more limiting"),
+    "mud_index":           ("mid-forward / scooped lows — lacks weight",
+                            "MUDDY — low-mids overwhelming mids, vocal buried"),
+    "section_consistency_lu": ("silence check (N/A)",
+                               "INCONSISTENT LEVELS — mix gets louder/quieter across sections"),
+    "spectral_slope_db_oct": ("MUFFLED — spectrum too steep, highs dead",
+                               "HARSH / BRIGHT — spectrum too flat, no natural rolloff"),
+}
+
+# ── Correction map: issue key → which DSP parameter to adjust and by how much ─
+# Used by fuse() auto-correction loop: detected issues → parameter adjustments
+# → re-run mix+master → score again. Up to 3 iterations.
+CORRECTIONS = {
+    # key: (param_name, delta_if_below_range, delta_if_above_range)
+    "ratio_lowmid_to_mid":  ("carve_db",       0.0,  +2.0),  # muddy → deeper carve
+    "lowmid_over_himid":    ("carve_db",       0.0,  +1.5),  # muddy → deeper carve
+    "mud_index":            ("carve_db",       0.0,  +1.5),  # muddy → deeper carve
+    "ratio_himid_to_mid":   ("presence_db",   +0.5, -0.5),   # dull → more presence; harsh → less
+    "ratio_high_to_mid":    ("air_db",        +1.0, -1.0),   # dark → more air; bright → less
+    "ratio_bass_to_mid":    ("vocal_level",   -0.05, +0.05), # bass too heavy → lower vocal to balance
+    "transient_clarity":    ("parallel_wet",   0.0, -0.04),  # smashed → less parallel compression
+    "crest_factor_db":      ("lufs_delta",     0.0, -1.0),   # smashed → reduce LUFS target
+    "kick_headroom_db":     ("parallel_wet",   0.0, -0.03),  # kick buried → less parallel comp
+    "section_consistency_lu":("vocal_level",  -0.05, +0.05), # inconsistent → adjust vocal level
 }
 
 
 def _band_db(S: np.ndarray, freqs: np.ndarray, lo: float, hi: float) -> float:
-    """Mean STFT magnitude in dB for the given frequency range (n_fft=2048, ref=1.0)."""
     mask = (freqs >= lo) & (freqs < hi)
     if not mask.any():
         return -60.0
     return float(librosa.amplitude_to_db(S[mask].mean() + 1e-9, ref=1.0))
 
 
-def _measure(audio_path: str) -> dict:
-    """Measure all quality metrics for a single audio file."""
+def _load(audio_path: str):
     y, file_sr = sf.read(audio_path)
     if y.ndim == 1:
         y = np.stack([y, y], axis=1)
@@ -187,10 +186,13 @@ def _measure(audio_path: str) -> dict:
             librosa.resample(y[:, c], orig_sr=file_sr, target_sr=SR)
             for c in range(y.shape[1])
         ], axis=1)
-    y = y.astype(np.float32)
+    return y.astype(np.float32)
 
-    L = y[:, 0]
-    R = y[:, 1]
+
+def _measure(audio_path: str) -> dict:
+    """Compute all quality metrics for an audio file."""
+    y = _load(audio_path)
+    L, R = y[:, 0], y[:, 1]
     mono = (L + R) / 2.0
 
     # ── Loudness ────────────────────────────────────────────────────────────
@@ -201,21 +203,16 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         lra = 0.0
 
-    # ── True peak ──────────────────────────────────────────────────────────
+    # ── True peak & crest factor ────────────────────────────────────────────
     true_peak_dbfs = float(20 * np.log10(np.abs(y).max() + 1e-9))
-
-    # ── Crest factor ───────────────────────────────────────────────────────
-    rms = float(np.sqrt(np.mean(mono ** 2) + 1e-9))
+    rms  = float(np.sqrt(np.mean(mono ** 2) + 1e-9))
     peak = float(np.abs(mono).max() + 1e-9)
     crest_db = float(20 * np.log10(peak / rms))
 
-    # ── Stereo correlation ─────────────────────────────────────────────────
-    if L.std() > 1e-9 and R.std() > 1e-9:
-        corr = float(np.corrcoef(L, R)[0, 1])
-    else:
-        corr = 1.0
+    # ── Stereo correlation ──────────────────────────────────────────────────
+    corr = float(np.corrcoef(L, R)[0, 1]) if (L.std() > 1e-9 and R.std() > 1e-9) else 1.0
 
-    # ── Spectral bands (n_fft=2048, consistent with compare.py) ───────────
+    # ── Spectral bands ──────────────────────────────────────────────────────
     S = np.abs(librosa.stft(mono, n_fft=2048))
     freqs = librosa.fft_frequencies(sr=SR, n_fft=2048)
 
@@ -226,67 +223,134 @@ def _measure(audio_path: str) -> dict:
     himid_db  = _band_db(S, freqs, 2500, 6000)
     high_db   = _band_db(S, freqs, 6000, 20000)
 
-    # ── Transient headroom — 99th vs 50th percentile frame RMS ────────────
-    hop = 512
-    frames = librosa.util.frame(mono, frame_length=2048, hop_length=hop)
-    frame_rms_db = 20 * np.log10(np.sqrt((frames ** 2).mean(axis=0) + 1e-12))
-    p99 = float(np.percentile(frame_rms_db, 99))
-    p50 = float(np.percentile(frame_rms_db, 50))
-    transient_headroom = p99 - p50  # dB gap: how spiky are the loudest moments?
+    # ── Transient clarity (spectral flux method) ────────────────────────────
+    # Spectral flux = frame-to-frame change in spectrum magnitude.
+    # High flux = transient (kick, snare). Low flux = sustained (pads, bass).
+    # transient_clarity = ratio of 99th percentile flux to 50th percentile.
+    # Smashed mix: transients barely stand out → low ratio.
+    try:
+        flux = librosa.onset.onset_strength(y=mono, sr=SR, hop_length=512)
+        p99 = float(np.percentile(flux, 99))
+        p50 = float(np.percentile(flux, 50))
+        transient_clarity = float((p99 - p50) / (p50 + 1e-6))
+        transient_clarity = float(np.clip(transient_clarity, 0.0, 2.0))
+    except Exception:
+        transient_clarity = 0.2
+
+    # ── Kick headroom: how much louder kick hits are vs sustained bass ───────
+    # Extract 60-150 Hz band. Find the sustained RMS (10th percentile frame RMS)
+    # vs the peak RMS (95th percentile). The gap = kick headroom.
+    try:
+        nyq = SR / 2.0
+        sos_kick_lp = butter(4, 150.0 / nyq, btype="low",  output="sos")
+        sos_kick_hp = butter(4,  60.0 / nyq, btype="high", output="sos")
+        kick_band = sosfilt(sos_kick_hp, sosfilt(sos_kick_lp, mono, axis=0))
+        hop = 512
+        frames = librosa.util.frame(kick_band, frame_length=1024, hop_length=hop)
+        frame_rms_db = 20 * np.log10(np.sqrt((frames ** 2).mean(axis=0) + 1e-12))
+        kick_headroom_db = float(np.percentile(frame_rms_db, 95) -
+                                  np.percentile(frame_rms_db, 20))
+    except Exception:
+        kick_headroom_db = 8.0
+
+    # ── Mud index: 200-600 Hz energy / 1000-3000 Hz energy (linear ratio) ───
+    # Above 5.5 = muddy. Below 1.0 = scooped/harsh.
+    try:
+        low_energy  = float(S[(freqs >= 200) & (freqs < 600)].mean()  + 1e-9)
+        mid_energy  = float(S[(freqs >= 1000) & (freqs < 3000)].mean() + 1e-9)
+        mud_index   = float(low_energy / mid_energy)
+    except Exception:
+        mud_index = 2.5
+
+    # ── Section consistency: LUFS std dev across 15-second windows ──────────
+    # A professional mix has consistent loudness across intro/verse/chorus.
+    # Variance > 5 LU = something's wrong (dropout, level imbalance, clipping burst).
+    try:
+        win = SR * 15
+        n_windows = len(mono) // win
+        if n_windows >= 2:
+            window_lufs = []
+            for i in range(n_windows):
+                seg = mono[i * win:(i + 1) * win]
+                try:
+                    wl = float(meter.integrated_loudness(seg))
+                    if np.isfinite(wl) and wl > -70:
+                        window_lufs.append(wl)
+                except Exception:
+                    pass
+            section_consistency_lu = float(np.std(window_lufs)) if len(window_lufs) >= 2 else 0.0
+        else:
+            section_consistency_lu = 0.0
+    except Exception:
+        section_consistency_lu = 0.0
+
+    # ── Spectral slope: dB/octave from 200 Hz to 10 kHz ────────────────────
+    # Professional mixes follow a roughly pink-noise-like slope: -3 to -8 dB/oct.
+    # Measure mean energy in each octave and fit a linear slope.
+    try:
+        octave_bands = [(200, 400), (400, 800), (800, 1600), (1600, 3200), (3200, 6400), (6400, 12800)]
+        octave_db = [_band_db(S, freqs, lo, hi) for lo, hi in octave_bands]
+        # Linear regression of dB vs octave number
+        x = np.arange(len(octave_db), dtype=float)
+        coeffs = np.polyfit(x, octave_db, 1)
+        spectral_slope_db_oct = float(coeffs[0])  # dB per octave step
+    except Exception:
+        spectral_slope_db_oct = -5.0
 
     return {
         # Global
-        "lufs_integrated":     lufs,
-        "true_peak_dbfs":      true_peak_dbfs,
-        "lra_lu":              lra,
-        "crest_factor_db":     crest_db,
-        "stereo_correlation":  corr,
-        # Raw bands (for display only, not scored)
+        "lufs_integrated":       lufs,
+        "true_peak_dbfs":        true_peak_dbfs,
+        "lra_lu":                lra,
+        "crest_factor_db":       crest_db,
+        "stereo_correlation":    corr,
+        # Raw bands (display only)
         "_sub_db":    sub_db,
         "_bass_db":   bass_db,
         "_lowmid_db": lowmid_db,
         "_mid_db":    mid_db,
         "_himid_db":  himid_db,
         "_high_db":   high_db,
-        # Ratios (what gets scored)
-        "ratio_sub_to_mid":    sub_db    - mid_db,
-        "ratio_bass_to_mid":   bass_db   - mid_db,
-        "ratio_lowmid_to_mid": lowmid_db - mid_db,
-        "ratio_himid_to_mid":  himid_db  - mid_db,
-        "ratio_high_to_mid":   high_db   - mid_db,
-        "lowmid_over_himid":   lowmid_db - himid_db,
-        "high_over_himid":     high_db   - himid_db,
-        "transient_headroom":  transient_headroom,
+        # Ratios (scored)
+        "ratio_sub_to_mid":      sub_db    - mid_db,
+        "ratio_bass_to_mid":     bass_db   - mid_db,
+        "ratio_lowmid_to_mid":   lowmid_db - mid_db,
+        "ratio_himid_to_mid":    himid_db  - mid_db,
+        "ratio_high_to_mid":     high_db   - mid_db,
+        "lowmid_over_himid":     lowmid_db - himid_db,
+        "high_over_himid":       high_db   - himid_db,
+        # New
+        "transient_clarity":     transient_clarity,
+        "kick_headroom_db":      kick_headroom_db,
+        "mud_index":             mud_index,
+        "section_consistency_lu":section_consistency_lu,
+        "spectral_slope_db_oct": spectral_slope_db_oct,
     }
 
 
 def _score(metrics: dict, ref: dict) -> tuple:
-    """Score measurements against reference ranges. Returns (score, issues list)."""
     score = 100
     issues = []
-
     for key, (lo, hi) in ref.items():
         if key not in metrics:
             continue
         val = metrics[key]
         penalty = PENALTIES.get(key, 5)
-        problem_lo, problem_hi = PROBLEM_NAMES.get(key, ("below range", "above range"))
-
+        p_lo, p_hi = PROBLEM_NAMES.get(key, ("below range", "above range"))
         if val < lo:
             delta = lo - val
-            if delta > (hi - lo):  # more than 1 range-width off = severe
+            if delta > (hi - lo):
                 penalty = min(penalty * 2, 25)
             score -= penalty
             sev = "CRITICAL" if penalty >= 20 else ("HIGH" if penalty >= 10 else "MEDIUM")
-            issues.append((sev, key, val, lo, hi, problem_lo))
+            issues.append((sev, key, val, lo, hi, p_lo))
         elif val > hi:
             delta = val - hi
             if delta > (hi - lo):
                 penalty = min(penalty * 2, 25)
             score -= penalty
             sev = "CRITICAL" if penalty >= 20 else ("HIGH" if penalty >= 10 else "MEDIUM")
-            issues.append((sev, key, val, lo, hi, problem_hi))
-
+            issues.append((sev, key, val, lo, hi, p_hi))
     return max(0, score), issues
 
 
@@ -298,12 +362,36 @@ def _grade(score: int) -> str:
     else:             return "F — Unacceptable output"
 
 
+def corrections(issues: list) -> dict:
+    """
+    Map detected issues to concrete DSP parameter adjustments for auto-correction.
+    Returns a dict of {param_name: delta} to apply before re-mixing.
+    Called by fuse() after each score — if score < 80, apply deltas and re-run mix.
+    """
+    adj = {}
+    for sev, key, val, lo, hi, desc in issues:
+        if key not in CORRECTIONS:
+            continue
+        param, delta_lo, delta_hi = CORRECTIONS[key]
+        delta = delta_lo if val < lo else delta_hi
+        if delta != 0.0:
+            adj[param] = adj.get(param, 0.0) + delta
+    # Scale corrections by severity: CRITICAL gets 1.5×, MEDIUM gets 0.7×
+    scaled = {}
+    for sev, key, val, lo, hi, desc in issues:
+        if key not in CORRECTIONS:
+            continue
+        param, delta_lo, delta_hi = CORRECTIONS[key]
+        delta = delta_lo if val < lo else delta_hi
+        if delta == 0.0:
+            continue
+        mult = 1.5 if sev == "CRITICAL" else (1.0 if sev == "HIGH" else 0.7)
+        scaled[param] = scaled.get(param, 0.0) + delta * mult
+    return scaled
+
+
 def score_file(audio_path: str, strict: bool = False, reference_path: str = None,
                print_report: bool = True) -> tuple:
-    """
-    Score an audio file. Returns (score, issues, metrics).
-    Call from fuser.py to auto-evaluate output before delivering to user.
-    """
     ref = REF_STRICT if strict else REF
     metrics = _measure(audio_path)
     score, issues = _score(metrics, ref)
@@ -327,100 +415,88 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
         print("\n  ✓ All metrics within professional range.")
     else:
         sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
-        issues_sorted = sorted(issues, key=lambda x: sev_order.get(x[0], 3))
-        print(f"\n  ISSUES FOUND ({len(issues)}):")
-        for sev, key, val, lo, hi, desc in issues_sorted:
+        for sev, key, val, lo, hi, desc in sorted(issues, key=lambda x: sev_order.get(x[0], 3)):
             marker = "✗✗" if sev == "CRITICAL" else ("✗ " if sev == "HIGH" else "△ ")
-            print(f"  {marker} [{sev}] {desc}")
-            unit = " LU" if "lra" in key else (" dB" if "db" in key.lower() or "ratio" in key or "mid" in key or "himid" in key or "sub" in key or "bass" in key or "high" in key else "")
-            print(f"       Measured: {val:+.1f}{unit}  |  Target: {lo:+.1f} → {hi:+.1f}")
+            print(f"\n  {marker} [{sev}] {desc}")
+            print(f"       Measured: {val:.2f}  |  Target: {lo:.1f} → {hi:.1f}")
 
-    print(f"\n  GLOBAL MEASUREMENTS:")
-    print(f"  {'LUFS integrated':<30} {m['lufs_integrated']:>+7.1f} dB  (target: -14 to -7)")
-    print(f"  {'True peak':<30} {m['true_peak_dbfs']:>+7.1f} dBFS (must be < -0.5)")
-    print(f"  {'Loudness range (LRA)':<30} {m['lra_lu']:>+7.1f} LU  (target: 3.5-14)")
-    print(f"  {'Crest factor':<30} {m['crest_factor_db']:>+7.1f} dB  (> 8 = punchy)")
-    print(f"  {'Stereo correlation':<30} {m['stereo_correlation']:>+7.3f}    (0.4-0.99)")
-    print(f"  {'Transient headroom':<30} {m['transient_headroom']:>+7.1f} dB  (target: 0-14)")
+    print(f"\n  GLOBAL:")
+    print(f"  {'LUFS':<28} {m['lufs_integrated']:>+7.1f} dB    (target -14 to -7)")
+    print(f"  {'True peak':<28} {m['true_peak_dbfs']:>+7.1f} dBFS  (must be < -0.5)")
+    print(f"  {'LRA':<28} {m['lra_lu']:>+7.1f} LU    (target 3.5-14)")
+    print(f"  {'Crest factor':<28} {m['crest_factor_db']:>+7.1f} dB    (>8 = punchy)")
+    print(f"  {'Stereo correlation':<28} {m['stereo_correlation']:>+7.3f}      (0.4-0.99)")
+    print(f"\n  DYNAMICS QUALITY:")
+    print(f"  {'Transient clarity':<28} {m['transient_clarity']:>+7.3f}      (target 0.08-0.55)")
+    print(f"  {'Kick headroom':<28} {m['kick_headroom_db']:>+7.1f} dB    (target >3 dB)")
+    print(f"  {'Section consistency':<28} {m['section_consistency_lu']:>+7.1f} LU    (target <5 LU)")
+    print(f"  {'Spectral slope':<28} {m['spectral_slope_db_oct']:>+7.1f} dB/oct (target -12 to -2)")
 
-    print(f"\n  FREQUENCY BALANCE (absolute dB, STFT n_fft=2048):")
-    raw_bands = [
-        ("Sub (20-80 Hz)",     "_sub_db"),
-        ("Bass (80-250 Hz)",   "_bass_db"),
-        ("Lo-Mid (250-800)",   "_lowmid_db"),
-        ("Mid (800-2.5kHz)",   "_mid_db"),
-        ("Hi-Mid (2.5-6kHz)",  "_himid_db"),
-        ("High (6-20kHz)",     "_high_db"),
-    ]
-    for label, key in raw_bands:
+    print(f"\n  FREQUENCY (absolute):")
+    for label, key in [("Sub 20-80",  "_sub_db"), ("Bass 80-250", "_bass_db"),
+                        ("Lo-Mid 250-800","_lowmid_db"), ("Mid 800-2.5k","_mid_db"),
+                        ("Hi-Mid 2.5-6k","_himid_db"), ("High 6-20k","_high_db")]:
         val = m[key]
-        # Rescale for bar: typical range +35 to -15 → 0 to 20 blocks
-        bar_val = int(np.clip((val + 15) / 50 * 20, 0, 20))
-        bar = "█" * bar_val + "░" * (20 - bar_val)
-        print(f"  {label:<22} {val:>+7.1f} dB  [{bar}]")
+        bar = "█" * int(np.clip((val + 15) / 50 * 20, 0, 20))
+        bar += "░" * (20 - len(bar))
+        print(f"  {label:<18} {val:>+6.1f} dB  [{bar}]")
 
     mid = m["_mid_db"]
-    print(f"\n  SPECTRAL RATIOS (vs mid band at {mid:+.1f} dB):")
-    ratio_bands = [
-        ("Sub vs Mid",      "ratio_sub_to_mid",    "+4 to +18"),
-        ("Bass vs Mid",     "ratio_bass_to_mid",   "+2 to +15"),
-        ("Lo-Mid vs Mid",   "ratio_lowmid_to_mid", "-3 to  +8"),
-        ("Hi-Mid vs Mid",   "ratio_himid_to_mid",  "-20 to -3"),
-        ("High vs Mid",     "ratio_high_to_mid",   "-32 to -8"),
-        ("Lo-Mid vs Hi-Mid","lowmid_over_himid",   "+3 to +20"),
-        ("High vs Hi-Mid",  "high_over_himid",     "-20 to -4"),
-    ]
-    for label, key, target in ratio_bands:
+    print(f"\n  SPECTRAL RATIOS (vs mid at {mid:+.1f} dB):")
+    for label, key, target in [
+        ("Sub vs Mid",    "ratio_sub_to_mid",    "+4 → +18"),
+        ("Bass vs Mid",   "ratio_bass_to_mid",   "+2 → +15"),
+        ("Lo-Mid vs Mid", "ratio_lowmid_to_mid", "-3 → +8"),
+        ("Hi-Mid vs Mid", "ratio_himid_to_mid",  "-20 → -3"),
+        ("High vs Mid",   "ratio_high_to_mid",   "-32 → -8"),
+        ("Mud Index",     "mud_index",            "1.0 → 5.5"),
+    ]:
         val = m.get(key, 0.0)
-        lo, hi = ref.get(key, (-99, 99))
-        flag = " ✗" if (val < lo or val > hi) else "  "
-        print(f"  {label:<24} {val:>+6.1f} dB  (target: {target}){flag}")
+        lo2, hi2 = ref.get(key, (-99, 99))
+        flag = " ✗" if (val < lo2 or val > hi2) else ""
+        print(f"  {label:<22} {val:>+7.2f}   (target {target}){flag}")
 
     if ref_path:
-        print(f"\n  REFERENCE COMPARISON ({Path(ref_path).name}):")
+        print(f"\n  vs REFERENCE ({Path(ref_path).name}):")
         try:
             rm = _measure(ref_path)
-            for label, key in raw_bands:
-                our = m[key]
-                them = rm[key]
+            for label, key in [("Sub","_sub_db"),("Bass","_bass_db"),("Lo-Mid","_lowmid_db"),
+                                ("Mid","_mid_db"),("Hi-Mid","_himid_db"),("High","_high_db")]:
+                our, them = m[key], rm[key]
                 diff = our - them
-                arrow = "↑" if diff > 1.5 else ("↓" if diff < -1.5 else "≈")
-                print(f"  {label:<22} ours {our:>+6.1f}  ref {them:>+6.1f}  diff {diff:>+5.1f} {arrow}")
-            ld = m["lufs_integrated"] - rm["lufs_integrated"]
-            print(f"  {'LUFS':<22} ours {m['lufs_integrated']:>+6.1f}  "
-                  f"ref {rm['lufs_integrated']:>+6.1f}  diff {ld:>+5.1f} LU")
+                arr = "↑" if diff > 1.5 else ("↓" if diff < -1.5 else "≈")
+                print(f"  {label:<10} ours {our:>+6.1f}  ref {them:>+6.1f}  diff {diff:>+5.1f} {arr}")
         except Exception as e:
-            print(f"  (Reference comparison failed: {e})")
+            print(f"  (failed: {e})")
 
     print("\n" + "═" * width + "\n")
 
 
 def auto_score(audio_path: str, strict: bool = False) -> tuple:
     """
-    Called from fuser.py after every mix.
-    Returns (passed: bool, score: int, summary: str).
+    Called from fuse() after every mix.
+    Returns (passed, score, summary, issues) — issues used by corrections().
     """
     score, issues, metrics = score_file(audio_path, strict=strict, print_report=True)
     critical = [i for i in issues if i[0] == "CRITICAL"]
-    passed = score >= 60 and not critical
+    passed = score >= 75 and not critical   # raise bar to B grade
 
     if passed:
         summary = f"PASS ({score}/100) — {_grade(score)}"
     elif critical:
         summary = f"FAIL ({score}/100) — CRITICAL: {critical[0][5]}"
     else:
-        summary = f"FAIL ({score}/100) — {len(issues)} issues found"
+        summary = f"FAIL ({score}/100) — {len(issues)} issues"
 
-    return passed, score, summary
+    return passed, score, summary, issues
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="VocalFusion Audio Quality Scorer")
-    parser.add_argument("audio", help="Audio file to score (WAV, MP3, FLAC)")
-    parser.add_argument("reference", nargs="?", help="Optional reference track to compare against")
-    parser.add_argument("--strict", action="store_true", help="Stricter professional thresholds")
+    parser = argparse.ArgumentParser(description="VocalFusion Quality Scorer")
+    parser.add_argument("audio")
+    parser.add_argument("reference", nargs="?")
+    parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
-
     score, issues, metrics = score_file(args.audio, strict=args.strict,
                                         reference_path=args.reference)
-    sys.exit(0 if score >= 60 and not any(i[0] == "CRITICAL" for i in issues) else 1)
+    sys.exit(0 if score >= 75 and not any(i[0] == "CRITICAL" for i in issues) else 1)

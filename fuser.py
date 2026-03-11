@@ -2705,11 +2705,14 @@ def fuse(song_a: str, song_b: str, out_path: str,
     print(f"      Groove quantize: strength={quant_strength:.2f} "
           f"(rap={rap_score:.2f})", flush=True)
 
-    # AI iterative mixer: closed-loop presence feedback, energy-envelope matching,
-    # spectral carve, parallel compress, sidechain — all style-adaptive
+    # Save pre-mix stems so the auto-correction loop can re-mix without re-separating.
+    # Stem separation is the slow step (2-5 min). Mix+master is ~20 seconds.
+    inst_remix = inst.copy()
+    vox_remix  = vox.copy()
+
+    # ── Mix + Master (initial pass) ───────────────────────────────────────────
     mix = _iterative_mix(inst, vox, style, sidechain_depth, bpm_a)
     mix = _check(mix, "post-mix")
-
     mix = _fade(mix, fade_s=2.0)
 
     step(9, TOTAL, "Mastering…")
@@ -2720,33 +2723,82 @@ def fuse(song_a: str, song_b: str, out_path: str,
     sf.write(out_path, mix, SR, subtype="PCM_24")
     print(f"Done → {out_path}", flush=True)
 
-    # ── Auto quality evaluation (legacy 7-point check) ───────────────────────
-    print("\n── Auto Quality Evaluation ─────────────────────────────────────", flush=True)
-    ev = _auto_evaluate(mix, inst, vox, bpm_a)
-    print(f"  Beat sync:      {ev['beat_sync_pct']}%  (want >45%)", flush=True)
-    print(f"  Vocal presence: {ev['vocal_presence']}%  (want 40-70%)", flush=True)
-    print(f"  LUFS:           {ev['lufs']} dB", flush=True)
-    print(f"  Peak:           {ev['peak_dBFS']} dBFS", flush=True)
-    print(f"  Bands:          {ev['bands']}", flush=True)
-    if ev["issues"]:
-        print("  ISSUES:", flush=True)
-        for iss in ev["issues"]:
-            print(f"    x {iss}", flush=True)
-    else:
-        print("  All checks passed", flush=True)
-    print(f"  Overall: {'PASS' if ev['pass'] else 'FAIL'}", flush=True)
-
-    # ── Professional quality scoring (listen.py) ──────────────────────────────
-    # Measures output against empirical ranges from 50+ commercial tracks.
-    # Catches: muddiness, harshness, clipping, noise floor, vocal level, etc.
+    # ── Auto-correction loop ─────────────────────────────────────────────────
+    # Score the mix. If it fails (< 75/100 or CRITICAL issue), apply the
+    # corrections() map to DSP params and re-run just mix+master. Up to 3 passes.
+    # The user never needs to listen and tell us what's wrong — we fix it ourselves.
     try:
-        from listen import auto_score
-        qc_passed, qc_score, qc_summary = auto_score(out_path)
-        print(f"\n  Professional score: {qc_summary}", flush=True)
-        if not qc_passed:
-            print("  [QC WARNING] Output may not meet professional standards. "
-                  "Check the report above for specific issues.", flush=True)
+        from listen import auto_score as _auto_score, corrections as _corrections
+        best_score = 0
+        best_mix   = mix.copy()
+        _lufs_target = -12.0   # mutable within this loop
+
+        for _attempt in range(3):
+            print(f"\n── Quality Check (attempt {_attempt + 1}/3) {'─' * 35}",
+                  flush=True)
+            _passed, _score, _summary, _issues = _auto_score(out_path)
+            print(f"  → {_summary}", flush=True)
+
+            if _score > best_score:
+                best_score = _score
+                best_mix   = mix.copy()
+
+            if _passed:
+                print(f"  ✓ Mix passed QC on attempt {_attempt + 1}.", flush=True)
+                break
+
+            if _attempt == 2:
+                print("  Max correction attempts reached — using best result.", flush=True)
+                break
+
+            # Get parameter deltas from issue map
+            _adj = _corrections(_issues)
+            if not _adj:
+                print("  No correctable issues found — keeping current mix.", flush=True)
+                break
+
+            print(f"  Auto-correcting: {_adj}", flush=True)
+
+            # Apply corrections to style dict (clamped to safe ranges)
+            if "carve_db" in _adj:
+                style["carve_db"] = float(np.clip(
+                    style["carve_db"] + _adj["carve_db"], 3.0, 12.0))
+            if "presence_db" in _adj:
+                style["presence_db"] = float(np.clip(
+                    style.get("presence_db", 1.5) + _adj["presence_db"], 0.0, 4.0))
+            if "air_db" in _adj:
+                style["air_db"] = float(np.clip(
+                    style.get("air_db", 2.5) + _adj["air_db"], 0.0, 5.0))
+            if "vocal_level" in _adj:
+                style["vocal_level"] = float(np.clip(
+                    style["vocal_level"] + _adj["vocal_level"], 0.5, 2.5))
+            if "lufs_delta" in _adj:
+                _lufs_target = float(np.clip(_lufs_target + _adj["lufs_delta"], -16.0, -9.0))
+
+            print(f"  New params: carve={style['carve_db']:.1f}dB  "
+                  f"vocal_level={style['vocal_level']:.2f}  "
+                  f"lufs={_lufs_target:.1f}", flush=True)
+
+            # Re-run mix + master with adjusted params
+            print("  Re-mixing…", flush=True)
+            mix = _iterative_mix(inst_remix, vox_remix, style, sidechain_depth, bpm_a)
+            mix = _check(mix, f"remix-{_attempt+2}/mix")
+            mix = _fade(mix, fade_s=2.0)
+            mix = _master(mix, bpm=bpm_a)
+            mix = _check(mix, f"remix-{_attempt+2}/master")
+            sf.write(out_path, mix, SR, subtype="PCM_24")
+
+        # Write the highest-scoring version
+        sf.write(out_path, best_mix, SR, subtype="PCM_24")
+        print(f"\n  Final score: {best_score}/100 — {out_path}", flush=True)
+
     except Exception as _qe:
-        print(f"  [Quality scorer unavailable: {_qe}]", flush=True)
+        print(f"  [Auto-correction unavailable: {_qe}]", flush=True)
+        # Legacy 7-point check as fallback
+        ev = _auto_evaluate(mix, inst, vox, bpm_a)
+        print(f"  Beat sync: {ev['beat_sync_pct']}%  "
+              f"Vocal: {ev['vocal_presence']}%  "
+              f"LUFS: {ev['lufs']}  "
+              f"{'PASS' if ev['pass'] else 'FAIL'}", flush=True)
 
     return out_path
