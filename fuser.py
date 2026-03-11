@@ -1581,320 +1581,111 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
                     target_root: int = 0, target_mode: str = "major",
                     bpm: float = 120.0) -> np.ndarray:
     """
-    Full professional vocal pipeline (v5 — style-adaptive):
-      1. DeepFilterNet / noisereduce: remove bleed artifacts (per channel)
-      2. pyrubberband R3 time-stretch + pitch-shift (formant-preserving)
-         fallback: pedalboard time_stretch
-      3. HPF 80 Hz, 24 dB/oct
-      4. Subtractive EQ: -3 dB @ 300 Hz (mud), -2 dB @ 500 Hz (boxy)
-      5. De-esser (BEFORE compression)
-      6. Compressor 1 (FET-type): style-adaptive ratio/attack/release
-      7. Compressor 2 (Opto-type): style-adaptive ratio/attack/release
-      8. NoiseGate
-      9. Additive EQ: style-adaptive presence boost + air shelf
-     10. Subtle saturation
-     11. Pre-delay reverb: style-adaptive room/damp/wet, HPF'd return
+    Minimal vocal pipeline — clarity over complexity.
+
+    Previous 16-stage chain was stacking artifacts on top of AI-separation
+    artifacts, creating smear and muddiness. Each removed stage is a stage
+    that can't add distortion, phase issues, or timing smear.
+
+    Chain (7 stages only):
+      1. HPF 80 Hz + 3-node subtractive EQ
+      2. Time-stretch + pitch-shift (pyrubberband R3)
+      3. De-esser
+      4. ONE compressor (style-adaptive)
+      5. Noise gate
+      6. Presence boost + air shelf
+      7. Dry reverb (5-8% wet, short room)
+
+    Removed vs old chain:
+      - Breath reduction      (creates pumping artifacts between words)
+      - Multiband compression (over-processing on AI stems)
+      - Dynamic EQ            (stacks with comp artifacts)
+      - NY parallel compression on vocal (smears transients)
+      - Mid-band harmonic exciter (adds distortion to bleed)
+      - Early reflections     (adds pre-echo that destroys flow)
+      - Slap-back echo        (smears phrases into each other)
+      - ADT / pitch-shift copies (chorus smear = "no flow" complaint)
+      - Soft-knee entry compressor (redundant with de-esser)
     """
     if style is None:
         style = {
-            "fet_ratio": 6.0, "fet_attack": 2.0, "fet_release": 60.0,
-            "opto_ratio": 2.5, "opto_attack": 20.0, "opto_release": 250.0,
-            "presence_db": 2.5, "presence_hz": 3500.0,
-            "air_db": 2.0, "reverb_room": 0.12, "reverb_damp": 0.80, "reverb_wet": 0.08,
+            "fet_ratio": 4.0, "fet_attack": 5.0, "fet_release": 80.0,
+            "presence_db": 2.0, "presence_hz": 3500.0,
+            "air_db": 1.5, "reverb_room": 0.10, "reverb_damp": 0.80, "reverb_wet": 0.06,
         }
-
-    # Step 1: REMOVED DeepFilterNet and noisereduce.
-    # DeepFilter is trained on speech + stationary noise. Applied to Demucs-separated
-    # vocals (which contain music bleed: hi-hats, synths, instrumental residue), it
-    # misidentifies those musical tones as "noise" and creates severe metallic/static
-    # artifacts. The Demucs stem is already reasonably clean — don't over-process it.
-
-    # Step 1b: breath reduction — attenuate breath noise between phrases
-    vox = _breath_reduce(vox.T, reduction_db=4.0).T.astype(np.float32)
-
-    # Step 1d: REMOVED pitch correction.
-    # PYIN pitch detection on Demucs vocals (with music bleed) produces wrong pitch
-    # readings on frames where the instrumental bleed dominates. Rubberband then
-    # shifts those frames by the wrong amount, creating pitch jump artifacts.
-    # The BPM stretch + key shift below handles tuning without per-note correction.
-    if False:  # disabled — kept for reference only
-        ratio_corr = np.where(np.abs(vox[:, 0]) > 1e-9,
-                              vox_mid_corrected / (vox_mid + 1e-9), 1.0).astype(np.float32)
-        vox = (vox * ratio_corr[:, np.newaxis]).astype(np.float32)
 
     # (samples, 2) → (2, samples) for pedalboard / pyrubberband
     vox_ch = vox.T.astype(np.float32)
 
-    # Step 2: time-stretch + pitch-shift
-    # Critical pre-processing when pitch-shifting: strip HF bleed BEFORE shift.
-    # Demucs vocal stems contain 17-24% hi-hat/cymbal bleed in 6-20kHz range.
-    # When pyrubberband pitch-shifts by N semitones, the bleed gets shifted too —
-    # a 8kHz hi-hat shifted -3 semitones sounds metallic/scratchy and clashes
-    # with the beat's natural hi-hats. Solution: LPF at 5kHz before shifting.
-    # The vocal body (fundamental + formants) is almost entirely below 5kHz.
+    # Stage 1: HPF 80 Hz + subtractive EQ
+    pre_eq = Pedalboard([
+        HighpassFilter(cutoff_frequency_hz=80.0),
+        PeakFilter(cutoff_frequency_hz=300.0, gain_db=-3.0, q=1.2),  # mud
+        PeakFilter(cutoff_frequency_hz=500.0, gain_db=-2.0, q=1.5),  # boxy
+    ])
+    vox_ch = pre_eq(vox_ch, SR).astype(np.float32)
+
+    # Stage 2: time-stretch + pitch-shift (pyrubberband R3, formant-preserving)
     if n_semitones != 0:
-        # 8kHz (not 5kHz): keeps vocal sibilance (s/sh at 5-8kHz), removes hi-hat
-        # bleed zone (8-16kHz). Pitch-shifted hi-hats sound scratchy/metallic;
-        # pitch-shifted sibilance sounds much more natural (it's broadband noise).
-        sos_pre_shift_lpf = butter(4, 8000.0 / (SR / 2), btype="low", output="sos")
+        # Strip hi-hat bleed before shifting (8kHz keeps sibilance, removes 8-16kHz bleed)
+        sos_lpf = butter(4, 8000.0 / (SR / 2), btype="low", output="sos")
         vox_ch = np.stack([
-            sosfilt(sos_pre_shift_lpf, vox_ch[c]).astype(np.float32)
+            sosfilt(sos_lpf, vox_ch[c]).astype(np.float32)
             for c in range(vox_ch.shape[0])
         ], axis=0)
 
-    # pyrubberband R3 engine gives much better formant preservation for vocals
     if HAS_PYRUBBERBAND and (abs(ratio - 1.0) > 0.005 or n_semitones != 0):
-        vox_mono_list = []
+        stretched = []
         for c in range(vox_ch.shape[0]):
             y_s = rb.time_stretch(vox_ch[c], SR, ratio, rbargs={'-3': ''})
             if n_semitones != 0:
                 y_s = rb.pitch_shift(y_s, SR, n_semitones, rbargs={'-3': ''})
-            vox_mono_list.append(y_s)
-        vox_ch = np.stack(vox_mono_list, axis=0).astype(np.float32)
-    else:
-        # Fallback: pedalboard
-        if abs(ratio - 1.0) > 0.005 or n_semitones != 0:
-            vox_ch = pb_time_stretch(
-                vox_ch, SR,
-                stretch_factor=ratio,
-                pitch_shift_in_semitones=float(n_semitones),
-            ).astype(np.float32)
+            stretched.append(y_s)
+        vox_ch = np.stack(stretched, axis=0).astype(np.float32)
+    elif abs(ratio - 1.0) > 0.005 or n_semitones != 0:
+        vox_ch = pb_time_stretch(
+            vox_ch, SR,
+            stretch_factor=ratio,
+            pitch_shift_in_semitones=float(n_semitones),
+        ).astype(np.float32)
 
-    # Steps 3-4: HPF + subtractive EQ (before dynamics)
-    # +1.5 dB at 250 Hz (Q=0.8): restores low-mid body that Demucs mask removes.
-    # Demucs is conservative in 200-500 Hz (heavy vocal/instrument overlap) and
-    # attenuates overtones here → vocal sounds "telephone thin". The 300 Hz cut
-    # (-3 dB) is complementary: restore warmth at 200-280 Hz, cut mud at 280-320 Hz.
-    pre_dynamics_board = Pedalboard([
-        HighpassFilter(cutoff_frequency_hz=80.0),      # 80 Hz (not 100) — low-end stem bleed
-        PeakFilter(cutoff_frequency_hz=250.0, gain_db=+1.5, q=0.8),   # restore Demucs mask attenuation
-        PeakFilter(cutoff_frequency_hz=300.0, gain_db=-3.0, q=1.2),   # mud
-        PeakFilter(cutoff_frequency_hz=500.0, gain_db=-2.0, q=1.5),   # boxy
-    ])
-    vox_ch = pre_dynamics_board(vox_ch, SR).astype(np.float32)
-
-    # Step 5: de-esser BEFORE compression (prevents sibilance pumping the compressor)
+    # Stage 3: de-esser (before compression — prevents sibilance pumping)
     vox_ch = _deess(vox_ch.T, threshold_db=-22.0).T.astype(np.float32)
 
-    # Steps 6-8: dual compressor (FET → Opto) + soft expander — style-adaptive
-    #
-    # Soft-knee emulation (pedalboard doesn't expose knee parameter):
-    # A 2-stage approach inserts a gentle "entry" compressor 6 dB before the
-    # main threshold, ratio 1.5:1. This begins smoothly easing in gain reduction
-    # before the main FET stage fires — the perceptual equivalent of a 6 dB knee.
-    # Research: 6 dB soft knee is the professional standard for vocal compression.
-    dynamics_board = Pedalboard([
-        # Soft-knee entry: begin compressing 6 dB before main threshold
-        Compressor(
-            threshold_db=params["comp_thresh_db"] - 6.0,  # early onset = knee
-            ratio=1.5,                                      # gentle slope into threshold
-            attack_ms=style["fet_attack"] * 2.0,           # slightly slower = smooth entry
-            release_ms=style["fet_release"],
-        ),
-        # Compressor 1 (FET-type): main compression — fast, catches transients
+    # Stage 4 + 5: ONE compressor + noise gate
+    dyn_board = Pedalboard([
         Compressor(
             threshold_db=params["comp_thresh_db"],
             ratio=style["fet_ratio"],
             attack_ms=style["fet_attack"],
             release_ms=style["fet_release"],
         ),
-        # Compressor 2 (Opto-type): slow programme-level smoothing glue
-        Compressor(
-            threshold_db=params["comp_thresh_db"] + 3.0,
-            ratio=style["opto_ratio"],
-            attack_ms=style["opto_attack"],
-            release_ms=style["opto_release"],
-        ),
-        # Soft expander instead of hard gate (ratio 2:1 instead of 10:1).
-        # Research: hard gates (10:1) create audible click/chop on word endings.
-        # A 2:1 downward expander reduces level below threshold gradually —
-        # sounds like the natural decay of a voice, not a switch being cut.
         NoiseGate(
             threshold_db=params["gate_thresh_db"],
-            ratio=2.0,        # expander (was 10.0 hard gate) — natural decay
-            attack_ms=5.0,    # slightly slower than gate to avoid clicking
-            release_ms=150.0, # 150ms = natural word-ending fade (research: 200ms slightly long)
+            ratio=2.0,       # soft expander — natural word-ending decay
+            attack_ms=5.0,
+            release_ms=150.0,
         ),
     ])
-    vox_ch = dynamics_board(vox_ch, SR).astype(np.float32)
+    vox_ch = dyn_board(vox_ch, SR).astype(np.float32)
 
-    # Step 8b: multiband compression (Waves C6 / Neutron style) — per-band control
-    # Runs after the dual-stage broadband comp; refines each frequency region
-    vox_ch = _multiband_compress_vocal(vox_ch, style)
-
-    # Step 8b2: dynamic EQ — reduce 3kHz harshness only on loud phrases
-    # Research: 3kHz is ISO 226 ear-sensitivity peak; belted/loud phrases accumulate
-    # harsh energy here. Dynamic EQ only cuts when energy exceeds 80th-percentile
-    # threshold — transparent on quiet phrases, controls harshness on loud ones.
-    vox_ch = _dynamic_eq_vocal(vox_ch)
-
-    # Step 8c: NY parallel vocal compression — adds density without pumping
-    # Blend of heavily crushed signal fills quiet gaps between syllables.
-    # Research: 25-38% blend, 8:1, 3-5ms attack, 40-80ms release — standard for hip-hop vocals.
-    rap = style.get("_rap_score", 0.5)
-    vox_ch = _parallel_compress_vocal(vox_ch, rap_score=rap)
-
-    # Step 9: additive EQ AFTER dynamics — style-adaptive presence + air
-    post_dynamics_board = Pedalboard([
+    # Stage 6: presence boost + air shelf
+    post_eq = Pedalboard([
         PeakFilter(cutoff_frequency_hz=style["presence_hz"],
                    gain_db=style["presence_db"], q=1.5),
         HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=style["air_db"]),
     ])
-    vox_ch = post_dynamics_board(vox_ch, SR).astype(np.float32)
+    vox_ch = post_eq(vox_ch, SR).astype(np.float32)
 
-    # Step 9b: consonant enhancement — boost "t","d","k" transients in 4-9kHz
-    # without boosting sustained hi-hats (dual envelope differentiates them)
-    # Disabled (was [0.5, 1.0] dB): operates at 4-9 kHz, straddles both Hi-Mid and High
-    # problem bands. Removed while tuning spectral balance vs reference.
-    consonant_boost = 0.0
-    vox_ch = _consonant_enhance(vox_ch, boost_db=consonant_boost)
-
-    # Step 9c: safe mid-band harmonic exciter — restores warmth stripped by Demucs mask
-    # Research: standard exciters on AI stems create static because they process
-    # the bleed-contaminated 3kHz+ range. Safe approach: bandpass-isolate 400-2500 Hz,
-    # apply tanh saturation (drive 0.12), blend at 15% parallel. This adds 2nd/3rd
-    # harmonics of vocal formants (landing in 800-5kHz range = presence/warmth)
-    # without touching the bleed-contaminated high end.
-    # Applied in Mid channel only (M/S) — Side channel has more artifacts.
-    try:
-        nyq = SR / 2.0
-        sos_lo = butter(4, 400.0 / nyq, btype="high", output="sos")
-        sos_hi = butter(4, 2500.0 / nyq, btype="low",  output="sos")
-        mid_ex = vox_ch.mean(axis=0)   # Mid = mono average
-        side_ex = vox_ch[0] - vox_ch[1]  # Side (preserved unprocessed)
-        band = sosfilt(sos_lo, sosfilt(sos_hi, mid_ex))  # 400-2500 Hz isolation
-        saturated = np.tanh(band * (1.0 + 0.12))  # tanh drive 0.12
-        harmonics = (saturated - band).astype(np.float32)  # only NEW content
-        mid_out = (mid_ex + harmonics * 0.15).astype(np.float32)  # 15% parallel blend
-        # Rebuild stereo: L = (Mid + Side)/2, R = (Mid - Side)/2
-        vox_ch = np.stack([
-            ((mid_out + side_ex) / 2.0).astype(np.float32),
-            ((mid_out - side_ex) / 2.0).astype(np.float32),
-        ], axis=0)
-    except Exception:
-        pass  # fall through if anything goes wrong
-
-    # Step 10: vocal waveshaper REMOVED — full-band saturation on Demucs stems
-    # amplifies music bleed into static. Replaced by Step 9c (mid-band only).
-
-    # Step 11: early reflections + pre-delay reverb with HPF'd return
-    #
-    # Early reflections (7ms, 14ms, 21ms at -3/-6/-9 dB) arrive BEFORE the
-    # diffuse reverb tail and "glue" the vocal to the acoustic space.
-    # Research: ER are the perceptually dominant quality factor in reverb.
-    #
-    # BPM-synced pre-delay: one 16th note at the track's tempo, capped at 40ms.
-    # At 120 BPM: 31ms; at 140 BPM: 27ms; at 160 BPM: 23ms.
-    # Rhythmically-locked pre-delay is a standard professional technique —
-    # the reverb tail "breathes" with the track's pulse.
-    predelay_ms = min(60000.0 / max(bpm, 60.0) / 16.0, 40.0)
-    pre_delay = int(SR * predelay_ms / 1000.0)
-    er_levels = [(-3.0, 0.007), (-6.0, 0.014), (-9.0, 0.021)]  # (dB, sec)
-
-    er_mix = np.zeros_like(vox_ch)
-    for er_db, er_t in er_levels:
-        er_samp  = int(SR * er_t)
-        er_level = 10 ** (er_db / 20.0)
-        er_pad   = np.concatenate([
-            np.zeros((vox_ch.shape[0], er_samp), dtype=np.float32),
-            vox_ch,
-        ], axis=1)[:, :vox_ch.shape[1]]
-        er_mix += er_pad * er_level
-
-    # Reverb tail only (wet_level=1, dry_level=0)
+    # Stage 7: short dry reverb (5-8% wet, HPF'd return to avoid mud)
     reverb_board = Pedalboard([
         Reverb(room_size=style["reverb_room"], damping=style["reverb_damp"],
-               wet_level=1.0, dry_level=0.0, width=0.9),
+               wet_level=1.0, dry_level=0.0, width=0.7),
     ])
     reverb_wet = reverb_board(vox_ch, SR).astype(np.float32)
-
-    # Abbey Road trick: HPF the reverb RETURN at 500 Hz — prevents muddy reverb tail
     reverb_wet = _hpf_signal(reverb_wet, cutoff_hz=500.0, order=4)
-
-    # Pre-delay the diffuse tail (separate from early reflections)
-    reverb_shifted = np.concatenate([
-        np.zeros((reverb_wet.shape[0], pre_delay), dtype=np.float32),
-        reverb_wet,
-    ], axis=1)[:, :vox_ch.shape[1]]
-
-    # Mix: dry + early reflections + pre-delayed HPF'd diffuse tail
-    er_wet = style["reverb_wet"] * 0.4    # ER slightly quieter than tail
-    tail_wet = style["reverb_wet"]
-    vox_ch = (vox_ch + er_mix * er_wet + reverb_shifted * tail_wet).astype(np.float32)
-
-    # Step 11b: Slap-back echo — presence echo 70-110ms, 0 feedback, HPF+shelf shaped.
-    # Research: 70-120ms single echo at 15-20% wet adds presence and "fatness".
-    # BPM-synced: keep slap delay near an 8th-note (ensures rhythmic coherence).
-    # Tone-shaping on the echo RETURN (not the dry): HPF 150Hz + high-shelf -3dB @8kHz.
-    # This prevents the echo from muddying the low-mids or clashing with the dry vocal.
-    eighth_note_ms = 60000.0 / max(bpm, 60.0) / 2.0
-    slap_ms = float(np.clip(eighth_note_ms, 70.0, 110.0))
-    slap_samp = int(SR * slap_ms / 1000.0)
-    slap_level = float(np.interp(rap, [0, 1], [0.08, 0.11]))  # reduced: was stacking too much with reverb tail
-    slap_echo = np.concatenate([
-        np.zeros((vox_ch.shape[0], slap_samp), dtype=np.float32),
-        vox_ch,
-    ], axis=1)[:, :vox_ch.shape[1]]
-    # Tone-shape the echo return: roll off lows (150Hz HPF) and air (8kHz shelf -3dB)
-    slap_eq = Pedalboard([
-        HighpassFilter(cutoff_frequency_hz=150.0),
-        HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=-3.0),
-    ])
-    slap_echo_shaped = slap_eq(slap_echo.astype(np.float32), SR).astype(np.float32)
-    vox_ch = (vox_ch + slap_echo_shaped * slap_level).astype(np.float32)
-
-    # Step 12: Stereo ADT — Automatic Double Tracking (radio-ready width + thickness)
-    # Two copies: pitch-up (+6 cents) panned left, pitch-down (-6 cents) panned right.
-    # LFO on delay time (±2 ms @ 0.3 Hz) prevents static comb-filter notch.
-    # Research: 4-8 cents + 13-25ms delay is the "invisible" sweet spot.
-    rap = style.get("_rap_score", 0.5)
-    adt_cents = float(np.interp(rap, [0, 1], [5.0, 4.0]))  # 4-6 cents: natural doubling, not chorus
-    adt_delay_ms = 22.0
-    adt_level = 0.14  # -17 dB — subtle stereo width without chorus-effect thickening
-
-    n_samp = vox_ch.shape[1]
-    # LFO for delay modulation — prevents static comb-filter notch
-    t = np.arange(n_samp, dtype=np.float32) / SR
-    lfo = (np.sin(2 * np.pi * 0.30 * t) * 0.002 * SR).astype(np.float32)  # ±2ms in samples
-
-    def _adt_copy(ch_audio, cents_shift, delay_base_ms, lfo_mod):
-        """Create one ADT copy: pitch shift + LFO-modulated delay."""
-        delay_base = int(delay_base_ms * SR / 1000)
-        n_semi_adt = cents_shift / 100.0
-        if HAS_PYRUBBERBAND:
-            shifted = rb.pitch_shift(ch_audio, SR, n_semi_adt,
-                                     rbargs={'-3': ''}).astype(np.float32)
-        else:
-            # Pedalboard fallback: pitch shift only (no time stretch)
-            shifted = pb_time_stretch(
-                ch_audio[np.newaxis, :].astype(np.float32), SR,
-                stretch_factor=1.0,
-                pitch_shift_in_semitones=float(n_semi_adt),
-                high_quality=True,
-            )[0].astype(np.float32)
-            # Trim/pad to original length
-            if len(shifted) > len(ch_audio):
-                shifted = shifted[:len(ch_audio)]
-            elif len(shifted) < len(ch_audio):
-                shifted = np.pad(shifted, (0, len(ch_audio) - len(shifted)))
-
-        # Vectorized LFO-modulated delay (replaces sample-by-sample loop)
-        lfo_int = lfo_mod[:len(shifted)].astype(np.int32)
-        indices  = np.arange(len(shifted), dtype=np.int64)
-        src_idx  = np.clip(indices - delay_base - lfo_int, 0, len(shifted) - 1)
-        delayed  = shifted[src_idx].astype(np.float32)
-        delayed[:delay_base] = 0.0  # enforce pre-delay silence
-        return delayed
-
-    # Mono signal for ADT input (preserves phase; stereo from L/R pan)
-    vox_mid_adt = ((vox_ch[0] + vox_ch[1]) * 0.5).astype(np.float32)
-
-    adt_L = _adt_copy(vox_mid_adt, +adt_cents, adt_delay_ms, lfo)
-    adt_R = _adt_copy(vox_mid_adt, -adt_cents, adt_delay_ms + 5.0, -lfo)
-
-    # Pan: add ADT L copy to L channel, R copy to R channel
-    vox_ch[0] = (vox_ch[0] + adt_L * adt_level).astype(np.float32)
-    vox_ch[1] = (vox_ch[1] + adt_R * adt_level).astype(np.float32)
+    wet = float(np.clip(style["reverb_wet"], 0.04, 0.09))
+    vox_ch = (vox_ch + reverb_wet * wet).astype(np.float32)
 
     return vox_ch.T  # (samples, 2)
 
@@ -2697,13 +2488,8 @@ def fuse(song_a: str, song_b: str, out_path: str,
     L = min(len(inst), len(vox))
     inst, vox = inst[:L], vox[:L]
 
-    # Groove quantization: nudge vocal syllables toward 8th-note grid (35% strength)
-    # Tightens timing without removing natural feel — most impactful for hip-hop/rap
-    rap_score = vox_char.get("rap_score", 0.5)
-    quant_strength = float(np.interp(rap_score, [0, 1], [0.20, 0.45]))
-    vox = _groove_quantize(vox, _to_mono(inst), bpm_a, strength=quant_strength)
-    print(f"      Groove quantize: strength={quant_strength:.2f} "
-          f"(rap={rap_score:.2f})", flush=True)
+    # Groove quantization disabled — causes clicks and can drift timing
+    # vox = _groove_quantize(vox, _to_mono(inst), bpm_a, strength=quant_strength)
 
     # Save pre-mix stems so the auto-correction loop can re-mix without re-separating.
     # Stem separation is the slow step (2-5 min). Mix+master is ~20 seconds.
