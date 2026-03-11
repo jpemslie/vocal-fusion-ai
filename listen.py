@@ -18,6 +18,12 @@ New metrics vs v1:
   - section_consistency — LUFS variance across 15-second windows
   - spectral_slope      — per-octave energy dropoff vs professional reference
 
+New perceptual quality metrics:
+  - beat_sync_score     — cross-correlation of L/R onset envelopes (beat vs vocal sync)
+  - vocal_clarity_index — speech intelligibility zone energy minus bass masking
+  - tempo_stability     — IBI coefficient of variation (rubberband drift detection)
+  - click_artifact_score— % samples with |diff| > 10x diff RMS (click/pop detector)
+
 Usage:
   python listen.py output.wav                  # score
   python listen.py output.wav reference.mp3    # compare vs reference
@@ -84,6 +90,22 @@ REF = {
     # Pink noise = -3 dB/oct. Professional mixes: -3 to -8 dB/oct.
     # Flat slope (< -2) = harsh/bright. Steep slope (< -12) = muffled.
     "spectral_slope_db_oct": (-12.0, -2.0),
+
+    # Perceptual quality metrics
+    # beat_sync_score: max normalized xcorr of L/R onset envelopes in ±50ms window.
+    # Low = beat and vocal are out of time (no groove). Target: > 0.35.
+    "beat_sync_score":      (0.35, 1.0),
+
+    # vocal_clarity_index: mid_db (1-4kHz) minus bass masking pressure (20-300Hz).
+    # Below -5 = bass is masking vocal intelligibility zone.
+    "vocal_clarity_index":  (-5.0, 20.0),
+
+    # tempo_stability: 1 - CV of inter-beat intervals. Low = rubberband drift.
+    "tempo_stability":      (0.6, 1.0),
+
+    # click_artifact_score: % samples where |diff| > 10x diff RMS.
+    # Above 0.005 = audible clicks/pops.
+    "click_artifact_score": (0.0, 0.005),
 }
 
 REF_STRICT = {**REF,
@@ -116,6 +138,10 @@ PENALTIES = {
     "mud_index":               8,
     "section_consistency_lu":  6,
     "spectral_slope_db_oct":   6,
+    "beat_sync_score":        15,
+    "vocal_clarity_index":    12,
+    "tempo_stability":        10,
+    "click_artifact_score":   15,
 }
 
 PROBLEM_NAMES = {
@@ -152,6 +178,14 @@ PROBLEM_NAMES = {
                                "INCONSISTENT LEVELS — mix gets louder/quieter across sections"),
     "spectral_slope_db_oct": ("MUFFLED — spectrum too steep, highs dead",
                                "HARSH / BRIGHT — spectrum too flat, no natural rolloff"),
+    "beat_sync_score":      ("NO BEAT SYNC — beat and vocal are out of time, no groove",
+                             "perfect sync (N/A)"),
+    "vocal_clarity_index":  ("VOCALS BURIED — bass masking the vocal intelligibility zone",
+                             "vocals too thin — not enough low-mid warmth"),
+    "tempo_stability":      ("TEMPO DRIFT — rubberband artifacts, mix sounds unstable",
+                             "too rigid (N/A)"),
+    "click_artifact_score": ("(clean)",
+                             "CLICKS / ARTIFACTS — discontinuities audible as pops"),
 }
 
 # ── Correction map: issue key → which DSP parameter to adjust and by how much ─
@@ -169,6 +203,7 @@ CORRECTIONS = {
     "crest_factor_db":      ("lufs_delta",     0.0, -1.0),   # smashed → reduce LUFS target
     "kick_headroom_db":     ("parallel_wet",   0.0, -0.03),  # kick buried → less parallel comp
     "section_consistency_lu":("vocal_level",  -0.05, +0.05), # inconsistent → adjust vocal level
+    "beat_sync_score":      ("vocal_level",   +0.05,  0.0),  # low sync → slightly boost vocal
 }
 
 
@@ -299,6 +334,72 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         spectral_slope_db_oct = -5.0
 
+    # ── Beat sync score: cross-correlation of L/R onset envelopes ───────────
+    # In M/S mixed content, L is beat-heavy and R is vocal-heavy.
+    # High xcorr in a ±50ms window = beat and vocal are locked in groove.
+    # Low xcorr = they're drifting / out of time.
+    try:
+        onset_L = librosa.onset.onset_strength(y=L, sr=SR, hop_length=512)
+        onset_R = librosa.onset.onset_strength(y=R, sr=SR, hop_length=512)
+        # Normalize each envelope to zero mean, unit variance
+        onset_L = (onset_L - onset_L.mean()) / (onset_L.std() + 1e-9)
+        onset_R = (onset_R - onset_R.mean()) / (onset_R.std() + 1e-9)
+        # Full cross-correlation
+        xcorr = np.correlate(onset_L, onset_R, mode="full")
+        # Normalize by the max possible value (N * 1 * 1)
+        xcorr_norm = xcorr / (len(onset_L) + 1e-9)
+        # ±50ms window in frames: hop_length=512 → frame_rate = SR/512
+        frame_rate = SR / 512
+        max_lag_frames = int(round(0.050 * frame_rate))  # 50ms
+        center = len(xcorr_norm) // 2
+        lo_idx = max(0, center - max_lag_frames)
+        hi_idx = min(len(xcorr_norm), center + max_lag_frames + 1)
+        beat_sync_score = float(np.max(xcorr_norm[lo_idx:hi_idx]))
+        beat_sync_score = float(np.clip(beat_sync_score, 0.0, 1.0))
+    except Exception:
+        beat_sync_score = 0.5
+
+    # ── Vocal clarity index: speech zone energy minus bass masking ───────────
+    # vocal_clarity = mid_db (1-4kHz) - max(0, (bass_db (20-300Hz) - mid_db - 10))
+    # Below -5 = bass is swamping the intelligibility zone.
+    try:
+        S_full = np.abs(librosa.stft(mono, n_fft=2048))
+        freqs_full = librosa.fft_frequencies(sr=SR, n_fft=2048)
+        bass_db_vc  = _band_db(S_full, freqs_full,   20,  300)
+        mid_db_vc   = _band_db(S_full, freqs_full, 1000, 4000)
+        masking_pressure = max(0.0, bass_db_vc - mid_db_vc - 10.0)
+        vocal_clarity_index = float(mid_db_vc - masking_pressure)
+    except Exception:
+        vocal_clarity_index = 5.0
+
+    # ── Tempo stability: IBI coefficient of variation ────────────────────────
+    # Detect beats with librosa, measure CV of inter-beat intervals (IBIs).
+    # High CV = tempo drift, often from rubberband time-stretch artifacts.
+    # tempo_stability = 1.0 - min(CV, 1.0). Target: > 0.6.
+    try:
+        _, beat_frames = librosa.beat.beat_track(y=mono, sr=SR, hop_length=512)
+        if len(beat_frames) >= 3:
+            beat_times = librosa.frames_to_time(beat_frames, sr=SR, hop_length=512)
+            ibis = np.diff(beat_times)
+            cv = float(ibis.std() / (ibis.mean() + 1e-9))
+            tempo_stability = float(1.0 - min(cv, 1.0))
+        else:
+            tempo_stability = 1.0  # too short to measure, assume stable
+    except Exception:
+        tempo_stability = 0.8
+
+    # ── Click artifact score: percentage of samples with large discontinuities ─
+    # Compute 1st derivative of signal. Score = % samples where |diff| > 10x
+    # the RMS of the diff signal. Above 0.005 = audible clicks/pops.
+    try:
+        diff_signal = np.diff(mono)
+        diff_rms = float(np.sqrt(np.mean(diff_signal ** 2) + 1e-12))
+        threshold = 10.0 * diff_rms
+        n_clicks = int(np.sum(np.abs(diff_signal) > threshold))
+        click_artifact_score = float(n_clicks / (len(diff_signal) + 1e-9))
+    except Exception:
+        click_artifact_score = 0.0
+
     return {
         # Global
         "lufs_integrated":       lufs,
@@ -321,12 +422,17 @@ def _measure(audio_path: str) -> dict:
         "ratio_high_to_mid":     high_db   - mid_db,
         "lowmid_over_himid":     lowmid_db - himid_db,
         "high_over_himid":       high_db   - himid_db,
-        # New
+        # Dynamics
         "transient_clarity":     transient_clarity,
         "kick_headroom_db":      kick_headroom_db,
         "mud_index":             mud_index,
         "section_consistency_lu":section_consistency_lu,
         "spectral_slope_db_oct": spectral_slope_db_oct,
+        # Perceptual quality
+        "beat_sync_score":       beat_sync_score,
+        "vocal_clarity_index":   vocal_clarity_index,
+        "tempo_stability":       tempo_stability,
+        "click_artifact_score":  click_artifact_score,
     }
 
 
@@ -368,7 +474,7 @@ def corrections(issues: list) -> dict:
     """
     Map detected issues to concrete DSP parameter adjustments for auto-correction.
     Returns a dict of {param_name: delta} to apply before re-mixing.
-    Called by fuse() after each score — if score < 80, apply deltas and re-run mix.
+    Called by fuse() after each score — if score < 82, apply deltas and re-run mix.
     """
     adj = {}
     for sev, key, val, lo, hi, desc in issues:
@@ -433,6 +539,11 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
     print(f"  {'Kick headroom':<28} {m['kick_headroom_db']:>+7.1f} dB    (target >3 dB)")
     print(f"  {'Section consistency':<28} {m['section_consistency_lu']:>+7.1f} LU    (target <5 LU)")
     print(f"  {'Spectral slope':<28} {m['spectral_slope_db_oct']:>+7.1f} dB/oct (target -12 to -2)")
+    print(f"\n  PERCEPTUAL QUALITY:")
+    print(f"  {'Beat sync score':<28} {m['beat_sync_score']:>+7.3f}      (target 0.35-1.0)")
+    print(f"  {'Vocal clarity index':<28} {m['vocal_clarity_index']:>+7.1f} dB    (target -5 to +20)")
+    print(f"  {'Tempo stability':<28} {m['tempo_stability']:>+7.3f}      (target 0.6-1.0)")
+    print(f"  {'Click artifact score':<28} {m['click_artifact_score']:>+7.5f}     (target <0.005)")
 
     print(f"\n  FREQUENCY (absolute):")
     for label, key in [("Sub 20-80",  "_sub_db"), ("Bass 80-250", "_bass_db"),
@@ -481,7 +592,12 @@ def auto_score(audio_path: str, strict: bool = False) -> tuple:
     """
     score, issues, metrics = score_file(audio_path, strict=strict, print_report=True)
     critical = [i for i in issues if i[0] == "CRITICAL"]
-    passed = score >= 75 and not critical   # raise bar to B grade
+    passed = score >= 82 and not critical   # B+ grade threshold
+
+    # Additional check: if beat_sync_score is too low, force a correction pass
+    beat_sync = metrics.get("beat_sync_score", 1.0)
+    if passed and beat_sync < 0.35:
+        passed = False
 
     if passed:
         summary = f"PASS ({score}/100) — {_grade(score)}"
@@ -501,4 +617,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     score, issues, metrics = score_file(args.audio, strict=args.strict,
                                         reference_path=args.reference)
-    sys.exit(0 if score >= 75 and not any(i[0] == "CRITICAL" for i in issues) else 1)
+    sys.exit(0 if score >= 82 and not any(i[0] == "CRITICAL" for i in issues) else 1)

@@ -193,7 +193,9 @@ def _analyze_vocal_character(vox_mono: np.ndarray) -> dict:
         "onset_rate":   round(onset_rate, 2),
         "flatness":     round(float(flatness), 4),
         "pitch_range":  round(pitch_range_semitones, 1),
-        "gender":       "female" if median_f0 >= 165.0 else "male",
+        # 200 Hz threshold: AutoTune'd male vocals (Future, Travis Scott, etc.) often
+    # sit at 160-200 Hz after pitch correction — use 200 Hz to avoid mis-gendering.
+    "gender":       "female" if median_f0 >= 200.0 else "male",
         "median_f0":    round(median_f0, 1),
     }
 
@@ -221,14 +223,13 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         "opto_attack":  float(np.interp(agg, [0, 1], [30.0, 15.0])),
         "opto_release": float(np.interp(agg, [0, 1], [300.0, 150.0])),
 
-        # Presence boost: spectral analysis shows Hi-Mid already +2.3 dB above
-        # inputs, so reduce boost. Presence at 3-4 kHz only needs +1-2 dB.
-        "presence_db":  float(np.interp(rap, [0, 1], [1.0, 2.0])),
-        "presence_hz":  float(np.interp(rap, [0, 1], [4000.0, 3000.0])),
+        # Presence boost: 3 kHz is the key vocal intelligibility / "cut-through"
+        # frequency. Needs +3-4 dB to push past a bass-heavy beat mix.
+        "presence_db":  float(np.interp(rap, [0, 1], [3.0, 4.0])),
+        "presence_hz":  3000.0,  # fixed: 3 kHz is the universal cut-through freq
 
-        # Air shelf: mix is -4.8 dB darker than inputs in 6-20kHz band.
-        # Boost air to compensate for HF stripped by Demucs mask + de-esser.
-        "air_db":       float(np.interp(rap, [0, 1], [3.0, 2.0])),
+        # Air shelf: compensate for HF stripped by Demucs mask + de-esser.
+        "air_db":       float(np.interp(rap, [0, 1], [2.5, 2.0])),
 
         # Reverb: rap/trap → tighter room; singing/pop → lusher plate
         # Research: trap/drill = 3-5% wet; R&B/singing = 15-22% wet
@@ -236,8 +237,8 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         "reverb_damp":  float(np.interp(rap, [0, 1], [0.65, 0.88])),
         "reverb_wet":   float(np.interp(rap, [0, 1], [0.10, 0.03])),  # reduced: slap echo covers presence, tail just for space
 
-        # Spectral carve: more bass-heavy → carve deeper in bass range
-        "carve_db":     float(np.interp(bass, [0, 1], [4.0, 6.0])),
+        # Spectral carve: more bass-heavy → carve deeper. 8-10 dB for house/EDM.
+        "carve_db":     float(np.interp(bass, [0, 1], [6.0, 10.0])),
 
         # Sidechain: aggressive beat → more sidechain duck
         "sidechain_mult": float(np.interp(agg, [0, 1], [0.9, 1.2])),
@@ -1622,9 +1623,12 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     vox_ch = vox.T.astype(np.float32)
 
     # Stage 1: HPF 80 Hz + subtractive EQ
+    # Cuts are aggressive because the instrumental beat adds heavy low-mid energy
+    # that will mask the vocal after mixing — must pre-clean the vocal stem.
     pre_eq = Pedalboard([
         HighpassFilter(cutoff_frequency_hz=80.0),
-        PeakFilter(cutoff_frequency_hz=300.0, gain_db=-3.0, q=1.2),  # mud
+        PeakFilter(cutoff_frequency_hz=300.0, gain_db=-5.0, q=1.2),  # mud (Demucs residue)
+        PeakFilter(cutoff_frequency_hz=450.0, gain_db=-3.0, q=1.4),  # cardboard box
         PeakFilter(cutoff_frequency_hz=500.0, gain_db=-2.0, q=1.5),  # boxy
     ])
     vox_ch = pre_eq(vox_ch, SR).astype(np.float32)
@@ -1803,16 +1807,17 @@ def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
     freqs = librosa.fft_frequencies(sr=SR, n_fft=n_fft)
     freq_w = np.zeros(len(freqs), dtype=np.float32)
     for i, f in enumerate(freqs):
-        if f < 300 or f > 5000:
-            freq_w[i] = 0.0                             # no carve outside 300-5kHz
+        if f < 200 or f > 5000:
+            freq_w[i] = 0.0                             # no carve outside 200-5kHz
+        elif f < 300:
+            freq_w[i] = (f - 200) / 100 * 0.4         # gentle ramp 200-300 Hz (mud zone)
         elif f < 600:
-            freq_w[i] = (f - 300) / 300 * 0.7         # ramp up (70% max below 600)
+            freq_w[i] = 0.4 + (f - 300) / 300 * 0.4   # ramp to 0.8 at 600 Hz
         elif f < 1000:
-            freq_w[i] = 0.7 + (f - 600) / 400 * 0.3   # ramp to 1.0 at 1kHz
+            freq_w[i] = 0.8 + (f - 600) / 400 * 0.2   # ramp to 1.0 at 1kHz
         else:
-            # 2-4kHz: peak weight raised 1.5 → 2.0 (vocal presence zone)
-            # At high volume, Fletcher-Munson makes bass dominate and mask this zone.
-            # Deeper carve here creates a clear vocal pocket that holds up loud.
+            # 2-4kHz: peak weight 2.0× at 3kHz — vocal presence / cut-through zone.
+            # Fletcher-Munson: at high volume bass masks this zone → carve deeper.
             freq_w[i] = 1.0 + 1.0 * float(np.clip(
                 1.0 - abs(np.log2(f / 3000)) * 1.5, 0, 1))  # peak 2.0× at 3kHz
 
