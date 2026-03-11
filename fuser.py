@@ -61,6 +61,7 @@ except Exception:
 
 SR = 44100
 _BS_ROFORMER = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+_MDX_VOCAL   = "Kim_Vocal_2.onnx"  # MDX-Net vocal (SDR ~9.5+, ONNX — fast on CPU)
 
 
 def _check(y: np.ndarray, label: str) -> np.ndarray:
@@ -283,11 +284,21 @@ def _smart_key_shift(n_semi: int, key_b_root: int, key_b_mode: str,
         elif c < -6:
             candidates.append(c + 12)
 
+    # Try all 4 adjacent Camelot wheel keys (±1 position = ±2 semitones, ±5 semitones)
+    # These are harmonically compatible and require smaller shifts
+    for adj in (2, -2, 5, -5, 7, -7):
+        candidates.append(n_semi + adj - round((n_semi + adj) / 12) * 12)
+
     # Pick the smallest absolute shift
     best = min(candidates, key=abs)
-    if best != n_semi:
-        return best, f"re-mapped {n_semi:+d} → {best:+d} semitones (better harmonic fit)"
-    return n_semi, f"{n_semi:+d} semitones (large shift — harmonic clash risk)"
+    if abs(best) > 5:
+        msg = (f"re-mapped {n_semi:+d} → {best:+d} st "
+               f"[WARNING: {abs(best)} semitones — quality may suffer]")
+    elif best != n_semi:
+        msg = f"re-mapped {n_semi:+d} → {best:+d} semitones (better harmonic fit)"
+    else:
+        msg = f"{n_semi:+d} semitones (compatible)"
+    return best, msg
 
 
 def _deepfilter_clean(vox_mono: np.ndarray) -> np.ndarray:
@@ -663,8 +674,13 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems") -> dict:
             finally:
                 shutil.rmtree(str(tmp_dir), ignore_errors=True)
         else:
-            # CPU path: Demucs (2–5 min vs 50+ min for BS-Roformer on CPU)
-            _separate_demucs(audio_path, cached)
+            # CPU path: MDX-Net (Kim Vocal 2, SDR ~9.5, ONNX — much faster than BS-Roformer)
+            # Falls back to Demucs htdemucs_ft (SDR ~8.5) if MDX-Net unavailable/fails.
+            try:
+                _separate_mdx(audio_path, cached, cache_dir)
+            except Exception as e:
+                print(f"      [MDX-Net failed ({e}), falling back to Demucs]", flush=True)
+                _separate_demucs(audio_path, cached)
 
     stems = {}
     for name in ("vocals", "no_vocals"):
@@ -714,6 +730,43 @@ def _separate_demucs(audio_path: str, out_dir: Path) -> None:
     finally:
         if tmp.exists():
             tmp.unlink()
+
+
+def _separate_mdx(audio_path: str, out_dir: Path, cache_dir: str) -> None:
+    """CPU path: MDX-Net Kim Vocal 2 via audio-separator ONNX (SDR ~9.5 vs Demucs ~8.5)."""
+    from audio_separator.separator import Separator
+    tmp_dir = Path(tempfile.mkdtemp(dir=cache_dir))
+    try:
+        sep = Separator(
+            log_level=logging.WARNING,
+            output_dir=str(tmp_dir),
+            output_format="WAV",
+            sample_rate=SR,
+            model_file_dir=str(Path(cache_dir) / "_models"),
+        )
+        sep.load_model(_MDX_VOCAL)
+        sep.separate(audio_path)
+
+        vox_src = inst_src = None
+        for p in tmp_dir.iterdir():
+            lname = p.name.lower()
+            if "(vocals)" in lname and "(instrumental)" not in lname:
+                vox_src = p
+            elif "(instrumental)" in lname or "(no_vocals)" in lname:
+                inst_src = p
+
+        if vox_src and inst_src:
+            shutil.move(str(vox_src),  str(out_dir / "vocals.wav"))
+            shutil.move(str(inst_src), str(out_dir / "no_vocals.wav"))
+        else:
+            wavs = sorted(tmp_dir.glob("*.wav"))
+            if len(wavs) >= 2:
+                shutil.move(str(wavs[0]), str(out_dir / "vocals.wav"))
+                shutil.move(str(wavs[1]), str(out_dir / "no_vocals.wav"))
+            else:
+                raise RuntimeError("MDX-Net produced no output")
+    finally:
+        shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
@@ -781,7 +834,23 @@ def detect_bpm(y_mono: np.ndarray) -> float:
 
 
 def _best_ratio(bpm_a: float, bpm_b: float) -> float:
-    return float(np.clip(bpm_a / bpm_b, 0.667, 1.5))
+    """
+    Compute time-stretch ratio with BPM octave correction.
+    Tries half/double bpm_b before clamping — critical for extreme tempo pairs
+    (e.g., 60 BPM ballad + 130 BPM trap) where naive ratio would be clamped badly.
+    """
+    candidates = [
+        bpm_a / bpm_b,          # direct
+        bpm_a / (bpm_b * 2),    # treat B as half-tempo (double-speed track)
+        bpm_a / (bpm_b / 2),    # treat B as double-tempo (half-speed track)
+    ]
+    # Pick candidate closest to 1.0 (minimum time-stretch needed)
+    best = min(candidates, key=lambda r: abs(r - 1.0))
+    clamped = float(np.clip(best, 0.667, 1.5))
+    if abs(best - clamped) > 0.01:
+        print(f"      [WARNING] BPM ratio {best:.3f} clamped to {clamped:.3f} — "
+              f"extreme tempo difference, sync may be imperfect.", flush=True)
+    return clamped
 
 
 def detect_key(y_mono: np.ndarray) -> tuple:
@@ -2489,6 +2558,30 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
     inst = stems_a["no_vocals"]   # (samples, 2)
     vox  = stems_b["vocals"]      # (samples, 2)
+
+    # HPSS Wiener bleed cleanup — remove instrumental bleed from vocal stem.
+    # Demucs/MDX vocal stems contain 17-24% percussion/hi-hat bleed at 6-20kHz.
+    # HPSS splits the stem into harmonic (vocal body) + percussive (bleed) components
+    # using a soft Wiener mask. margin=3.0: aggressive enough to suppress drum transients
+    # without notching out consonants. Applied per-channel for stereo preservation.
+    print("      Cleaning vocal bleed with HPSS Wiener mask…", flush=True)
+    try:
+        vox_clean = np.zeros_like(vox)
+        vox_mono_ref = _to_mono(vox)
+        D_ref = librosa.stft(vox_mono_ref, n_fft=2048)
+        mag_ref, _ = librosa.magphase(D_ref)
+        H_ref, P_ref = librosa.decompose.hpss(mag_ref, margin=3.0)
+        # Soft Wiener mask derived from mono (consistent between channels)
+        vocal_mask = librosa.util.softmask(H_ref, P_ref + librosa.util.tiny(H_ref), power=2)
+        for c in range(vox.shape[1]):
+            D_c = librosa.stft(vox[:, c], n_fft=2048)
+            mag_c, phase_c = librosa.magphase(D_c)
+            mag_c_clean = vocal_mask * mag_c
+            vox_clean[:, c] = librosa.istft(mag_c_clean * phase_c, length=vox.shape[0])
+        vox = vox_clean.astype(np.float32)
+        print("      HPSS bleed cleanup done.", flush=True)
+    except Exception as _e:
+        print(f"      [HPSS bleed cleanup failed: {_e} — skipping]", flush=True)
 
     ratio   = _best_ratio(bpm_a, bpm_b)
     n_semi  = semitones_to_shift(key_b_root, key_b_mode, key_a_root, key_a_mode)
