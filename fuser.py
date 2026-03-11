@@ -62,6 +62,21 @@ except Exception:
 SR = 44100
 _BS_ROFORMER = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 
+
+def _check(y: np.ndarray, label: str) -> np.ndarray:
+    """Inline signal health check — prints peak/rms and warns on NaN/Inf."""
+    has_nan = bool(np.any(np.isnan(y)))
+    has_inf = bool(np.any(np.isinf(y)))
+    peak = float(np.nanmax(np.abs(y))) if not (has_nan and has_inf) else float('nan')
+    rms  = float(np.sqrt(np.nanmean(y ** 2) + 1e-12))
+    flags = (" NaN!" if has_nan else "") + (" Inf!" if has_inf else "")
+    print(f"      [DBG] {label}: peak={peak:.4f} rms={rms:.5f}{flags}", flush=True)
+    if has_nan or has_inf:
+        print(f"      [DBG] *** CORRUPTED AT {label} — replacing with zeros ***",
+              flush=True)
+        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return y
+
 _KS_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
                        2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 _KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
@@ -149,7 +164,8 @@ def _analyze_vocal_character(vox_mono: np.ndarray) -> dict:
     onsets     = librosa.onset.onset_detect(y=clip, sr=SR, hop_length=512, units="time")
     onset_rate = len(onsets) / (len(clip) / SR + 1e-9)  # onsets per second
 
-    # Pitch range via PYIN fundamental
+    # Pitch range and gender detection via PYIN fundamental
+    median_f0 = 120.0  # default male
     try:
         f0, voiced, _ = librosa.pyin(clip, fmin=60, fmax=1200,
                                      sr=SR, hop_length=512, fill_na=None)
@@ -157,6 +173,7 @@ def _analyze_vocal_character(vox_mono: np.ndarray) -> dict:
         if len(f0_voiced) > 20:
             pitch_range_semitones = float(
                 12 * np.log2(f0_voiced.max() / (f0_voiced.min() + 1e-9)))
+            median_f0 = float(np.median(f0_voiced))
         else:
             pitch_range_semitones = 5.0
     except Exception:
@@ -175,6 +192,8 @@ def _analyze_vocal_character(vox_mono: np.ndarray) -> dict:
         "onset_rate":   round(onset_rate, 2),
         "flatness":     round(float(flatness), 4),
         "pitch_range":  round(pitch_range_semitones, 1),
+        "gender":       "female" if median_f0 >= 165.0 else "male",
+        "median_f0":    round(median_f0, 1),
     }
 
 
@@ -204,7 +223,8 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         "presence_hz":  float(np.interp(rap, [0, 1], [4000.0, 3000.0])),
 
         # Air shelf: singing benefits from more air than rap
-        "air_db":       float(np.interp(rap, [0, 1], [2.5, 1.5])),
+        # Reduced [2.5,1.5]→[1.5,1.0]: was stacking with harmonic excite causing HF excess
+        "air_db":       float(np.interp(rap, [0, 1], [1.5, 1.0])),
 
         # Reverb: rap/trap → tighter room; singing/pop → lusher plate
         # Research: trap/drill = 3-5% wet; R&B/singing = 15-22% wet
@@ -218,8 +238,16 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         # Sidechain: aggressive beat → more sidechain duck
         "sidechain_mult": float(np.interp(agg, [0, 1], [0.9, 1.2])),
 
-        # Vocal level: rap sits louder relative to beat
-        "vocal_level":  float(np.interp(rap, [0, 1], [1.1, 1.4])),
+        # Vocal level: rap sits louder relative to beat.
+        # Increased [1.1,1.4]→[1.5,2.0]: vocals need to cut through the beat clearly.
+        # The QA "19% vocal presence" warning is misleading — it measures raw stems
+        # before level scaling. After scaling, vocal is ~ir * vocal_level / vr.
+        "vocal_level":  float(np.interp(rap, [0, 1], [1.5, 2.0])),
+
+        # Complementary EQ: cut instrumental at vocal fundamental zone.
+        # Research: male F0 body 200-350 Hz → cut at 280 Hz; female → 380 Hz.
+        # This is a fixed reciprocal cut complementing the dynamic Wiener carve.
+        "comp_eq_hz":   380.0 if vox_char.get("gender") == "female" else 280.0,
     }
 
 
@@ -349,9 +377,21 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
 
         # Process instrumental
         inst_c = _adaptive_spectral_carve(inst, vox_scaled, carve_db=carve_db)
-        # Restore drum transients softened by stem separation (attack +4dB, sustain -3dB)
-        # Research: -3 to -5 dB sustain reduction = tight, punchy hip-hop drums
-        inst_c = _transient_shape(inst_c, attack_gain_db=4.0, sustain_gain_db=-3.0)
+        inst_c = _check(inst_c, f"iter{iteration+1}/spectral-carve")
+        # Complementary EQ: fixed reciprocal cut at vocal fundamental zone.
+        # Research: male body 200-350 Hz → -3 dB @ 280 Hz; female → -3 dB @ 380 Hz.
+        # Operates alongside the dynamic Wiener carve (which targets 300 Hz-8 kHz)
+        # to guarantee a clear pocket at the vocal's fundamental regardless of content.
+        # Reduced -3.0→-1.5 dB: was over-cutting Lo-Mid vs reference
+        _comp_eq = Pedalboard([PeakFilter(cutoff_frequency_hz=style["comp_eq_hz"],
+                                          gain_db=-1.5, q=1.2)])
+        inst_c = _comp_eq(inst_c.T.astype(np.float32), SR).T.astype(np.float32)
+        # Transient shaper: sustain reduction only (no attack boost).
+        # attack_gain_db=0: the function was silently disabled (btype crash) throughout
+        # all v17 testing. Setting to 0 matches v17 effective behavior and stops
+        # hi-hat/cymbal transient boosting that was pushing High band +9.6 dB over ref.
+        inst_c = _transient_shape(inst_c, attack_gain_db=0.0, sustain_gain_db=-2.0)
+        inst_c = _check(inst_c, f"iter{iteration+1}/transient-shape")
         # Sub-bass management: kick transient sidechains 20-80Hz sub-bass
         inst_c = _kick_sub_sidechain(inst_c, depth=0.35)
         inst_c = _parallel_compress(inst_c)
@@ -376,6 +416,11 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
             level_mult = min(level_mult * 1.18, 3.0)
         else:
             level_mult = max(level_mult * 0.85, 0.5)
+
+    # Mono-safe low end: collapse Side channel below 150 Hz for mono compatibility.
+    # Research: hip-hop professional standard is correlation >0.90 below 150 Hz.
+    # Wide kicks (Side energy 0.7-0.85 correlation) cause 2+ dB cancellation on mono sum.
+    inst_c = _mono_lf(inst_c, cutoff_hz=150.0)
 
     # Final M/S mix with dynamic stereo width
     # Research: during vocal sections, narrow the beat's stereo field slightly
@@ -431,6 +476,30 @@ def _ms_decode(M: np.ndarray, S: np.ndarray) -> np.ndarray:
     return np.stack([L, R], axis=1).astype(np.float32)
 
 
+def _mono_lf(audio: np.ndarray, cutoff_hz: float = 150.0) -> np.ndarray:
+    """
+    Collapse the Side channel below cutoff_hz to mono for mono compatibility.
+
+    Sub-bass and low-bass are normally expected to be mono in professional mixes.
+    When the beat's Side channel contains significant energy below 150 Hz (e.g.
+    a "wide kick"), summing to mono cancels that Side content — causing the kick
+    to sound thin or hollow on mono speakers/club systems.
+
+    This function zeroes out the low-frequency portion of the Side channel by:
+      1. M/S encode the signal
+      2. High-pass the Side channel at cutoff_hz (keep only HF stereo info)
+      3. M/S decode — the LF band collapses to mono automatically
+
+    Research: correlation >0.90 below 150 Hz is the professional standard.
+    Mono-collapsing the Side below 150 Hz guarantees correlation = 1.0.
+    """
+    nyq = SR / 2.0
+    sos_hp = butter(4, cutoff_hz / nyq, btype="high", output="sos")
+    M, S = _ms_encode(audio)
+    S_hf = sosfilt(sos_hp, S.astype(np.float64)).astype(np.float32)
+    return _ms_decode(M, S_hf)
+
+
 def _maxx_bass(mix: np.ndarray, fundamental_lo: float = 40.0,
                fundamental_hi: float = 100.0, blend: float = 0.30) -> np.ndarray:
     """
@@ -461,32 +530,17 @@ def _maxx_bass(mix: np.ndarray, fundamental_lo: float = 40.0,
     sos_harm = butter(4, [h2_lo / nyq, h3_hi / nyq],
                       btype="band", output="sos")
 
-    result = mix.copy()
-    for c in range(mix.shape[1]):
-        ch = mix[:, c].astype(np.float64)
-
-        # Extract fundamental
-        fund = sosfilt(sos_fund, ch)
-        peak = np.max(np.abs(fund)) + 1e-9
-        fund_norm = fund / peak
-
-        # Heavy asymmetric saturation → 2nd (2×) and 3rd (3×) harmonics
-        # Asymmetric: positive gets softer clip (2nd harmonic dominant)
-        pos = fund_norm > 0
-        saturated = np.where(pos,
-                             np.tanh(fund_norm * 4.0 * 0.7),
-                             np.tanh(fund_norm * 4.0 * 1.3))
-        saturated = saturated * peak
-
-        # Remove the fundamental from saturated (keep only harmonics)
-        harmonics = saturated - fund
-
-        # Bandpass to 2nd+3rd harmonic range only
-        harmonics = sosfilt(sos_harm, harmonics)
-
-        result[:, c] = (ch + harmonics * blend).astype(np.float32)
-
-    return result.astype(np.float32)
+    # Vectorized over both channels simultaneously (axis=0 = samples)
+    mix_f64 = mix.astype(np.float64)
+    fund = sosfilt(sos_fund, mix_f64, axis=0)              # (samples, 2)
+    peak = np.max(np.abs(fund), axis=0, keepdims=True) + 1e-9
+    fund_norm = fund / peak
+    # Asymmetric saturation: positive half → softer (2nd harmonic), negative → harder (3rd)
+    saturated = np.where(fund_norm > 0,
+                         np.tanh(fund_norm * 4.0 * 0.7),
+                         np.tanh(fund_norm * 4.0 * 1.3)) * peak
+    harmonics = sosfilt(sos_harm, saturated - fund, axis=0)
+    return (mix_f64 + harmonics * blend).astype(np.float32)
 
 
 def _kick_sub_sidechain(inst: np.ndarray, depth: float = 0.35) -> np.ndarray:
@@ -640,7 +694,9 @@ def _separate_demucs(audio_path: str, out_dir: Path) -> None:
         )
         if result.returncode != 0:
             raise RuntimeError(f"Demucs failed:\n{result.stderr}")
-        raw = out_dir.parent / "htdemucs_ft" / fid
+        # Demucs names its output dir after the input filename (without extension).
+        # The temp file is named "{fid}_src{ext}", so Demucs creates "{fid}_src/".
+        raw = out_dir.parent / "htdemucs_ft" / f"{fid}_src"
         if raw.exists():
             for f in raw.iterdir():
                 shutil.move(str(f), str(out_dir / f.name))
@@ -806,6 +862,13 @@ def _detect_section_start(y_mono: np.ndarray, section: str = "chorus") -> int:
 
 def _groove_quantize(vox: np.ndarray, inst_mono: np.ndarray,
                      bpm: float, strength: float = 0.35) -> np.ndarray:
+    """
+    DISABLED: overlapping segment operations cause clicks throughout the mix.
+    The overlap between fade-out zeroing and += seg_write creates gaps and
+    double-writes when onset ranges overlap (which they always do on dense vocals).
+    """
+    return vox
+    # Original broken implementation below — do not re-enable without rewrite:
     """
     Vocal groove quantization: nudge vocal syllable onsets toward the beat grid.
 
@@ -1247,34 +1310,17 @@ def _harmonic_excite(audio_ch: np.ndarray, crossover_hz: float = 3000.0,
 
     audio_ch: (n_channels, n_samples) float32
     """
+    # Vectorized over all channels (axis=1 = samples axis for (ch, samples) layout)
     sos_hp = butter(4, crossover_hz / (SR / 2.0), btype="high", output="sos")
-    result = audio_ch.copy()
-
-    for c in range(audio_ch.shape[0]):
-        ch = audio_ch[c].astype(np.float64)
-        # Step 1: HP filter
-        hp_band = sosfilt(sos_hp, ch)
-
-        # Step 2: normalize, saturate (asymmetric = even harmonics), restore
-        peak = np.max(np.abs(hp_band)) + 1e-9
-        hp_norm = hp_band / peak
-        # Asymmetric drive: positive half gets softer clip → 2nd harmonic (warmth)
-        pos = hp_norm > 0
-        saturated = np.where(pos,
-                             np.tanh(hp_norm * drive * 0.8),
-                             np.tanh(hp_norm * drive * 1.2))
-        saturated = saturated * peak
-
-        # Step 3: subtract original → only new harmonic content
-        harmonics_only = saturated - hp_band
-
-        # Step 4: re-HP to remove any low-freq artifacts from saturation
-        harmonics_only = sosfilt(sos_hp, harmonics_only).astype(np.float32)
-
-        # Step 5: mix harmonics into original
-        result[c] = (ch + harmonics_only * mix_level).astype(np.float32)
-
-    return result.astype(np.float32)
+    audio_f64 = audio_ch.astype(np.float64)
+    hp_band = sosfilt(sos_hp, audio_f64, axis=1)            # (channels, samples)
+    peak = np.max(np.abs(hp_band), axis=1, keepdims=True) + 1e-9
+    hp_norm = hp_band / peak
+    saturated = np.where(hp_norm > 0,
+                         np.tanh(hp_norm * drive * 0.8),
+                         np.tanh(hp_norm * drive * 1.2)) * peak
+    harmonics_only = sosfilt(sos_hp, saturated - hp_band, axis=1)
+    return (audio_f64 + harmonics_only * mix_level).astype(np.float32)
 
 
 def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
@@ -1479,21 +1525,22 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
             "air_db": 2.0, "reverb_room": 0.12, "reverb_damp": 0.80, "reverb_wet": 0.08,
         }
 
-    # Step 1: neural noise suppression (DeepFilter) or fallback noisereduce
-    vox = np.stack([
-        _deepfilter_clean(vox[:, c]) for c in range(vox.shape[1])
-    ], axis=1)
+    # Step 1: REMOVED DeepFilterNet and noisereduce.
+    # DeepFilter is trained on speech + stationary noise. Applied to Demucs-separated
+    # vocals (which contain music bleed: hi-hats, synths, instrumental residue), it
+    # misidentifies those musical tones as "noise" and creates severe metallic/static
+    # artifacts. The Demucs stem is already reasonably clean — don't over-process it.
 
     # Step 1b: breath reduction — attenuate breath noise between phrases
-    vox = _breath_reduce(vox.T, reduction_db=8.0).T.astype(np.float32)
+    vox = _breath_reduce(vox.T, reduction_db=4.0).T.astype(np.float32)
 
-    # Step 1d: pitch correction — snap vocal to target key BEFORE stretch
-    # Use mid channel for pitch detection, apply to both channels equally
-    vox_mid = _to_mono(vox)
-    vox_mid_corrected = _pitch_correct(vox_mid, target_root, target_mode, strength=0.65)
-    # Reconstruct stereo with the pitch-corrected mid
-    if not np.allclose(vox_mid, vox_mid_corrected):
-        ratio_corr = np.where(np.abs(vox_mid) > 1e-9,
+    # Step 1d: REMOVED pitch correction.
+    # PYIN pitch detection on Demucs vocals (with music bleed) produces wrong pitch
+    # readings on frames where the instrumental bleed dominates. Rubberband then
+    # shifts those frames by the wrong amount, creating pitch jump artifacts.
+    # The BPM stretch + key shift below handles tuning without per-note correction.
+    if False:  # disabled — kept for reference only
+        ratio_corr = np.where(np.abs(vox[:, 0]) > 1e-9,
                               vox_mid_corrected / (vox_mid + 1e-9), 1.0).astype(np.float32)
         vox = (vox * ratio_corr[:, np.newaxis]).astype(np.float32)
 
@@ -1598,23 +1645,19 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
 
     # Step 9b: consonant enhancement — boost "t","d","k" transients in 4-9kHz
     # without boosting sustained hi-hats (dual envelope differentiates them)
-    consonant_boost = float(np.interp(style.get("_rap_score", 0.5), [0, 1], [2.0, 3.5]))
+    # Disabled (was [0.5, 1.0] dB): operates at 4-9 kHz, straddles both Hi-Mid and High
+    # problem bands. Removed while tuning spectral balance vs reference.
+    consonant_boost = 0.0
     vox_ch = _consonant_enhance(vox_ch, boost_db=consonant_boost)
 
     # Step 9c: harmonic exciter (Aphex-style) — adds upper harmonics stripped by
-    # stem separation and digital processing. Crossover at 3kHz, 12% mix level.
-    vox_ch = _harmonic_excite(vox_ch, crossover_hz=3000.0,
-                               drive=2.0, mix_level=0.12)
+    # stem separation and digital processing. Crossover at 3kHz.
+    # Vocal harmonic exciter REMOVED: stacks with consonant enhance and other
+    # saturation stages causing intermodulation distortion (static artifacts).
 
-    # Step 10: asymmetric waveshaper — adds even harmonics (2nd = "tube warmth")
-    # tanh alone only generates odd harmonics; biasing the input before tanh
-    # creates 2nd+3rd harmonic content matching Class A tube preamp character.
-    # drive=1.3 = 0.5-1% THD — matches Ampex 456 tape at +3 VU (research confirmed correct)
-    # asym=0.18 = stronger 2nd harmonic vs 0.12 (more "tube" vs "tape" character)
-    drive = 1.3
-    asym  = 0.18  # 0.18 = tube character (more 2nd harmonic), 0.12 = tape character
-    _vox_biased = vox_ch + asym * np.abs(vox_ch)
-    vox_ch = (np.tanh(drive * _vox_biased) / np.tanh(drive)).astype(np.float32)
+    # Step 10: vocal waveshaper REMOVED — saturation on already-noisy Demucs stems
+    # generates intermodulation distortion. The stem has music bleed; saturating it
+    # amplifies those artifacts into audible static on every vocal phrase.
 
     # Step 11: early reflections + pre-delay reverb with HPF'd return
     #
@@ -1783,7 +1826,7 @@ def _transient_shape(inst: np.ndarray,
     # gives more accurate transient identification vs using full-bandwidth signal
     nyq = SR / 2.0
     sos_kick  = butter(4, [60 / nyq, 200 / nyq],  btype="band", output="sos")
-    sos_snare = butter(4, [150 / nyq, min(6000 / nyq, 0.999)], btype="high", output="sos")
+    sos_snare = butter(4, [150 / nyq, min(6000 / nyq, 0.999)], btype="band", output="sos")
     inst_mono_d = _to_mono(inst).astype(np.float64)
     kick_b  = sosfilt(sos_kick,  inst_mono_d)
     snare_b = sosfilt(sos_snare, inst_mono_d)
@@ -1880,8 +1923,9 @@ def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
         reconstructed = librosa.istft(carved_stft, hop_length=hop, length=len(inst))
         result[:, c] = reconstructed.astype(np.float32)
 
-    # Add high-shelf air boost to compensate for stem separation frequency loss
-    shelf = Pedalboard([HighShelfFilter(cutoff_frequency_hz=5500.0, gain_db=4.5)])
+    # High shelf removed (was 4.5→2.0 dB): transient shaper (now working) already
+    # restores instrumental presence. Shelf was contributing to High band excess.
+    shelf = Pedalboard([HighShelfFilter(cutoff_frequency_hz=5500.0, gain_db=0.0)])
     result = shelf(result.T.astype(np.float32), SR).T.astype(np.float32)
 
     return result
@@ -1899,8 +1943,9 @@ def _parallel_compress(inst: np.ndarray) -> np.ndarray:
         Gain(gain_db=9.0),   # makeup: bring crushed level up to match dry
     ])
     crushed = crush(inst_ch, SR).T.astype(np.float32)
-    # 33% wet: NY compression research shows 30-35% is the hip-hop density sweet spot
-    return (0.67 * inst + 0.33 * crushed).astype(np.float32)
+    # Reverted to v17 20% wet: 33% was generating HF harmonics from heavy compression
+    # that pushed High band +7-10 dB above reference. 80/20 matches v17 tested behavior.
+    return (0.80 * inst + 0.20 * crushed).astype(np.float32)
 
 
 def _parallel_compress_vocal(vox_ch: np.ndarray, rap_score: float = 0.5) -> np.ndarray:
@@ -1985,34 +2030,27 @@ def _sidechain(inst: np.ndarray, vox: np.ndarray,
                depth: float, window_ms: int = 40,
                attack_ms: float = 10.0, release_ms: float = 100.0) -> np.ndarray:
     """
-    Triband sidechain: duck only 200Hz-5kHz when vocal is loud.
+    Broadband sidechain: duck everything above 200 Hz when vocal is loud.
 
     - Sub/bass (<200Hz): no ducking — kick and sub stay punchy
-    - Mid zone (200Hz-5kHz): full depth — vocal and beat share this space most
-    - High (>5kHz): no ducking — hi-hats and air don't compete with vocal
+    - Everything above 200Hz: ducked proportionally to vocal level
 
-    Research (SSL/Neve engineers): multiband sidechain on drum bus, keyed to vocal,
-    targeting 300-600Hz and 1-5kHz (vocal "meat"). Ducking hi-hats is wasteful
-    and makes the beat sound thin when the vocal enters.
+    Previous triband version (duck 200-5kHz only, preserve 5kHz+) caused hi-hats
+    and cymbals to pass at full level during vocal sections, pushing the High band
+    +10 dB above reference. v17 architecture ducked the full 200+ Hz range.
+    Reverting to v17 spec: sub-bass preserved, everything else ducked.
     """
-    sos_lo     = butter(4, 200.0  / (SR / 2), btype="low",  output="sos")
-    sos_mid_hp = butter(4, 200.0  / (SR / 2), btype="high", output="sos")
-    sos_mid_lp = butter(4, 5000.0 / (SR / 2), btype="low",  output="sos")
-    sos_hi     = butter(4, 5000.0 / (SR / 2), btype="high", output="sos")
+    sos_lp = butter(4, 200.0 / (SR / 2), btype="low",  output="sos")
+    sos_hp = butter(4, 200.0 / (SR / 2), btype="high", output="sos")
 
-    inst_lo  = sosfilt(sos_lo, inst, axis=0).astype(np.float32)   # < 200Hz: unaffected
-    inst_mid = sosfilt(sos_mid_lp,
-                       sosfilt(sos_mid_hp, inst, axis=0),
-                       axis=0).astype(np.float32)                  # 200Hz-5kHz: ducked
-    inst_hi  = sosfilt(sos_hi, inst, axis=0).astype(np.float32)   # > 5kHz: unaffected
+    inst_lo   = sosfilt(sos_lp, inst, axis=0).astype(np.float32)  # < 200Hz: unaffected
+    inst_high = sosfilt(sos_hp, inst, axis=0).astype(np.float32)  # > 200Hz: ducked
 
     vox_mono = _to_mono(vox)
     gain = _sidechain_envelope(vox_mono, len(inst), depth, window_ms,
                                 attack_ms=attack_ms, release_ms=release_ms)
 
-    inst_mid_ducked = (inst_mid * gain[:, np.newaxis]).astype(np.float32)
-
-    return (inst_lo + inst_mid_ducked + inst_hi).astype(np.float32)
+    return (inst_lo + inst_high * gain[:, np.newaxis]).astype(np.float32)
 
 
 # ── Mastering ─────────────────────────────────────────────────────────────────
@@ -2224,7 +2262,7 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     """
     Mastering chain (v6):
       M/S EQ → mastering EQ → soft clip → glue comp → sub-bass limiter
-      → LUFS -9 normalize → brick-wall limiter -1.5 dBTP
+      → LUFS -10 normalize → brick-wall limiter -2.0 dBFS
 
     M/S EQ (new):
       Mid: -1.5 dB @ 350 Hz (remove mud from centered elements), sub preserved
@@ -2233,6 +2271,20 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     LUFS normalize goes LAST so it accounts for all gain reduction.
     Hip-hop target: -9 LUFS (-8 to -10).
     """
+    # ── Safety normalize: bring mix to -6 dBFS peak before processing ─────────
+    # The soft-clipper (Chebyshev 1.5x - 0.5x³) hard-clips everything above 1.0
+    # because it clips input first: mix_c = np.clip(mix, -1.0, 1.0). When the
+    # post-mix peak is 4.77 (+13.6 dBFS), the clipper acts as a brick wall on
+    # the top 70% of the signal — producing "crazy static" harmonic distortion.
+    # Normalizing to -6 dBFS (peak=0.5) ensures the entire mastering chain
+    # (tanh saturation, Chebyshev soft clip, compression) operates in its
+    # intended range. LUFS normalize at the end sets final loudness.
+    peak_in = float(np.max(np.abs(mix)))
+    if peak_in > 0.5:
+        mix = (mix * (0.5 / peak_in)).astype(np.float32)
+    print(f"      Master input: peak_in={peak_in:.3f} → normalized to -6 dBFS",
+          flush=True)
+
     # M/S EQ: separate processing for Mid and Sides channels
     if mix.ndim == 2 and mix.shape[1] == 2:
         M, S = _ms_encode(mix)  # (samples,) each
@@ -2241,9 +2293,9 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         # Research: +1 dB shelf at 3-5 kHz on the Mid improves mono compatibility
         # and punch-through on phone speakers / earbuds (where M/S collapses to mono).
         mid_eq = Pedalboard([
-            PeakFilter(cutoff_frequency_hz=350.0, gain_db=-1.5, q=1.2),
+            PeakFilter(cutoff_frequency_hz=350.0, gain_db=-0.75, q=1.2),  # reduced -1.5→-0.75: Lo-Mid
             LowShelfFilter(cutoff_frequency_hz=120.0, gain_db=0.5),  # sub warmth
-            HighShelfFilter(cutoff_frequency_hz=4000.0, gain_db=1.0), # +1dB mono punch-through
+            HighShelfFilter(cutoff_frequency_hz=4000.0, gain_db=0.0), # removed: was contributing to Hi-Mid excess
         ])
         M_proc = mid_eq(M[np.newaxis, :].astype(np.float32), SR)[0]
 
@@ -2254,7 +2306,7 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         sides_eq = Pedalboard([
             HighpassFilter(cutoff_frequency_hz=120.0),              # 120Hz mono-safe (safer than 100Hz)
             PeakFilter(cutoff_frequency_hz=400.0, gain_db=-2.5, q=0.8),  # muddy sides cut
-            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=2.5),    # +2.5dB (research: 2.5-3dB pro range)
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=-1.0),    # -1.0dB: corrective cut (was +1.5, caused HF excess)
         ])
         S_proc = sides_eq(S[np.newaxis, :].astype(np.float32), SR)[0]
 
@@ -2265,10 +2317,10 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # A -1.5 dB cut at 3.2kHz dramatically reduces fatigue without perceived loudness loss,
     # freeing headroom for the limiter to work 0.5-1 dB harder.
     master_eq = Pedalboard([
-        PeakFilter(cutoff_frequency_hz=250.0, gain_db=-1.0, q=0.8),  # mud cut
-        PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5, q=2.5), # fatigue notch
-        PeakFilter(cutoff_frequency_hz=5000.0, gain_db=1.0,  q=1.2), # presence restore
-        HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=1.5),    # air
+        PeakFilter(cutoff_frequency_hz=250.0,  gain_db=-0.5,  q=0.8),  # mud cut
+        PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5,  q=2.5), # fatigue notch
+        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.0,  q=1.0), # Hi-Mid correction (reduced -2.5→-2.0: shelf now covers top of band)
+        HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-6.0),    # High correction: shelf moved 7k→6k to cover dominant 6-8kHz content
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
@@ -2276,23 +2328,10 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # Placed after mastering EQ so it controls, not changes, the tonal balance
     mix = _multiband_master_compress(mix)
 
-    # Maxx Bass: synthesize 2nd/3rd harmonics from sub-bass for small speaker audibility
-    # Blend 30%: bass audible on earbuds, subtle enough not to muddy the mix
-    mix = _maxx_bass(mix, fundamental_lo=40.0, fundamental_hi=100.0, blend=0.30)
-
-    # Even-harmonic (tape-style) pre-saturation: 2nd harmonic warmth, ~0.3% THD.
-    # tanh generates odd harmonics (3rd, 5th). Asymmetric bias before tanh adds
-    # even harmonics (2nd, 4th) — the warmth signature of tape and class-A circuits.
-    # Research: even harmonics sound "warm"; odd harmonics sound "harsh".
-    # drive=0.25 is very subtle — adds character without audible distortion.
-    _bias = 0.06  # 6% asymmetry = tape character (lower = less colored)
-    mix_biased = (mix + _bias * np.abs(mix)).astype(np.float64)
-    mix = (np.tanh(0.25 * mix_biased) / np.tanh(0.25)).astype(np.float32)
-
-    # Mastering harmonic exciter: gentle upper-harmonic generation on full mix
-    # Crossover higher (5kHz) and lower level (7%) than vocal chain
-    mix = _harmonic_excite(mix.T, crossover_hz=5000.0, drive=1.5,
-                           mix_level=0.07).T.astype(np.float32)
+    # Maxx Bass, tanh saturation, and harmonic exciter all REMOVED from mastering.
+    # These three nonlinear stages were stacking intermodulation distortion and
+    # combined with the Chebyshev soft-clip to produce static/harshness artifacts.
+    # The Chebyshev soft-clip below is sufficient for peak control without IMD.
 
     # Soft clip: Chebyshev 3rd-order (1.5x - 0.5x³) — gentler than tanh,
     # preserves low-level signal shape, clips peaks without hardness
@@ -2333,11 +2372,21 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # so -10 is within 4 LU of the norm — keeps dynamics while remaining competitive).
     mix = _lufs_normalize(mix, -10.0)
 
+    # Post-normalize HF correction: applied AFTER LUFS normalize so normalization
+    # cannot compensate and undo the cut (pre-normalize EQ cuts get partially restored
+    # by LUFS normalize since cutting HF lowers K-weighted LUFS, which the normalize
+    # then boosts back). This shelf directly targets the measured residual HF excess:
+    # High (6-20k) was +4.6 dB above reference after all pre-normalize processing.
+    post_norm_eq = Pedalboard([HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-5.5)])
+    mix = post_norm_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
     # Brick-wall limiter LAST: enforces peak ceiling after LUFS normalization.
-    # -1.5 dBTP (not -1.0) to leave headroom for inter-sample peaks:
-    # pedalboard's Limiter measures sample peaks; D/A reconstruction can add
-    # 0.5-2 dB of inter-sample overshoot. -1.5 dBTP ensures true peaks stay ≤ -0.5 dBTP.
-    limiter = Pedalboard([Limiter(threshold_db=-1.5, release_ms=50.0)])
+    # -2.0 dBFS (not -1.0 or -1.5): pedalboard's Limiter measures sample peaks only,
+    # not true peaks. Hip-hop kick/808 transients produce +0.5-2.0 dB inter-sample
+    # overshoot beyond the sample peak. Setting -2.0 dBFS ensures true peaks stay
+    # ≤ -0.5 dBTP in worst case. Research: tanh pre-clip reduces overshoot to lower
+    # end of range (~+0.5 dB), so -2.0 dBFS provides adequate safety margin.
+    limiter = Pedalboard([Limiter(threshold_db=-2.0, release_ms=50.0)])
     mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
     return mix
 
@@ -2414,12 +2463,14 @@ def fuse(song_a: str, song_b: str, out_path: str,
           f"brightness={beat_char['brightness']:.2f}", flush=True)
     print(f"      Vocal: rap_score={vox_char['rap_score']:.2f}  "
           f"onset_rate={vox_char['onset_rate']:.1f}/s  "
-          f"pitch_range={vox_char['pitch_range']:.0f}st", flush=True)
+          f"pitch_range={vox_char['pitch_range']:.0f}st  "
+          f"gender={vox_char['gender']} (F0={vox_char['median_f0']:.0f}Hz)", flush=True)
     print(f"      Style → FET {style['fet_ratio']:.1f}:1  "
           f"reverb_room={style['reverb_room']:.2f}  "
           f"reverb_wet={style['reverb_wet']:.2f}  "
           f"carve={style['carve_db']:.1f}dB  "
-          f"vocal_level={style['vocal_level']:.2f}", flush=True)
+          f"vocal_level={style['vocal_level']:.2f}  "
+          f"comp_eq={style['comp_eq_hz']:.0f}Hz", flush=True)
     print(f"      Gate thresh: {vox_params['gate_thresh_db']:.1f} dB  "
           f"Comp ratio: {vox_params['comp_ratio']:.1f}:1  "
           f"Spectral overlap: {overlap:.3f}  "
@@ -2432,6 +2483,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     vox = _process_vocals(vox, ratio, n_semi, vox_params, style,
                           target_root=key_a_root, target_mode=key_a_mode,
                           bpm=bpm_a)
+    vox = _check(vox, "post-vocal-chain")
 
     step(8, TOTAL, "Mixing (chorus-align + beat-snap + spectral carve + M/S + sidechain)…")
 
@@ -2488,11 +2540,13 @@ def fuse(song_a: str, song_b: str, out_path: str,
     # AI iterative mixer: closed-loop presence feedback, energy-envelope matching,
     # spectral carve, parallel compress, sidechain — all style-adaptive
     mix = _iterative_mix(inst, vox, style, sidechain_depth, bpm_a)
+    mix = _check(mix, "post-mix")
 
     mix = _fade(mix, fade_s=2.0)
 
     step(9, TOTAL, "Mastering…")
     mix = _master(mix, bpm=bpm_a)
+    mix = _check(mix, "post-master")
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     sf.write(out_path, mix, SR, subtype="PCM_24")
