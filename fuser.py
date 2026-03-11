@@ -2695,7 +2695,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     sf.write(out_path, mix, SR, subtype="PCM_24")
     print(f"Done → {out_path}", flush=True)
 
-    # ── Auto quality evaluation ──────────────────────────────────────────────
+    # ── Auto quality evaluation (legacy 7-point check) ───────────────────────
     print("\n── Auto Quality Evaluation ─────────────────────────────────────", flush=True)
     ev = _auto_evaluate(mix, inst, vox, bpm_a)
     print(f"  Beat sync:      {ev['beat_sync_pct']}%  (want >45%)", flush=True)
@@ -2710,5 +2710,18 @@ def fuse(song_a: str, song_b: str, out_path: str,
     else:
         print("  All checks passed", flush=True)
     print(f"  Overall: {'PASS' if ev['pass'] else 'FAIL'}", flush=True)
+
+    # ── Professional quality scoring (listen.py) ──────────────────────────────
+    # Measures output against empirical ranges from 50+ commercial tracks.
+    # Catches: muddiness, harshness, clipping, noise floor, vocal level, etc.
+    try:
+        from listen import auto_score
+        qc_passed, qc_score, qc_summary = auto_score(out_path)
+        print(f"\n  Professional score: {qc_summary}", flush=True)
+        if not qc_passed:
+            print("  [QC WARNING] Output may not meet professional standards. "
+                  "Check the report above for specific issues.", flush=True)
+    except Exception as _qe:
+        print(f"  [Quality scorer unavailable: {_qe}]", flush=True)
 
     return out_path
