@@ -224,8 +224,9 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         "opto_release": float(np.interp(agg, [0, 1], [300.0, 150.0])),
 
         # Presence boost: 3 kHz is the key vocal intelligibility / "cut-through"
-        # frequency. +4-5 dB needed to push past a bass-heavy EDM/trap beat.
-        "presence_db":  float(np.interp(rap, [0, 1], [4.0, 5.0])),
+        # frequency. +2-3.5 dB — the +4dB high shelf was removed (caused harshness);
+        # vocals cut through via spectral carve, not aggressive presence boost.
+        "presence_db":  float(np.interp(rap, [0, 1], [2.0, 3.5])),
         "presence_hz":  3000.0,  # fixed: 3 kHz is the universal cut-through freq
 
         # Air shelf: compensate for HF stripped by Demucs mask + de-esser.
@@ -1682,6 +1683,15 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # (samples, 2) → (2, samples) for pedalboard / pyrubberband
     vox_ch = vox.T.astype(np.float32)
 
+    # Stage 0: Spectral noise reduction — remove residual stem-separation bleed.
+    # The Wiener mask in fuse() handles time-frequency bins where instrumental
+    # dominates. noisereduce handles the stationary noise floor left behind.
+    # prop_decrease=0.35 is conservative — avoids metallic artifacts on melody.
+    vox_ch = np.stack([
+        _clean_vocal(vox_ch[c])
+        for c in range(vox_ch.shape[0])
+    ], axis=0)
+
     # Stage 1: HPF 80 Hz + subtractive EQ
     # Cuts are aggressive because the instrumental beat adds heavy low-mid energy
     # that will mask the vocal after mixing — must pre-clean the vocal stem.
@@ -1737,11 +1747,11 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     ])
     vox_ch = dyn_board(vox_ch, SR).astype(np.float32)
 
-    # Stage 6: clarity boost + presence + air shelf
-    # The high shelf at 1500 Hz goes AFTER compression — the compressor can't
-    # undo it. This lifts all consonants and intelligibility cues permanently.
+    # Stage 6: presence + air shelf
+    # The +4dB shelf at 1500Hz was causing hi-mid harshness (2.5-6kHz too loud).
+    # Vocals cut through via the spectral carve + narrow presence peak, not a
+    # broad shelf. Use a narrow presence peak only + subtle air shelf.
     post_eq = Pedalboard([
-        HighShelfFilter(cutoff_frequency_hz=1500.0, gain_db=+4.0),  # cut-through lift
         PeakFilter(cutoff_frequency_hz=style["presence_hz"],
                    gain_db=style["presence_db"], q=1.5),
         HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=style["air_db"]),
@@ -2303,11 +2313,10 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # freeing headroom for the limiter to work 0.5-1 dB harder.
     master_eq = Pedalboard([
         PeakFilter(cutoff_frequency_hz=250.0,  gain_db=-0.5,  q=0.8),  # mud cut
-        PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5,  q=2.5), # fatigue notch
-        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.0,  q=1.0), # Hi-Mid correction
-        # High shelf: was -6 dB when harmonic exciters/waveshapers were active.
-        # Those are all removed; mix is now -3 dB dark in High band vs inputs.
-        # Reduce to -1.5 dB (just control HF limiter peak, not tonal correction).
+        PeakFilter(cutoff_frequency_hz=500.0,  gain_db=-1.5,  q=0.7),  # lo-mid warmth control (250-800Hz)
+        PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5,  q=2.5),  # ear-fatigue notch
+        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.0,  q=1.0),  # hi-mid harshness cut
+        PeakFilter(cutoff_frequency_hz=4000.0, gain_db=-1.5,  q=1.0),  # upper presence cut (2.5-6kHz)
         HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-1.5),
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
@@ -2433,7 +2442,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     print(f"      A: {_NOTES[key_a_root]} {key_a_mode}   "
           f"B: {_NOTES[key_b_root]} {key_b_mode}", flush=True)
 
-    sep_model = "BS-Roformer" if _has_gpu() else "Demucs"
+    sep_model = "BS-Roformer" if _has_gpu() else "MDX-Net Kim Vocal 2→Demucs fallback"
     step(4, TOTAL, f"Separating stems — Song A (instrumental) via {sep_model}…")
     stems_a = separate(song_a, stems_cache)
 
@@ -2556,8 +2565,8 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
     rb_engine = "pyrubberband R3" if HAS_PYRUBBERBAND else "pedalboard (fallback)"
     predelay_ms = min(60000.0 / max(bpm_a, 60.0) / 16.0, 40.0)
-    step(7, TOTAL, f"Processing vocals (DeepFilter + pitch-correct + stretch [{rb_engine}] + NY-comp + "
-         f"split-band de-esser + BPM-reverb {predelay_ms:.0f}ms)…")
+    step(7, TOTAL, f"Processing vocals (noisereduce + pitch-correct + stretch [{rb_engine}] + "
+         f"de-esser + compress + presence + reverb {predelay_ms:.0f}ms)…")
     vox = _process_vocals(vox, stretch_vocal, n_semi, vox_params, style,
                           target_root=key_a_root, target_mode=key_a_mode,
                           bpm=bpm_a)

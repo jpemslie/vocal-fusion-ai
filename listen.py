@@ -51,14 +51,14 @@ REF = {
     # Global loudness & dynamics
     "lufs_integrated":    (-14.0, -7.0),
     "true_peak_dbfs":     (-40.0, -0.5),   # 0.0 = clipping → CRITICAL
-    "lra_lu":             (3.5, 14.0),
+    "lra_lu":             (2.0, 14.0),
     "crest_factor_db":    (6.0, 22.0),
     "stereo_correlation": (0.4, 0.99),
 
     # Frequency balance ratios (vs mid band)
     "ratio_sub_to_mid":    (+4.0, +18.0),
-    "ratio_bass_to_mid":   (+2.0, +15.0),
-    "ratio_lowmid_to_mid": (-3.0, +8.0),   # > +8 = MUDDY
+    "ratio_bass_to_mid":   (+2.0, +20.0),
+    "ratio_lowmid_to_mid": (-3.0, +10.0),   # > +10 = MUDDY (EDM/hip-hop naturally warm)
     "ratio_himid_to_mid":  (-20.0, -3.0),  # > -3 = HARSH, < -20 = DULL
     "ratio_high_to_mid":   (-32.0, -8.0),  # > -8 = BRIGHT, < -32 = DARK
 
@@ -159,7 +159,7 @@ PROBLEM_NAMES = {
     "ratio_bass_to_mid":   ("bass missing — thin sounding",
                             "bass too heavy vs mids"),
     "ratio_lowmid_to_mid": ("low-mids scooped — hollow / phone-speaker sound",
-                            "MUDDINESS — 250-800 Hz buildup, vocal intelligibility drops"),
+                            "MUDDINESS — 250-800 Hz extreme buildup, vocal buried"),
     "ratio_himid_to_mid":  ("presence missing — vocal sounds behind glass",
                             "HARSHNESS — 2-6 kHz too loud, ear fatigue"),
     "ratio_high_to_mid":   ("DARK / MUFFLED — highs rolled off too much",
