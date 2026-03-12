@@ -212,11 +212,11 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
     return {
         "_rap_score": rap,  # pass-through for ADT and other downstream use
         # FET compressor: rap/trap → faster, harder
-        # Attack minimum 3ms (research): below 3ms kills consonant transients,
-        # voice becomes a flat wall of sound. 1ms attack was the prior minimum.
-        "fet_ratio":    float(np.interp(rap, [0, 1], [4.0, 8.0])),
+        # Ratio cap 6:1 (was 8:1 — over-squashed vocal, LRA collapsed to 2.5 LU)
+        # Release min 60ms (was 40ms — too fast, caused pumping artifacts)
+        "fet_ratio":    float(np.interp(rap, [0, 1], [3.5, 6.0])),
         "fet_attack":   float(np.interp(rap, [0, 1], [5.0, 3.0])),
-        "fet_release":  float(np.interp(agg, [0, 1], [100.0, 40.0])),
+        "fet_release":  float(np.interp(agg, [0, 1], [120.0, 60.0])),
 
         # Opto compressor: more gentle always, but faster for aggressive
         "opto_ratio":   float(np.interp(agg, [0, 1], [2.0, 3.0])),
@@ -224,8 +224,8 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         "opto_release": float(np.interp(agg, [0, 1], [300.0, 150.0])),
 
         # Presence boost: 3 kHz is the key vocal intelligibility / "cut-through"
-        # frequency. Needs +3-4 dB to push past a bass-heavy beat mix.
-        "presence_db":  float(np.interp(rap, [0, 1], [3.0, 4.0])),
+        # frequency. +4-5 dB needed to push past a bass-heavy EDM/trap beat.
+        "presence_db":  float(np.interp(rap, [0, 1], [4.0, 5.0])),
         "presence_hz":  3000.0,  # fixed: 3 kHz is the universal cut-through freq
 
         # Air shelf: compensate for HF stripped by Demucs mask + de-esser.
@@ -243,11 +243,11 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         # Sidechain: aggressive beat → more sidechain duck
         "sidechain_mult": float(np.interp(agg, [0, 1], [0.9, 1.2])),
 
-        # Vocal level: research says vocals sit 2-4 dB above beat bus.
-        # Linear 1.0 = same RMS as beat. Compression adds 2-3 dB perceived loudness,
-        # so 1.0-1.3 gets vocal to 2-4 dB apparent advantage without crushing beat.
-        # Previous 1.5-2.0 was 4-6 dB raw before processing → way too loud.
-        "vocal_level":  float(np.interp(rap, [0, 1], [1.0, 1.3])),
+        # Vocal level: vocals need to sit clearly above the beat in the mid-frequency
+        # zone. Using mid-RMS matching now, so this multiplier directly controls
+        # how much louder the vocal is vs the beat at 500-5000 Hz.
+        # 1.5 = vocal is 3.5 dB louder than beat in presence zone.
+        "vocal_level":  float(np.interp(rap, [0, 1], [1.5, 2.0])),
 
         # Complementary EQ: cut instrumental at vocal fundamental zone.
         # Research: male F0 body 200-350 Hz → cut at 280 Hz; female → 380 Hz.
@@ -383,15 +383,34 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
     level_mult = style["vocal_level"]
     carve_db   = style["carve_db"]
 
+    # ── Pre-mix bass management ────────────────────────────────────────────────
+    # House/EDM beats have +20-25 dB of bass vs mids.
+    # Two-band approach: harder sub cut (<80 Hz) + medium bass cut (80-350 Hz)
+    # Target: bring bass vs mid from +17 to +15, lo-mid vs mid from +9 to +8.
+    nyq_m = SR / 2.0
+    sos_bass_cut = butter(4, 350.0 / nyq_m, btype="low", output="sos")
+    bass_band = sosfilt(sos_bass_cut, inst, axis=0).astype(np.float32)
+    inst = (inst - bass_band * (1.0 - 10**(-9.0/20.0))).astype(np.float32)  # -9 dB on <350 Hz
+
     for iteration in range(max_iter):
         # Apply energy-envelope matching then static scalar
-        ir = _rms(_to_mono(inst))
-        vr = _rms(_to_mono(vox))
+        # Presence check uses MID-FREQUENCY RMS (500-5000 Hz) — not full-band.
+        # Full-band RMS on a bass-heavy beat inflates beat's apparent loudness;
+        # the vocal looks "50% present" while being completely masked in presence zone.
+        def _rms_mid(y_mono):
+            nyq_r = SR / 2.0
+            sos_hp = butter(4, 500.0 / nyq_r, btype="high", output="sos")
+            sos_lp = butter(4, 5000.0 / nyq_r, btype="low",  output="sos")
+            band = sosfilt(sos_hp, sosfilt(sos_lp, y_mono, axis=0))
+            return float(np.sqrt(np.mean(band**2) + 1e-12))
+
+        ir = _rms_mid(_to_mono(inst))
+        vr = _rms_mid(_to_mono(vox))
         vox_scaled = (vox * (ir * level_mult / (vr + 1e-9))).astype(np.float32)
 
-        # Dynamic envelope: vocal tracks beat energy locally
-        vox_scaled = _energy_match_envelope(inst, vox_scaled,
-                                            target_ratio=level_mult)
+        # Note: _energy_match_envelope is intentionally disabled. For EDM/house beats
+        # with flat energy envelopes, local tracking kills vocal LRA (was 2.5 LU).
+        # The static mid-RMS scalar above handles presence; iterative loop handles targeting.
 
         # Process instrumental
         inst_c = _adaptive_spectral_carve(inst, vox_scaled, carve_db=carve_db)
@@ -403,10 +422,45 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         #    harder. -2.5 dB here is barely audible on its own but makes a clear gap
         #    for the vocal to sit in. This is the #1 fix for "vocals unclear loud".
         _comp_eq = Pedalboard([
-            PeakFilter(cutoff_frequency_hz=style["comp_eq_hz"], gain_db=-1.5, q=1.2),
-            PeakFilter(cutoff_frequency_hz=1200.0, gain_db=-2.5, q=0.8),
+            PeakFilter(cutoff_frequency_hz=style["comp_eq_hz"], gain_db=-3.0, q=1.2),
+            PeakFilter(cutoff_frequency_hz=1200.0, gain_db=-4.0, q=0.8),
+            PeakFilter(cutoff_frequency_hz=2500.0, gain_db=-2.0, q=1.0),  # upper-mid cut on beat
         ])
         inst_c = _comp_eq(inst_c.T.astype(np.float32), SR).T.astype(np.float32)
+
+        # Vocal-activated bass duck: when the vocal is present, drop the beat's
+        # 20-350 Hz by up to -8 dB. This is the professional mashup technique —
+        # bass drops under the vocal so both can be heard clearly.
+        vox_env = np.abs(_to_mono(vox_scaled))
+        hop_d = 512
+        env_frames = librosa.feature.rms(y=vox_env, frame_length=2048, hop_length=hop_d)[0]
+        env_thresh = float(np.percentile(env_frames, 80))  # fires on top 20% of frames (true peaks only)
+        # Smooth the gain curve (100ms attack, 200ms release)
+        duck_gain = np.zeros(len(env_frames), dtype=np.float32)
+        for fi in range(len(env_frames)):
+            if env_frames[fi] > env_thresh:
+                duck_gain[fi] = 10**(-4.0/20.0)  # -4 dB when vocal is at peak (was -8 dB — too aggressive)
+            else:
+                duck_gain[fi] = 1.0
+        # Smooth: simple one-pole IIR
+        a_att = np.exp(-1.0 / (SR * 0.10 / hop_d))
+        a_rel = np.exp(-1.0 / (SR * 0.20 / hop_d))
+        smooth = np.ones(len(duck_gain), dtype=np.float32)
+        for fi in range(1, len(duck_gain)):
+            a = a_att if duck_gain[fi] < smooth[fi-1] else a_rel
+            smooth[fi] = a * smooth[fi-1] + (1.0 - a) * duck_gain[fi]
+        # Interpolate to sample resolution
+        n_samp = inst_c.shape[0]
+        x_f = np.arange(len(smooth)) * hop_d
+        x_s = np.arange(n_samp)
+        gain_samp = np.interp(x_s, x_f, smooth).astype(np.float32)
+        # Apply only to bass band
+        sos_bass_d = butter(4, 350.0 / nyq_m, btype="low",  output="sos")
+        sos_rest_d = butter(4, 350.0 / nyq_m, btype="high", output="sos")
+        bass_d  = sosfilt(sos_bass_d, inst_c, axis=0).astype(np.float32)
+        rest_d  = sosfilt(sos_rest_d, inst_c, axis=0).astype(np.float32)
+        inst_c = (bass_d * gain_samp[:, np.newaxis] + rest_d).astype(np.float32)
+
         # Transient shaper: sustain reduction only (no attack boost).
         # attack_gain_db=0: the function was silently disabled (btype crash) throughout
         # all v17 testing. Setting to 0 matches v17 effective behavior and stops
@@ -424,9 +478,11 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
                             window_ms=sc_window_ms,
                             attack_ms=10.0, release_ms=100.0)
 
-        # Evaluate presence
-        vp = _rms(_to_mono(vox_scaled)) / (
-             _rms(_to_mono(inst_c)) + _rms(_to_mono(vox_scaled)) + 1e-9)
+        # Evaluate presence using mid-frequency RMS (500-5000 Hz) — the zone
+        # where vocal and beat actually compete. Full-band is misleading because
+        # a bass-heavy beat inflates beat RMS while the vocal clarity zone is buried.
+        vp = _rms_mid(_to_mono(vox_scaled)) / (
+             _rms_mid(_to_mono(inst_c)) + _rms_mid(_to_mono(vox_scaled)) + 1e-9)
 
         print(f"      Mix iter {iteration+1}: presence={vp:.0%}  "
               f"level_mult={level_mult:.2f}  carve={carve_db:.1f}dB", flush=True)
@@ -1677,8 +1733,11 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     ])
     vox_ch = dyn_board(vox_ch, SR).astype(np.float32)
 
-    # Stage 6: presence boost + air shelf
+    # Stage 6: clarity boost + presence + air shelf
+    # The high shelf at 1500 Hz goes AFTER compression — the compressor can't
+    # undo it. This lifts all consonants and intelligibility cues permanently.
     post_eq = Pedalboard([
+        HighShelfFilter(cutoff_frequency_hz=1500.0, gain_db=+4.0),  # cut-through lift
         PeakFilter(cutoff_frequency_hz=style["presence_hz"],
                    gain_db=style["presence_db"], q=1.5),
         HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=style["air_db"]),
