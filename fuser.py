@@ -1475,7 +1475,7 @@ def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     return nr.reduce_noise(
         y=vox_mono, sr=SR,
         stationary=False,
-        prop_decrease=0.35,   # 0.75 creates watery/metallic artifacts on melodic content
+        prop_decrease=0.55,   # raised 0.35→0.55: trap/EDM bleed is dense, needs more suppression
         n_fft=2048,
     ).astype(np.float32)
 
@@ -1684,22 +1684,26 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     vox_ch = vox.T.astype(np.float32)
 
     # Stage 0: Spectral noise reduction — remove residual stem-separation bleed.
-    # The Wiener mask in fuse() handles time-frequency bins where instrumental
-    # dominates. noisereduce handles the stationary noise floor left behind.
-    # prop_decrease=0.35 is conservative — avoids metallic artifacts on melody.
+    # The Wiener mask handles bins where instrumental dominates.
+    # noisereduce (prop_decrease=0.55) handles the noise floor left behind.
+    # NaN guard: noisereduce can produce NaN in silent/zero regions (divide-by-zero
+    # in spectral gating) — replace with 0 before any further processing.
     vox_ch = np.stack([
-        _clean_vocal(vox_ch[c])
+        np.nan_to_num(_clean_vocal(vox_ch[c]), nan=0.0, posinf=0.0, neginf=0.0)
         for c in range(vox_ch.shape[0])
     ], axis=0)
 
-    # Stage 1: HPF 80 Hz + subtractive EQ
-    # Cuts are aggressive because the instrumental beat adds heavy low-mid energy
-    # that will mask the vocal after mixing — must pre-clean the vocal stem.
+    # Stage 1: HPF 80 Hz + subtractive EQ + hi-hat bleed roll-off
+    # The 8kHz shelf always rolls off the hi-hat zone regardless of pitch shift.
+    # Stem separation leaves 8-16kHz hi-hat residue that sounds "scratchy" after
+    # compression and presence boost. -3dB at 8kHz (-1 oct per octave above) is
+    # gentle enough to preserve sibilance (5-8kHz) while suppressing hi-hat bleed.
     pre_eq = Pedalboard([
         HighpassFilter(cutoff_frequency_hz=80.0),
         PeakFilter(cutoff_frequency_hz=300.0, gain_db=-5.0, q=1.2),  # mud (Demucs residue)
         PeakFilter(cutoff_frequency_hz=450.0, gain_db=-3.0, q=1.4),  # cardboard box
         PeakFilter(cutoff_frequency_hz=500.0, gain_db=-2.0, q=1.5),  # boxy
+        HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=-3.0),   # hi-hat bleed roll-off
     ])
     vox_ch = pre_eq(vox_ch, SR).astype(np.float32)
 
@@ -2476,11 +2480,13 @@ def fuse(song_a: str, song_b: str, out_path: str,
             mag_v = np.abs(D_v)
             mag_i = np.abs(D_i)
             phase_v = np.angle(D_v)
-            # Wiener soft mask — floor at 0.25 to preserve consonant transients
-            # and protect AutoTune'd / processed vocals (sustained synthetic tones
-            # can be misclassified as instrumental bleed at floor=0.15).
+            # Wiener soft mask — floor at 0.15 (was 0.25).
+            # 0.25 was too conservative: heavily-produced trap/EDM stems (808s,
+            # dense hi-hats) left audible bleed that the floor was protecting.
+            # 0.15 suppresses more bleed while still preserving consonant energy
+            # (true consonants have mag_v >> mag_i so mask is already near 1.0).
             raw_mask = librosa.util.softmask(mag_v, mag_i + 1e-8, power=2)
-            mask = np.maximum(raw_mask, 0.25)
+            mask = np.maximum(raw_mask, 0.15)
             D_clean = (mask * mag_v) * np.exp(1j * phase_v)
             vox_clean[:, c] = librosa.istft(D_clean, length=vox.shape[0]).astype(np.float32)
         vox = vox_clean.astype(np.float32)
