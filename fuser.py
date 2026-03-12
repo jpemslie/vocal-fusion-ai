@@ -1004,6 +1004,152 @@ def _detect_section_start(y_mono: np.ndarray, section: str = "chorus") -> int:
         return 0
 
 
+def _detect_all_sections(y_mono: np.ndarray, n_sections: int = 7) -> list:
+    """
+    Detect structural sections in a track and classify each as:
+      intro / verse / chorus / drop / breakdown / bridge / outro
+
+    Uses MFCC + chroma agglomerative segmentation, then characterises each
+    segment by its RMS energy, spectral brightness and onset density.
+    Returns a list of dicts: {start_s, end_s, label, energy, brightness, density}
+    """
+    try:
+        hop = 512
+        duration_s = len(y_mono) / SR
+
+        # ── Feature extraction ────────────────────────────────────────────────
+        mfcc   = librosa.feature.mfcc(y=y_mono, sr=SR, n_mfcc=13, hop_length=hop)
+        chroma = librosa.feature.chroma_cqt(y=y_mono, sr=SR, hop_length=hop,
+                                            bins_per_octave=36)
+        feats = np.vstack([
+            librosa.util.normalize(mfcc,   norm=2, axis=0),
+            librosa.util.normalize(chroma, norm=2, axis=0),
+        ])
+
+        # ── Boundary detection ────────────────────────────────────────────────
+        k = max(3, min(n_sections, int(duration_s / 25) + 2))
+        boundaries    = librosa.segment.agglomerative(feats, k=k)
+        boundary_times = librosa.frames_to_time(boundaries, sr=SR, hop_length=hop)
+        boundary_times = np.append(boundary_times, duration_s)
+
+        # Per-frame characterisation arrays
+        rms_f  = librosa.feature.rms(y=y_mono, frame_length=2048, hop_length=hop)[0]
+        cen_f  = librosa.feature.spectral_centroid(y=y_mono, sr=SR, hop_length=hop)[0]
+        ons_f  = librosa.onset.onset_strength(y=y_mono, sr=SR, hop_length=hop)
+
+        # ── Build raw section list ────────────────────────────────────────────
+        raw = []
+        for i in range(len(boundary_times) - 1):
+            t_s = float(boundary_times[i])
+            t_e = float(boundary_times[i + 1])
+            if t_e - t_s < 2.0:
+                continue
+            f_s = min(librosa.time_to_frames(t_s, sr=SR, hop_length=hop), len(rms_f) - 1)
+            f_e = min(librosa.time_to_frames(t_e, sr=SR, hop_length=hop), len(rms_f))
+            if f_e <= f_s:
+                continue
+            raw.append({
+                'start_s':   t_s,
+                'end_s':     t_e,
+                'energy':    float(rms_f[f_s:f_e].mean()),
+                'brightness':float(cen_f[f_s:f_e].mean()),
+                'density':   float(ons_f[f_s:f_e].mean()),
+                'label':     'unknown',
+            })
+
+        if not raw:
+            return []
+
+        # ── Normalise features to 0-1 within this track ───────────────────────
+        for key in ('energy', 'brightness', 'density'):
+            vals = np.array([s[key] for s in raw])
+            lo, hi = vals.min(), vals.max()
+            rng = hi - lo if hi - lo > 1e-9 else 1.0
+            for i, s in enumerate(raw):
+                s[key] = float((vals[i] - lo) / rng)
+
+        # ── Classify ──────────────────────────────────────────────────────────
+        total_dur = raw[-1]['end_s']
+        for sec in raw:
+            t_frac = sec['start_s'] / (total_dur + 1e-9)
+            e, b, d = sec['energy'], sec['brightness'], sec['density']
+
+            if   t_frac < 0.15 and e < 0.45:            label = 'intro'
+            elif t_frac > 0.80 and e < 0.45:            label = 'outro'
+            elif e > 0.65 and d > 0.55:                 label = 'chorus'
+            elif e > 0.55 and b > 0.65:                 label = 'drop'
+            elif e < 0.30 and d < 0.35:                 label = 'breakdown'
+            elif e > 0.40:                              label = 'verse'
+            else:                                       label = 'bridge'
+            sec['label'] = label
+
+        return raw
+
+    except Exception as _e:
+        print(f"      [section detect failed: {_e}]", flush=True)
+        return []
+
+
+def _arrangement_gain_curves(beat_secs: list, vox_secs: list,
+                              n_samples: int) -> tuple:
+    """
+    Generate per-sample gain multipliers for the beat and vocal stems based
+    on their detected sections.  Shapes the mix so it has real dynamics:
+
+      Beat intro    → 1.00  (full beat before vocals enter)
+      Beat verse    → 0.82  (step back: vocal owns this space)
+      Beat chorus   → 1.00  (both full — big chorus moment)
+      Beat drop     → 1.00  (EDM drop: maximum beat energy)
+      Beat breakdown→ 0.55  (dramatic pull-back before the drop)
+      Beat bridge   → 0.88
+      Beat outro    → 0.90
+
+      Vocal intro   → 0.85  (ease in — beat has just established itself)
+      Vocal verse   → 1.00
+      Vocal chorus  → 1.08  (push vocal forward on the hook)
+      Vocal drop    → 1.05
+      Vocal breakdown→ 0.92
+      Vocal outro   → 0.88
+
+    Returns (beat_gain, vox_gain) — float32 arrays of length n_samples.
+    """
+    _BEAT_GAIN = {
+        'intro': 1.00, 'verse': 0.82, 'chorus': 1.00,
+        'drop':  1.00, 'breakdown': 0.55, 'bridge': 0.88, 'outro': 0.90,
+    }
+    _VOX_GAIN = {
+        'intro': 0.85, 'verse': 1.00, 'chorus': 1.08,
+        'drop':  1.05, 'breakdown': 0.92, 'bridge': 1.00, 'outro': 0.88,
+    }
+
+    beat_gain = np.ones(n_samples, dtype=np.float32)
+    vox_gain  = np.ones(n_samples, dtype=np.float32)
+
+    for sec in beat_secs:
+        s = int(sec['start_s'] * SR)
+        e = min(int(sec['end_s'] * SR), n_samples)
+        if e > s:
+            beat_gain[s:e] = _BEAT_GAIN.get(sec['label'], 0.90)
+
+    for sec in vox_secs:
+        s = int(sec['start_s'] * SR)
+        e = min(int(sec['end_s'] * SR), n_samples)
+        if e > s:
+            vox_gain[s:e] = _VOX_GAIN.get(sec['label'], 1.00)
+
+    # Smooth every discontinuity with a 200 ms linear ramp to avoid clicks
+    fade_n = int(0.20 * SR)
+    for arr in (beat_gain, vox_gain):
+        jumps = np.where(np.abs(np.diff(arr)) > 0.02)[0]
+        for j in jumps:
+            s = max(0, j - fade_n // 2)
+            e = min(n_samples, j + fade_n // 2)
+            if e > s + 1:
+                arr[s:e] = np.linspace(arr[s], arr[e - 1], e - s)
+
+    return beat_gain, vox_gain
+
+
 def _groove_quantize(vox: np.ndarray, inst_mono: np.ndarray,
                      bpm: float, strength: float = 0.35) -> np.ndarray:
     """
@@ -2624,6 +2770,30 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
     # Groove quantization disabled — causes clicks and can drift timing
     # vox = _groove_quantize(vox, _to_mono(inst), bpm_a, strength=quant_strength)
+
+    # ── Stage 3: Section-aware arrangement gain automation ─────────────────────
+    # Detect all sections in the time-aligned stems and generate per-sample gain
+    # curves that create real dynamic structure instead of a flat overlay:
+    #   - Beat pulls back (0.82x) in verse sections so the vocal owns that space
+    #   - Beat pushes full (1.00x) in chorus/drop — big moment with full energy
+    #   - Beat drops hard (0.55x) in breakdowns — builds tension before the drop
+    #   - Vocal pushes slightly forward (1.08x) on the hook/chorus
+    #   - Both curves are smoothed with 200ms ramps at every boundary (no clicks)
+    print("      Detecting sections for arrangement automation…", flush=True)
+    beat_secs = _detect_all_sections(_to_mono(inst))
+    vox_secs  = _detect_all_sections(_to_mono(vox))
+    if beat_secs:
+        print("      Beat: " + " | ".join(
+            f"{s['label']}@{s['start_s']:.0f}s" for s in beat_secs), flush=True)
+    if vox_secs:
+        print("      Vocal: " + " | ".join(
+            f"{s['label']}@{s['start_s']:.0f}s" for s in vox_secs), flush=True)
+
+    if beat_secs or vox_secs:
+        beat_gc, vox_gc = _arrangement_gain_curves(beat_secs, vox_secs, L)
+        inst = (inst * beat_gc[:, np.newaxis]).astype(np.float32)
+        vox  = (vox  * vox_gc[:, np.newaxis]).astype(np.float32)
+        print("      Arrangement gain curves applied.", flush=True)
 
     # Save pre-mix stems so the auto-correction loop can re-mix without re-separating.
     # Stem separation is the slow step (2-5 min). Mix+master is ~20 seconds.
