@@ -1621,7 +1621,7 @@ def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     return nr.reduce_noise(
         y=vox_mono, sr=SR,
         stationary=False,
-        prop_decrease=0.55,   # raised 0.35→0.55: trap/EDM bleed is dense, needs more suppression
+        prop_decrease=0.35,   # conservative — reference pass in fuse() handles bulk of bleed
         n_fft=2048,
     ).astype(np.float32)
 
@@ -2639,6 +2639,37 @@ def fuse(song_a: str, song_b: str, out_path: str,
         print("      Two-stem Wiener done.", flush=True)
     except Exception as _e:
         print(f"      [Two-stem Wiener failed: {_e} — skipping]", flush=True)
+
+    # Reference-guided noise reduction.
+    # Stage 0 in _process_vocals uses blind spectral gating (no noise sample).
+    # Here we have the ACTUAL source instrumental (stems_b["no_vocals"]) — the
+    # exact music that bled into the vocal stem.  Feeding it as y_noise gives
+    # noisereduce a precise PSD profile of the bleed vs guessing from silence.
+    # prop_decrease=0.50: moderately aggressive — reference accuracy means we
+    # can suppress cleanly without the metallic artifacts of blind over-gating.
+    print("      Reference-guided vocal cleanup (song B instrumental)…", flush=True)
+    try:
+        ref_inst = stems_b["no_vocals"]
+        min_len_nr = min(vox.shape[0], ref_inst.shape[0])
+        vox_ref = np.zeros_like(vox)
+        for c in range(vox.shape[1]):
+            ic = min(c, ref_inst.shape[1] - 1)
+            cleaned = nr.reduce_noise(
+                y=vox[:min_len_nr, c].astype(np.float32),
+                y_noise=ref_inst[:min_len_nr, ic].astype(np.float32),
+                sr=SR,
+                stationary=False,
+                prop_decrease=0.50,
+                n_fft=2048,
+            )
+            vox_ref[:min_len_nr, c] = np.nan_to_num(
+                cleaned, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            if min_len_nr < vox.shape[0]:
+                vox_ref[min_len_nr:, c] = vox[min_len_nr:, c]
+        vox = vox_ref.astype(np.float32)
+        print("      Reference-guided cleanup done.", flush=True)
+    except Exception as _ref_e:
+        print(f"      [Reference noisereduce failed: {_ref_e} — skipping]", flush=True)
 
     ratio   = _best_ratio(bpm_a, bpm_b)
     n_semi  = semitones_to_shift(key_b_root, key_b_mode, key_a_root, key_a_mode)
