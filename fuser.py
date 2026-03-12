@@ -231,11 +231,12 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         # Air shelf: compensate for HF stripped by Demucs mask + de-esser.
         "air_db":       float(np.interp(rap, [0, 1], [2.5, 2.0])),
 
-        # Reverb: rap/trap → tighter room; singing/pop → lusher plate
-        # Research: trap/drill = 3-5% wet; R&B/singing = 15-22% wet
-        "reverb_room":  float(np.interp(rap, [0, 1], [0.20, 0.07])),
-        "reverb_damp":  float(np.interp(rap, [0, 1], [0.65, 0.88])),
-        "reverb_wet":   float(np.interp(rap, [0, 1], [0.10, 0.03])),  # reduced: slap echo covers presence, tail just for space
+        # Reverb: very dry. AI-separated stems already have the original recording's
+        # reverb baked in. Adding more reverb = double-reverb = wash/blur.
+        # Max 4% wet for singing, max 2% for rap. Just enough for space, not blur.
+        "reverb_room":  float(np.interp(rap, [0, 1], [0.15, 0.06])),
+        "reverb_damp":  float(np.interp(rap, [0, 1], [0.70, 0.90])),
+        "reverb_wet":   float(np.interp(rap, [0, 1], [0.04, 0.02])),
 
         # Spectral carve: more bass-heavy → carve deeper. 8-10 dB for house/EDM.
         "carve_db":     float(np.interp(bass, [0, 1], [6.0, 10.0])),
@@ -243,11 +244,10 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         # Sidechain: aggressive beat → more sidechain duck
         "sidechain_mult": float(np.interp(agg, [0, 1], [0.9, 1.2])),
 
-        # Vocal level: vocals need to sit clearly above the beat in the mid-frequency
-        # zone. Using mid-RMS matching now, so this multiplier directly controls
-        # how much louder the vocal is vs the beat at 500-5000 Hz.
-        # 1.5 = vocal is 3.5 dB louder than beat in presence zone.
-        "vocal_level":  float(np.interp(rap, [0, 1], [1.5, 2.0])),
+        # Vocal level: vocals need to dominate the mid-frequency zone clearly.
+        # 2.0 = vocal is 6 dB louder than beat in presence zone.
+        # 3.0 = vocal is 9.5 dB louder — needed for rap over heavy EDM beats.
+        "vocal_level":  float(np.interp(rap, [0, 1], [2.0, 3.0])),
 
         # Complementary EQ: cut instrumental at vocal fundamental zone.
         # Research: male F0 body 200-350 Hz → cut at 280 Hz; female → 380 Hz.
@@ -478,21 +478,25 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
                             window_ms=sc_window_ms,
                             attack_ms=10.0, release_ms=100.0)
 
-        # Evaluate presence using mid-frequency RMS (500-5000 Hz) — the zone
-        # where vocal and beat actually compete. Full-band is misleading because
-        # a bass-heavy beat inflates beat RMS while the vocal clarity zone is buried.
+        # Evaluate presence using mid-frequency RMS (500-5000 Hz).
+        # CRITICAL: use original `inst` (pre-carve), NOT `inst_c` (post-carve).
+        # Using inst_c causes a self-defeating feedback loop: the carve reduces
+        # inst_c's mid energy → presence looks artificially high → loop REDUCES
+        # vocal level_mult → vocal ends up quieter than intended.
+        # Evaluating against original inst gives an accurate picture of how loud
+        # the vocal is relative to the unprocessed beat before any carve benefit.
         vp = _rms_mid(_to_mono(vox_scaled)) / (
-             _rms_mid(_to_mono(inst_c)) + _rms_mid(_to_mono(vox_scaled)) + 1e-9)
+             _rms_mid(_to_mono(inst)) + _rms_mid(_to_mono(vox_scaled)) + 1e-9)
 
         print(f"      Mix iter {iteration+1}: presence={vp:.0%}  "
               f"level_mult={level_mult:.2f}  carve={carve_db:.1f}dB", flush=True)
 
-        if 0.40 <= vp <= 0.65 or iteration == max_iter - 1:
+        if 0.45 <= vp <= 0.70 or iteration == max_iter - 1:
             break
-        elif vp < 0.40:
-            level_mult = min(level_mult * 1.18, 3.0)
+        elif vp < 0.45:
+            level_mult = min(level_mult * 1.20, 4.0)
         else:
-            level_mult = max(level_mult * 0.85, 0.5)
+            level_mult = max(level_mult * 0.88, 1.0)  # floor at 1.0 — never go below starting point
 
     # Mono-safe low end: collapse Side channel below 150 Hz for mono compatibility.
     # Research: hip-hop professional standard is correlation >0.90 below 150 Hz.
@@ -2528,7 +2532,10 @@ def fuse(song_a: str, song_b: str, out_path: str,
     style      = _style_params(beat_char, vox_char)
     vox_params = _analyze_vocal_stem(vox)
     overlap    = _spectral_overlap(_to_mono(vox), _to_mono(inst))
-    sidechain_depth = float(np.clip(overlap * 0.3, 0.07, 0.15))  # reduced: was over-ducking beat during vocals
+    # Sidechain depth: depth=0.37 → beat ducks -4 dB when vocal is at peak.
+    # Previous cap of 0.15 → only -1.6 dB max duck — barely audible. The beat
+    # never stepped back for the vocal, making everything sound cluttered.
+    sidechain_depth = float(np.clip(overlap * 0.6, 0.30, 0.45))
     print(f"      Beat: agg={beat_char['aggressiveness']:.2f}  "
           f"bass={beat_char['bass_weight']:.2f}  "
           f"brightness={beat_char['brightness']:.2f}", flush=True)
