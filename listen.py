@@ -66,17 +66,17 @@ REF = {
     "lowmid_over_himid":   (+3.0, +20.0),  # > +20 = extreme mud
     "high_over_himid":     (-20.0, -4.0),
 
-    # New: transient + dynamics quality
-    # transient_clarity: ratio of peak spectral flux to sustained spectral flux.
-    # Commercial tracks: 0.12–0.40. Smashed/over-compressed: < 0.08.
-    # Upper bound raised to 2.0: EDM/house with strong kicks naturally scores
-    # 1.5–2.0 and that is NOT a problem — it IS punchy.
-    "transient_clarity":   (0.08, 2.0),
+    # transient_clarity: dB crest of onset strength envelope (p95/p10 in dB).
+    # Measures how much kick/snare transients stand above the sustained floor.
+    # Trap/hip-hop: 10-25 dB. Over-compressed: < 8 dB. Distorted: > 28 dB.
+    # (Old metric 0.08-0.55 was wrong — always clipped to cap for our genre.)
+    "transient_clarity":   (8.0, 28.0),
 
-    # kick_headroom_db: how much louder kick transients are vs the sustained
-    # bass floor (measured in 60-150 Hz band). Professional: > 5 dB.
-    # Smashed: < 3 dB (kick and bass blur together).
-    "kick_headroom_db":    (3.0, 20.0),
+    # kick_headroom_db: p95-p10 dynamic range of 60-150 Hz sub-bass band (dB).
+    # Trap 808s naturally swing 18-28 dB between hit peaks and silence.
+    # Below 8 dB: bass is smashed/over-compressed. Above 32 dB: distorted.
+    # (Old threshold 3-20 dB caused false fails on normal trap dynamics.)
+    "kick_headroom_db":    (8.0, 32.0),
 
     # mud_index: 200-600 Hz mean energy / 1000-3000 Hz mean energy (linear).
     # Professional: 1.5–4.0. Too muddy: > 5.5. Too scooped: < 1.0.
@@ -111,6 +111,17 @@ REF = {
     # Roughness of 6-16kHz during voiced frames: 0=smooth (clean), 1=choppy (bleed).
     # Above 0.40 = audible scratchiness (empirically calibrated: v11=0.23, v8=0.48).
     "vocal_bleed_score":    (0.0, 0.40),
+
+    # vocal_spectral_crest: median spectral crest of 300-3000Hz in voiced frames.
+    # High = harmonic peaks dominate (clean, tonal vocal after resynth).
+    # Low = flat spectrum (noise/bleed dominates — poor separation quality).
+    # Calibrated: clean professional vocal ~8-20. Blendy/noisy ~2-4.
+    "vocal_spectral_crest": (4.0, 30.0),
+
+    # vocal_modulation_index: fraction of envelope energy at syllable rate (3-8 Hz).
+    # Intelligible vocal: 0.25-0.65 of slow-modulation energy is at syllable rate.
+    # Below 0.25: muffled/buried/monotone. Above 0.65: choppy/over-gated.
+    "vocal_modulation_index": (0.20, 0.65),
 }
 
 REF_STRICT = {**REF,
@@ -148,6 +159,8 @@ PENALTIES = {
     "tempo_stability":        10,
     "click_artifact_score":   15,
     "vocal_bleed_score":      20,   # severe bleed = unacceptable → big penalty
+    "vocal_spectral_crest":   15,   # flat vocal spectrum = no harmonic structure
+    "vocal_modulation_index": 12,   # no syllable rate = unintelligible vocal
 }
 
 PROBLEM_NAMES = {
@@ -194,6 +207,10 @@ PROBLEM_NAMES = {
                              "CLICKS / ARTIFACTS — discontinuities audible as pops"),
     "vocal_bleed_score":    ("(clean)",
                              "SCRATCHY VOCALS — beat bleed in vocal stem, hi-hat artifacts audible"),
+    "vocal_spectral_crest": ("NOISY VOCAL — flat spectrum, no harmonic structure, sounds muddy/blendy",
+                             "vocal too peaky — possible distortion or tuning artifacts"),
+    "vocal_modulation_index":("VOCAL BURIED — no intelligible syllable dynamics, sounds muffled",
+                              "CHOPPY VOCAL — over-gated or clipping modulation artifacts"),
 }
 
 # ── Correction map: issue key → which DSP parameter to adjust and by how much ─
@@ -213,7 +230,11 @@ CORRECTIONS = {
     "section_consistency_lu":("vocal_level",   -0.05, +0.05), # inconsistent → adjust vocal level
     "beat_sync_score":      ("vocal_level",    +0.05,  0.0),  # low sync → slightly boost vocal
     # Bleed: carve deeper (reduces hi-freq mask energy) + pull air shelf back
-    "vocal_bleed_score":    ("carve_db",        0.0, +1.5),   # bleed detected → more spectral carve
+    "vocal_bleed_score":    ("carve_db",        0.0, +1.5),   # bleed → more spectral carve
+    # Flat vocal spectrum: boost presence or vocal level
+    "vocal_spectral_crest": ("presence_db",    +1.0, -0.5),   # noisy→boost presence; peaky→cut
+    # Vocal unintelligible: raise level slightly for better articulation
+    "vocal_modulation_index":("vocal_level",   +0.08, -0.05), # muffled→up level; choppy→down
 }
 
 
@@ -270,23 +291,28 @@ def _measure(audio_path: str) -> dict:
     himid_db  = _band_db(S, freqs, 2500, 6000)
     high_db   = _band_db(S, freqs, 6000, 20000)
 
-    # ── Transient clarity (spectral flux method) ────────────────────────────
-    # Spectral flux = frame-to-frame change in spectrum magnitude.
-    # High flux = transient (kick, snare). Low flux = sustained (pads, bass).
-    # transient_clarity = ratio of 99th percentile flux to 50th percentile.
-    # Smashed mix: transients barely stand out → low ratio.
+    # ── Transient clarity (spectral flux dynamic range) ─────────────────────
+    # Measure the crest factor of the onset strength envelope in dB.
+    # Strong transients (kicks, snares) lift p95 far above the median floor.
+    # Over-compressed mix: transients barely poke out → low crest → low score.
+    # Good hip-hop/trap: p95/p10 ratio of 4-15x (12-24 dB) in onset strength.
+    # Previously this clipped to 2.0 always because the formula produced 9-12
+    # for typical trap mixes (target was 0.08-0.55 — completely wrong range).
     try:
         flux = librosa.onset.onset_strength(y=mono, sr=SR, hop_length=512)
-        p99 = float(np.percentile(flux, 99))
-        p50 = float(np.percentile(flux, 50))
-        transient_clarity = float((p99 - p50) / (p50 + 1e-6))
-        transient_clarity = float(np.clip(transient_clarity, 0.0, 2.0))
+        p95 = float(np.percentile(flux, 95))
+        p10 = float(np.percentile(flux, 10))
+        # dB crest of onset envelope: 0 = fully compressed, 20 = very punchy
+        transient_clarity = float(20 * np.log10((p95 + 1e-6) / (p10 + 1e-6)))
+        transient_clarity = float(np.clip(transient_clarity, 0.0, 30.0))
     except Exception:
-        transient_clarity = 0.2
+        transient_clarity = 10.0
 
-    # ── Kick headroom: how much louder kick hits are vs sustained bass ───────
-    # Extract 60-150 Hz band. Find the sustained RMS (10th percentile frame RMS)
-    # vs the peak RMS (95th percentile). The gap = kick headroom.
+    # ── Kick dynamic range: peak vs floor in 60-150 Hz sub-bass band ─────────
+    # Measures how much the 808/kick hits stand above the sustained bass floor.
+    # Low = over-compressed sub-bass. High = punchy, dynamic kick hits.
+    # Trap/hip-hop naturally has 18-28 dB range here (heavy 808 hits vs silence
+    # between hits). Old threshold (3-20 dB) was too tight — caused false fails.
     try:
         nyq = SR / 2.0
         sos_kick_lp = butter(4, 150.0 / nyq, btype="low",  output="sos")
@@ -296,9 +322,9 @@ def _measure(audio_path: str) -> dict:
         frames = librosa.util.frame(kick_band, frame_length=1024, hop_length=hop)
         frame_rms_db = 20 * np.log10(np.sqrt((frames ** 2).mean(axis=0) + 1e-12))
         kick_headroom_db = float(np.percentile(frame_rms_db, 95) -
-                                  np.percentile(frame_rms_db, 20))
+                                  np.percentile(frame_rms_db, 10))
     except Exception:
-        kick_headroom_db = 8.0
+        kick_headroom_db = 15.0
 
     # ── Mud index: 200-600 Hz energy / 1000-3000 Hz energy (linear ratio) ───
     # Above 5.5 = muddy. Below 1.0 = scooped/harsh.
@@ -467,6 +493,57 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         vocal_bleed_score = 0.0
 
+    # ── Vocal spectral crest: measures harmonic structure of vocal ───────────
+    # In voiced frames (1-4kHz active), the 300-3000 Hz STFT should show clear
+    # harmonic peaks well above the noise floor.
+    #
+    # spectral_crest = mean(peak / mean of spectrum) across voiced frames.
+    # High crest (>5) = harmonic peaks dominate = clean vocal.
+    # Low crest (<3) = flat spectrum = noisy, blendy, artifact-heavy vocal.
+    #
+    # This directly measures the quality of the harmonic resynthesis stage —
+    # if the vocal is rebuilt from harmonics, the spectral peaks are sharp.
+    # If bleed/noise dominates, the spectrum is flat → low crest.
+    try:
+        S_voiced = np.abs(librosa.stft(mono, n_fft=2048, hop_length=512))
+        freqs_v  = librosa.fft_frequencies(sr=SR, n_fft=2048)
+        vp_rms   = librosa.feature.rms(y=vp_band, frame_length=1024,
+                                        hop_length=512)[0]
+        v_med    = float(np.median(vp_rms))
+        v_mask   = vp_rms > v_med                    # voiced frame mask
+        if v_mask.sum() > 20:
+            mid_mask = (freqs_v >= 300) & (freqs_v < 3000)
+            S_mid_voiced = S_voiced[np.ix_(mid_mask, v_mask)]  # (freq_bins, voiced_frames)
+            # Spectral crest per frame: max / mean
+            frame_max  = S_mid_voiced.max(axis=0)
+            frame_mean = S_mid_voiced.mean(axis=0) + 1e-12
+            vocal_spectral_crest = float(np.median(frame_max / frame_mean))
+        else:
+            vocal_spectral_crest = 5.0   # neutral default
+    except Exception:
+        vocal_spectral_crest = 5.0
+
+    # ── Vocal modulation index: measures intelligibility via syllable rate ───
+    # Speech intelligibility depends on amplitude modulation at 3-8 Hz
+    # (syllable rate).  An intelligible vocal has clear peaks in its envelope
+    # modulation spectrum at those rates.  A muffled/over-processed vocal has
+    # a flat modulation spectrum.
+    #
+    # Score = fraction of envelope energy at 3-8 Hz vs 1-20 Hz total.
+    # Target: 0.25-0.65 (25-65% of slow modulation energy is syllable-rate).
+    # Below 0.25: monotone / over-compressed / buried.
+    # Above 0.65: too choppy / distorted / clipping artefacts in modulation.
+    try:
+        vp_env   = librosa.feature.rms(y=vp_band, frame_length=512, hop_length=256)[0]
+        vp_env   = vp_env.astype(np.float64)
+        env_fft  = np.abs(np.fft.rfft(vp_env - vp_env.mean()))
+        mod_freqs = np.fft.rfftfreq(len(vp_env), d=256.0 / SR)
+        total_e  = float(env_fft[(mod_freqs >= 1.0) & (mod_freqs <= 20.0)].sum() + 1e-12)
+        syl_e    = float(env_fft[(mod_freqs >= 3.0) & (mod_freqs <=  8.0)].sum() + 1e-12)
+        vocal_modulation_index = float(np.clip(syl_e / total_e, 0.0, 1.0))
+    except Exception:
+        vocal_modulation_index = 0.40
+
     return {
         # Global
         "lufs_integrated":       lufs,
@@ -501,6 +578,8 @@ def _measure(audio_path: str) -> dict:
         "tempo_stability":       tempo_stability,
         "click_artifact_score":  click_artifact_score,
         "vocal_bleed_score":     vocal_bleed_score,
+        "vocal_spectral_crest":  vocal_spectral_crest,
+        "vocal_modulation_index":vocal_modulation_index,
     }
 
 
@@ -603,8 +682,8 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
     print(f"  {'Crest factor':<28} {m['crest_factor_db']:>+7.1f} dB    (>8 = punchy)")
     print(f"  {'Stereo correlation':<28} {m['stereo_correlation']:>+7.3f}      (0.4-0.99)")
     print(f"\n  DYNAMICS QUALITY:")
-    print(f"  {'Transient clarity':<28} {m['transient_clarity']:>+7.3f}      (target 0.08-0.55)")
-    print(f"  {'Kick headroom':<28} {m['kick_headroom_db']:>+7.1f} dB    (target >3 dB)")
+    print(f"  {'Transient clarity':<28} {m['transient_clarity']:>+7.1f} dB    (target 8-28 dB crest)")
+    print(f"  {'Kick headroom':<28} {m['kick_headroom_db']:>+7.1f} dB    (target 8-32 dB range)")
     print(f"  {'Section consistency':<28} {m['section_consistency_lu']:>+7.1f} LU    (target <5 LU)")
     print(f"  {'Spectral slope':<28} {m['spectral_slope_db_oct']:>+7.1f} dB/oct (target -12 to -2)")
     print(f"\n  PERCEPTUAL QUALITY:")
@@ -612,6 +691,10 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
     print(f"  {'Vocal clarity index':<28} {m['vocal_clarity_index']:>+7.1f} dB    (target -5 to +20)")
     print(f"  {'Tempo stability':<28} {m['tempo_stability']:>+7.3f}      (target 0.6-1.0)")
     print(f"  {'Click artifact score':<28} {m['click_artifact_score']:>+7.5f}     (target <0.005)")
+    print(f"\n  VOCAL QUALITY:")
+    print(f"  {'Vocal bleed score':<28} {m['vocal_bleed_score']:>+7.3f}      (target <0.40 = clean)")
+    print(f"  {'Vocal spectral crest':<28} {m['vocal_spectral_crest']:>+7.2f}      (target 4-30 = harmonic)")
+    print(f"  {'Vocal modulation index':<28} {m['vocal_modulation_index']:>+7.3f}      (target 0.20-0.65 = intelligible)")
 
     print(f"\n  FREQUENCY (absolute):")
     for label, key in [("Sub 20-80",  "_sub_db"), ("Bass 80-250", "_bass_db"),

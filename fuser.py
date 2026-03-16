@@ -1184,67 +1184,92 @@ def _targeted_hihat_suppression(vox: np.ndarray, drums: np.ndarray) -> np.ndarra
     return out.astype(np.float32)
 
 
-def _harmonic_vocal_enhance(vox: np.ndarray) -> np.ndarray:
+def _harmonic_vocal_process(vox: np.ndarray) -> np.ndarray:
     """
-    Restore vocal harmonics suppressed by the Wiener mask.
+    Combined voice harmonic resynthesis + enhancement in one STFT pass.
 
-    Strategy:
-    1. PYIN F0 tracking on mono sum (robust, handles AutoTune glides).
-    2. In voiced frames: find bins at F0·k (k=1…6), boost by +2 dB (F0)
-       or +1.5 dB (overtones) where energy exists.
-    3. Neighboring bins (±1) get half the boost (smooth spectral peak).
-    4. Unvoiced frames left untouched — no artefact risk.
+    Traditional spectral subtraction (Wiener, hi-hat subtraction) removes bleed
+    globally without knowing the signal model.  This function knows the signal
+    model: a human voice is a sum of harmonics at integer multiples of F0.
+    Anything NOT at those harmonic frequencies is by definition NOT the voice.
 
-    This corrects the mask's tendency to over-suppress low-energy upper
-    harmonics (which share bins with instrument bleed), restoring the
-    "air" and intelligibility of the vocal without adding bleed back.
+    Single PYIN pass → per-frame harmonic mask:
+
+    VOICED frames (PYIN detects F0):
+      • Keep bins within ±BW_BINS of each F0·k (k=1…N_HARM), boosted +1.5 dB
+        to restore energy suppressed by earlier masking stages.
+      • Suppress all other bins to FLOOR (10% of original) — not zero, because
+        noise-modelled consonants (fricative energy between harmonics) matter.
+
+    UNVOICED frames (no stable F0):
+      • Pass through unchanged.  Consonants (S, T, SH, CH) are aperiodic and
+        handled by the earlier oracle Wiener + spectral subtraction stages.
+
+    Final MIX = 65% harmonic-processed + 35% cleaned original.
+    The 35% dry blend preserves consonant naturalness and prevents the
+    resynthesised "pure harmonic" character from sounding too synthetic.
+
+    Effective result: removes residual inter-harmonic bleed that survives the
+    oracle Wiener and targeted spectral subtraction stages, while restoring
+    any harmonics those stages over-suppressed.
     """
     import librosa
 
-    N_FFT  = 2048
-    HOP    = 512
-    FMIN   = 60.0
-    FMAX   = 1000.0
-    DB_F0  = 2.0    # boost at fundamental
-    DB_HRM = 1.5    # boost at overtones
-    MIN_MAG = 1e-6  # skip bins that are essentially silent
+    N_FFT    = 2048
+    HOP      = 512
+    FMIN     = 60.0
+    FMAX     = 1100.0   # soprano can reach ~1050 Hz
+    BW_BINS  = 3        # ±bins kept around each harmonic (±65 Hz @ 44100/2048)
+    N_HARM   = 24       # track up to 24th harmonic (covers up to ~20 kHz for F0=250)
+    FLOOR    = 0.10     # inter-harmonic floor — keeps consonant texture
+    BOOST    = 10 ** (1.5 / 20.0)   # +1.5 dB harmonic boost
+    MIX_DRY  = 0.35     # blend of cleaned original (preserves naturalness)
 
     mono = _to_mono(vox)
     f0, voiced_flag, _ = librosa.pyin(
         mono, fmin=FMIN, fmax=FMAX, sr=SR,
         hop_length=HOP, frame_length=N_FFT)
 
-    freqs = librosa.fft_frequencies(sr=SR, n_fft=N_FFT)
     out = np.zeros_like(vox)
 
     for c in range(vox.shape[1]):
         D   = librosa.stft(vox[:, c], n_fft=N_FFT, hop_length=HOP)
-        mag = np.abs(D).copy()
+        mag = np.abs(D)
         ph  = np.angle(D)
-        gain = np.ones_like(mag)
 
+        mag_proc = mag.copy()
         n_frames = min(len(voiced_flag), mag.shape[1])
+
         for fi in range(n_frames):
             if not voiced_flag[fi] or np.isnan(f0[fi]):
-                continue
+                continue  # unvoiced: passthrough unchanged
+
             f0_hz = float(f0[fi])
-            for harmonic in range(1, 7):
-                freq_hz = f0_hz * harmonic
+
+            # Build harmonic mask for this frame
+            is_harmonic = np.zeros(mag.shape[0], dtype=bool)
+            for k in range(1, N_HARM + 1):
+                freq_hz = f0_hz * k
                 if freq_hz >= SR / 2:
                     break
-                bi = int(np.round(freq_hz * N_FFT / SR))
-                bi = int(np.clip(bi, 0, mag.shape[0] - 1))
-                if mag[bi, fi] < MIN_MAG:
-                    continue
-                db = DB_F0 if harmonic == 1 else DB_HRM
-                gain[bi, fi] *= 10 ** (db / 20.0)
-                for nb in (bi - 1, bi + 1):
-                    if 0 <= nb < mag.shape[0] and mag[nb, fi] >= MIN_MAG:
-                        gain[nb, fi] *= 10 ** (db * 0.5 / 20.0)
+                bi  = int(np.round(freq_hz * N_FFT / SR))
+                lo  = max(0, bi - BW_BINS)
+                hi  = min(mag.shape[0], bi + BW_BINS + 1)
+                is_harmonic[lo:hi] = True
 
-        D_enh = (gain * mag) * np.exp(1j * ph)
-        out[:, c] = librosa.istft(
-            D_enh, length=vox.shape[0], hop_length=HOP, n_fft=N_FFT
+            # Harmonic bins: slight boost (restores Wiener over-suppression)
+            mag_proc[is_harmonic, fi]  = mag[is_harmonic,  fi] * BOOST
+            # Inter-harmonic bins: suppress to floor (keeps some consonant texture)
+            mag_proc[~is_harmonic, fi] = mag[~is_harmonic, fi] * FLOOR
+
+        D_proc      = mag_proc * np.exp(1j * ph)
+        proc_signal = librosa.istft(
+            D_proc, length=vox.shape[0], hop_length=HOP, n_fft=N_FFT
+        ).astype(np.float32)
+
+        # Blend: mostly processed (clean), partly original (natural consonants)
+        out[:, c] = (
+            (1.0 - MIX_DRY) * proc_signal + MIX_DRY * vox[:, c]
         ).astype(np.float32)
 
     return out.astype(np.float32)
@@ -3062,13 +3087,15 @@ def fuse(song_a: str, song_b: str, out_path: str,
             except Exception:
                 pass
 
-        # Harmonic enhancement: restore vocal overtones suppressed by the mask.
-        print("      Harmonic vocal enhancement (PYIN F0 tracking)…", flush=True)
+        # Harmonic resynthesis + enhancement: rebuild vocal from harmonic skeleton.
+        # Removes residual inter-harmonic bleed + boosts harmonics the Wiener
+        # over-suppressed — both in one PYIN pass.
+        print("      Harmonic resynthesis (PYIN F0 skeleton rebuild)…", flush=True)
         try:
-            vox = _harmonic_vocal_enhance(vox)
-            print("      Harmonic enhancement done.", flush=True)
+            vox = _harmonic_vocal_process(vox)
+            print("      Harmonic resynthesis done.", flush=True)
         except Exception as _he:
-            print(f"      [Harmonic enhance failed: {_he} — skipping]", flush=True)
+            print(f"      [Harmonic resynth failed: {_he} — skipping]", flush=True)
 
         # Reference-guided noisereduce (moderate — oracle mask handles bulk).
         if "no_vocals" in stems_b:
