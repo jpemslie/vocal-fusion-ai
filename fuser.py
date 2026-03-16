@@ -3136,45 +3136,61 @@ def fuse(song_a: str, song_b: str, out_path: str,
             print(f"      [Harmonic resynth failed: {_he} — skipping]", flush=True)
 
         # Resemble Enhance: neural perceptual vocal enhancement.
-        # Restores harmonic bandwidth + natural voice character that spectral processing
-        # may have softened. Enhancement-only mode (lambd=0.05) — denoiser disabled
-        # because it fights musical content (same issue as DeepFilterNet).
+        # Runs in a subprocess so a crash/segfault can't kill the main fuse process.
+        # Enhancement-only mode (lambd=0.05) — denoiser disabled (fights musical content).
         try:
-            from resemble_enhance.enhancer.inference import enhance as _re_enhance
-            import torch as _torch
-            # Pre-check: if the model repo clone failed (git-lfs missing), skip gracefully
             import resemble_enhance as _re_pkg
             _re_model_path = Path(_re_pkg.__file__).parent / "model_repo"
-            _re_has_weights = (_re_model_path / "pytorch_model.bin").exists() or \
-                              any((_re_model_path).glob("*.bin")) or \
-                              any((_re_model_path).glob("*.safetensors"))
+            _re_has_weights = any(_re_model_path.rglob("*.pt")) or \
+                              any(_re_model_path.rglob("*.bin")) or \
+                              any(_re_model_path.rglob("*.safetensors"))
             if not _re_has_weights:
                 print("      [Neural enhance: model weights not downloaded — skipping]",
                       flush=True)
             else:
+                # Write vocal to a temp file, run enhance in subprocess, read result back.
+                # Subprocess isolation: if model crashes (MPS/torch conflict), we skip cleanly.
+                import sys as _sys_re, tempfile, subprocess as _sp
                 print("      Neural vocal enhancement (Resemble Enhance)…", flush=True)
-                _vox_t = _torch.from_numpy(vox.T.astype(np.float32))  # (C, N)
-                _enhanced_chs = []
-                for _ci in range(_vox_t.shape[0]):
-                    _ch_tensor = _vox_t[_ci].unsqueeze(0)             # (1, N)
-                    _enh, _sr_enh = _re_enhance(
-                        _ch_tensor, SR,
-                        device="cpu",
-                        nfe=8,         # 8 diffusion steps — fast on CPU
-                        solver="midpoint",
-                        lambd=0.05,    # 0.0=full enhance, 1.0=denoise only; 0.05=mostly enhance
-                        tau=0.5,
-                    )
-                    _enhanced_chs.append(_enh.squeeze(0).numpy())
-                _vox_enh = np.stack(_enhanced_chs, axis=1).astype(np.float32)  # (N, C)
-                # Safety: don't allow enhancement to increase peak more than 12dB
-                _peak_before = np.abs(vox).max() + 1e-9
-                _peak_after  = np.abs(_vox_enh).max() + 1e-9
-                if _peak_after / _peak_before < 4.0:
-                    vox = _vox_enh
-                    print("      Neural vocal enhancement done.", flush=True)
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as _tf_in:
+                    _re_in = _tf_in.name
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as _tf_out:
+                    _re_out = _tf_out.name
+                sf.write(_re_in, vox, SR, subtype="PCM_24")
+                _re_script = (
+                    "import sys, numpy as np, soundfile as sf, torch\n"
+                    "from resemble_enhance.enhancer.inference import enhance\n"
+                    "vox, sr = sf.read(sys.argv[1], always_2d=True)\n"
+                    "vox = vox.astype(np.float32)\n"
+                    "enhanced = []\n"
+                    "for c in range(vox.shape[1]):\n"
+                    "    t = torch.from_numpy(vox[:, c])  # 1D — enhance() requires (N,)\n"
+                    "    e, _ = enhance(t, sr, device='cpu', nfe=8, solver='midpoint', lambd=0.05, tau=0.5)\n"
+                    "    enhanced.append(e.numpy())\n"
+                    "out = np.stack(enhanced, axis=1).astype(np.float32)\n"
+                    "sf.write(sys.argv[2], out, sr, subtype='PCM_24')\n"
+                )
+                _re_proc = _sp.run(
+                    [_sys_re.executable, "-c", _re_script, _re_in, _re_out],
+                    capture_output=True, text=True, timeout=600,
+                )
+                if _re_proc.returncode == 0:
+                    _vox_enh, _ = sf.read(_re_out, always_2d=True)
+                    _vox_enh = _vox_enh.astype(np.float32)
+                    _peak_before = np.abs(vox).max() + 1e-9
+                    _peak_after  = np.abs(_vox_enh).max() + 1e-9
+                    if _peak_after / _peak_before < 4.0 and _vox_enh.shape == vox.shape:
+                        vox = _vox_enh
+                        print("      Neural vocal enhancement done.", flush=True)
+                    else:
+                        print("      [Neural enhance: output invalid — skipping]", flush=True)
                 else:
-                    print("      [Neural enhance: peak gain too high — skipping]", flush=True)
+                    print(f"      [Neural enhance subprocess failed (rc={_re_proc.returncode}) — skipping]",
+                          flush=True)
+                try:
+                    os.unlink(_re_in); os.unlink(_re_out)
+                except OSError:
+                    pass
         except ImportError:
             pass   # resemble-enhance not installed — silently skip
         except Exception as _ree:
