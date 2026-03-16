@@ -214,7 +214,8 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         # FET compressor: rap/trap → faster, harder
         # Ratio cap 6:1 (was 8:1 — over-squashed vocal, LRA collapsed to 2.5 LU)
         # Release min 60ms (was 40ms — too fast, caused pumping artifacts)
-        "fet_ratio":    float(np.interp(rap, [0, 1], [3.5, 6.0])),
+        # Non-rap floor 2.2:1 (was 3.5:1 — over-squashing caused unnatural dynamics)
+        "fet_ratio":    float(np.interp(rap, [0, 1], [2.2, 6.0])),
         "fet_attack":   float(np.interp(rap, [0, 1], [5.0, 3.0])),
         "fet_release":  float(np.interp(agg, [0, 1], [120.0, 60.0])),
 
@@ -1220,10 +1221,17 @@ def _harmonic_vocal_process(vox: np.ndarray) -> np.ndarray:
     FMIN     = 60.0
     FMAX     = 1100.0   # soprano can reach ~1050 Hz
     BW_BINS  = 3        # ±bins kept around each harmonic (±65 Hz @ 44100/2048)
-    N_HARM   = 24       # track up to 24th harmonic (covers up to ~20 kHz for F0=250)
-    FLOOR    = 0.10     # inter-harmonic floor — keeps consonant texture
+    N_HARM   = 24       # track up to 24th harmonic
+    FLOOR    = 0.10     # inter-harmonic floor in hi-hat zone
     BOOST    = 10 ** (1.5 / 20.0)   # +1.5 dB harmonic boost
-    MIX_DRY  = 0.35     # blend of cleaned original (preserves naturalness)
+    MIX_DRY  = 0.50     # 50% original — prevents vocoder character
+
+    # KEY: only suppress inter-harmonic content ABOVE HH_BIN.
+    # Below that, the voice character (formants, vowels) lives — leave it alone.
+    # The 0-4kHz band makes the voice sound human; suppressing it sounds robotic.
+    # 4-16kHz is where hi-hat bleed lives — safe to apply harmonic mask there.
+    freqs_v = librosa.fft_frequencies(sr=SR, n_fft=N_FFT)
+    HH_BIN  = int(np.searchsorted(freqs_v, 4000.0))   # ~186 @ 44100/2048
 
     mono = _to_mono(vox)
     f0, voiced_flag, _ = librosa.pyin(
@@ -1258,9 +1266,13 @@ def _harmonic_vocal_process(vox: np.ndarray) -> np.ndarray:
                 is_harmonic[lo:hi] = True
 
             # Harmonic bins: slight boost (restores Wiener over-suppression)
-            mag_proc[is_harmonic, fi]  = mag[is_harmonic,  fi] * BOOST
-            # Inter-harmonic bins: suppress to floor (keeps some consonant texture)
-            mag_proc[~is_harmonic, fi] = mag[~is_harmonic, fi] * FLOOR
+            mag_proc[is_harmonic, fi] = mag[is_harmonic, fi] * BOOST
+            # Inter-harmonic suppression ABOVE 4kHz only — this is where hi-hat bleed lives.
+            # Below 4kHz: voice formants, vowel character, fundamental body — leave untouched.
+            # Suppressing below 4kHz creates vocoder/robotic effect.
+            bin_idx = np.arange(mag.shape[0])
+            suppress_mask = ~is_harmonic & (bin_idx >= HH_BIN)
+            mag_proc[suppress_mask, fi] = mag[suppress_mask, fi] * FLOOR
 
         D_proc      = mag_proc * np.exp(1j * ph)
         proc_signal = librosa.istft(
@@ -2062,7 +2074,7 @@ def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     return nr.reduce_noise(
         y=vox_mono, sr=SR,
         stationary=False,
-        prop_decrease=0.35,   # conservative — reference pass in fuse() handles bulk of bleed
+        prop_decrease=0.15,   # light touch — oracle Wiener+harmonic already removed bleed; avoid artifacts
         n_fft=2048,
     ).astype(np.float32)
 
@@ -2337,6 +2349,15 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         ),
     ])
     vox_ch = dyn_board(vox_ch, SR).astype(np.float32)
+
+    # Stage 5b: parallel tape saturation (adds warmth/harmonics without artifacts)
+    # Now safe because bleed is removed by oracle Wiener + harmonic mask.
+    # Saturation without bleed = harmonic richness; with bleed = mud/distortion.
+    # Approach: soft-clip (tanh) at 20% wet — warms the compressed signal without smearing.
+    SAT_DRIVE = 1.4   # drive factor — gentle overdrive into tanh
+    SAT_WET   = 0.20  # 20% wet blend — adds body without muddying transients
+    sat_sig = np.tanh(vox_ch * SAT_DRIVE) / SAT_DRIVE   # gain-compensated tanh
+    vox_ch = ((1.0 - SAT_WET) * vox_ch + SAT_WET * sat_sig).astype(np.float32)
 
     # Stage 6: presence + air shelf
     # The +4dB shelf at 1500Hz was causing hi-mid harshness (2.5-6kHz too loud).
