@@ -202,8 +202,9 @@ def get_corrections(
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        # No API key — silently fall back to lookup table in fuser.py
-        return {}
+        # No API key — use built-in causal decision tree (understands root causes,
+        # not just metric→delta mapping like the simple lookup table)
+        return _causal_corrections(metrics, issues, current_params, history)
 
     try:
         import anthropic
@@ -334,3 +335,93 @@ def _format_history(history: list) -> str:
             f"params=[{p_str}]  failing=[{issues_str}]"
         )
     return "\n".join(lines)
+
+
+def _causal_corrections(metrics: dict, issues: list, current_params: dict,
+                         history: list) -> dict:
+    """
+    Causal decision tree — works without Claude API key.
+
+    Encodes the same diagnostic logic as the Claude system prompt:
+    identifies ROOT CAUSES rather than blindly mapping metric→delta.
+    Checks history to avoid repeating failed adjustments.
+
+    Returns absolute param values (same format as Claude director output).
+    """
+    adj = {}
+    issue_keys = {i[1] for i in issues}
+    m = metrics
+    p = current_params
+
+    # Helper: get previously tried values for a param, to avoid repeating failures
+    def _tried(param):
+        return [h["params"].get(param) for h in history if param in h.get("params", {})]
+
+    def _set(param, val):
+        lo, hi = PARAM_BOUNDS.get(param, (None, None))
+        if lo is not None:
+            val = max(lo, min(hi, val))
+        # Don't repeat a value we already tried (within 5% tolerance)
+        for tried_val in _tried(param):
+            if tried_val is not None and abs(tried_val - val) / (abs(tried_val) + 1e-6) < 0.05:
+                return  # already tried this — skip
+        adj[param] = val
+
+    bleed  = m.get("vocal_bleed_score", 0.0)
+    crest  = m.get("vocal_spectral_crest", 10.0)
+    modul  = m.get("vocal_modulation_index", 0.35)
+    clarity = m.get("vocal_clarity_index", 5.0)
+    lra    = m.get("lra_lu", 8.0)
+    lufs   = m.get("lufs_integrated", -12.0)
+
+    # ── Vocal bleed too high ────────────────────────────────────────────────
+    if "vocal_bleed_score" in issue_keys:
+        if crest < 4.0:
+            # Bleed survived harmonic resynth — tighten the source (bleed cause)
+            _set("harmonic_mix_dry",   max(0.30, p.get("harmonic_mix_dry", 0.50) - 0.10))
+            _set("drum_weight_hh",     min(5.0,  p.get("drum_weight_hh", 3.5) + 0.7))
+            _set("wiener_mask_floor",  max(0.04, p.get("wiener_mask_floor", 0.08) - 0.02))
+        else:
+            # Spectral crest OK → broadband noise, not hi-hat bleed
+            _set("noisereduce_strength", min(0.40, p.get("noisereduce_strength", 0.15) + 0.10))
+            _set("hihat_alpha",          min(0.95, p.get("hihat_alpha", 0.90) + 0.03))
+
+    # ── Vocal spectral crest too low (vocal sounds flat/noisy) ─────────────
+    if "vocal_spectral_crest" in issue_keys and bleed <= 0.40:
+        # Crest low but bleed OK → compression squashing harmonic peaks
+        _set("presence_db", min(4.0, p.get("presence_db", 2.0) + 0.8))
+        _set("air_db",      min(5.0, p.get("air_db", 2.5) + 0.5))
+
+    # ── Vocal modulation too low (rhythm/syllables lost) ───────────────────
+    if "vocal_modulation_index" in issue_keys and modul < 0.20:
+        _set("vocal_level", min(4.0, p.get("vocal_level", 2.1) + 0.20))
+        _set("carve_db",    max(3.0, p.get("carve_db", 10.0) - 1.0))
+
+    # ── Vocal modulation too high (choppy/gated sound) ─────────────────────
+    if "vocal_modulation_index" in issue_keys and modul > 0.65:
+        _set("wiener_mask_floor",  min(0.15, p.get("wiener_mask_floor", 0.08) + 0.03))
+        _set("noisereduce_strength", max(0.05, p.get("noisereduce_strength", 0.15) - 0.05))
+
+    # ── Vocal clarity too low (bass masking voice) ──────────────────────────
+    if "vocal_clarity_index" in issue_keys and clarity < -5.0:
+        _set("carve_db",    min(12.0, p.get("carve_db", 10.0) + 1.5))
+        _set("presence_db", min(4.0,  p.get("presence_db", 2.0) + 0.5))
+
+    # ── LUFS out of range ───────────────────────────────────────────────────
+    if "lufs_integrated" in issue_keys:
+        if lufs < -14.0:
+            _set("lufs_target", min(-9.0, p.get("lufs_target", -12.0) + 1.5))
+        elif lufs > -7.0:
+            _set("lufs_target", max(-16.0, p.get("lufs_target", -12.0) - 1.5))
+
+    # ── LRA too low (over-compressed) ───────────────────────────────────────
+    if "lra_lu" in issue_keys and lra < 3.5:
+        _set("lufs_target", max(-16.0, p.get("lufs_target", -12.0) - 1.0))
+
+    # ── LRA too high (too dynamic) ──────────────────────────────────────────
+    if "lra_lu" in issue_keys and lra > 14.0:
+        _set("lufs_target", min(-9.0, p.get("lufs_target", -12.0) + 1.0))
+
+    if adj:
+        print(f"  [Built-in director] Causal corrections: {adj}", flush=True)
+    return adj
