@@ -893,24 +893,22 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
             finally:
                 shutil.rmtree(str(tmp_dir), ignore_errors=True)
         else:
-            # CPU path: Demucs htdemucs_ft 4-stem for oracle stems,
-            # then MDX-Net Kim Vocal 2 to upgrade the vocal stem quality.
-            # Demucs gives the best oracle (drums/bass/other separately).
-            # MDX-Net gives cleaner vocal (SDR ~9.5 vs Demucs ~8.5).
-            # STFT-domain blend of both vocals = best of both models.
+            # CPU path: Demucs htdemucs_ft 4-stem for oracle stems.
             print("      CPU path: Demucs htdemucs_ft 4-stem (oracle stems)…", flush=True)
             _separate_demucs(audio_path, cached)
-            # Only upgrade vocal stem for the vocal source song (Song B), not the beat.
-            # MDX-Net loads ~2GB ONNX model in-process; running it on Song A wastes
-            # memory and caused OOM on the beat separation which doesn't use vocals.
-            _sentinel = cached / "_mdx_vocal_upgraded"
-            if upgrade_vocal and not _sentinel.exists():
-                try:
-                    _upgrade_vocal_mdx(audio_path, cached, cache_dir)
-                    _sentinel.touch()
-                except Exception as _me:
-                    print(f"      [MDX-Net vocal upgrade failed: {_me} — using Demucs vocal]",
-                          flush=True)
+
+    # MDX-Net vocal upgrade runs AFTER the cache check so it applies even when
+    # vocals.wav was already cached from a previous (non-upgraded) Demucs run.
+    # Sentinel ensures it only runs once per song.
+    if upgrade_vocal and not _has_gpu():
+        _sentinel = cached / "_mdx_vocal_upgraded"
+        if not _sentinel.exists():
+            try:
+                _upgrade_vocal_mdx(audio_path, cached, cache_dir)
+                _sentinel.touch()
+            except Exception as _me:
+                print(f"      [MDX-Net vocal upgrade failed: {_me} — using Demucs vocal]",
+                      flush=True)
 
     stems = {}
     for name in ("vocals", "no_vocals", "drums", "bass", "other"):
