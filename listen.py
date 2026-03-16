@@ -106,6 +106,11 @@ REF = {
     # click_artifact_score: % samples where |diff| > 10x diff RMS.
     # Above 0.005 = audible clicks/pops.
     "click_artifact_score": (0.0, 0.005),
+
+    # vocal_bleed_score: hi-hat-band roughness vs vocal-presence-band roughness.
+    # 0.0 = clean vocals, no beat bleed. Above 0.45 = audible scratchiness.
+    # Above 0.70 = severe bleed — reject before playback.
+    "vocal_bleed_score":    (0.0, 0.45),
 }
 
 REF_STRICT = {**REF,
@@ -142,6 +147,7 @@ PENALTIES = {
     "vocal_clarity_index":    12,
     "tempo_stability":        10,
     "click_artifact_score":   15,
+    "vocal_bleed_score":      20,   # severe bleed = unacceptable → big penalty
 }
 
 PROBLEM_NAMES = {
@@ -186,6 +192,8 @@ PROBLEM_NAMES = {
                              "too rigid (N/A)"),
     "click_artifact_score": ("(clean)",
                              "CLICKS / ARTIFACTS — discontinuities audible as pops"),
+    "vocal_bleed_score":    ("(clean)",
+                             "SCRATCHY VOCALS — beat bleed in vocal stem, hi-hat artifacts audible"),
 }
 
 # ── Correction map: issue key → which DSP parameter to adjust and by how much ─
@@ -400,6 +408,48 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         click_artifact_score = 0.0
 
+    # ── Vocal bleed score: detects beat artifacts (hi-hats, drums) bleeding ──
+    # into the vocal, causing the characteristic "scratchy" sound.
+    #
+    # Method: beat bleed creates rhythmically-modulated energy in the 6-16kHz
+    # hi-hat range. We compute the ROUGHNESS of the 6-16kHz band — how
+    # choppy/modulated it is frame-to-frame. A clean vocal-over-beat mix has
+    # SMOOTH high-frequency energy (hi-hats are part of the beat, not inside
+    # the voice). Vocal bleed makes the 6-16kHz modulate with vocal syllable
+    # timing → high roughness correlated with vocal onsets = scratchiness.
+    #
+    # vocal_bleed_score: 0.0 = no bleed (clean), 1.0 = severe artifact bleed.
+    # Computed as: hi-hat band roughness / (mid vocal band roughness + eps)
+    # Clean mix: hi-hat roughness ≈ mid roughness → ratio ≈ 1 → score ≈ 0
+    # Bleed mix: hi-hat roughness >> mid roughness → ratio >> 1 → score high
+    try:
+        nyq = SR / 2.0
+        hop_b = 512
+        # Extract hi-hat band (6-16kHz) and vocal-presence band (1-4kHz)
+        sos_hh_hp = butter(4,  6000.0 / nyq, btype="high", output="sos")
+        sos_hh_lp = butter(4, 16000.0 / nyq, btype="low",  output="sos")
+        sos_vp_hp = butter(4,  1000.0 / nyq, btype="high", output="sos")
+        sos_vp_lp = butter(4,  4000.0 / nyq, btype="low",  output="sos")
+
+        hh_band = sosfilt(sos_hh_lp, sosfilt(sos_hh_hp, mono, axis=0))
+        vp_band = sosfilt(sos_vp_lp, sosfilt(sos_vp_hp, mono, axis=0))
+
+        # Frame-level RMS
+        hh_frames = librosa.feature.rms(y=hh_band, frame_length=1024, hop_length=hop_b)[0]
+        vp_frames = librosa.feature.rms(y=vp_band, frame_length=1024, hop_length=hop_b)[0]
+
+        # Roughness = normalised standard deviation of the RMS envelope
+        # High roughness = rapid, choppy energy changes = bleed artifacts
+        hh_rough = float(hh_frames.std() / (hh_frames.mean() + 1e-9))
+        vp_rough = float(vp_frames.std() / (vp_frames.mean() + 1e-9))
+
+        # Bleed ratio: hi-hat roughness should be similar to or lower than vocal
+        # presence roughness in a clean mix. If hh_rough >> vp_rough → bleed.
+        bleed_ratio = float(hh_rough / (vp_rough + 1e-9))
+        vocal_bleed_score = float(np.clip((bleed_ratio - 0.8) / 1.4, 0.0, 1.0))
+    except Exception:
+        vocal_bleed_score = 0.0
+
     return {
         # Global
         "lufs_integrated":       lufs,
@@ -433,6 +483,7 @@ def _measure(audio_path: str) -> dict:
         "vocal_clarity_index":   vocal_clarity_index,
         "tempo_stability":       tempo_stability,
         "click_artifact_score":  click_artifact_score,
+        "vocal_bleed_score":     vocal_bleed_score,
     }
 
 
