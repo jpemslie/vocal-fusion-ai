@@ -257,6 +257,158 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
     }
 
 
+def _beat_sonic_fingerprint(inst_mono: np.ndarray, bpm: float) -> dict:
+    """
+    Extract the beat's sonic DNA — the characteristics that make it sound the way
+    it does.  Used to re-produce the vocal so both elements feel native to the
+    same session rather than transplanted from different worlds.
+
+    Returns a dict of 0-1 scores:
+      saturation     — 0=clean/digital, 1=warm/driven/saturated
+      brightness     — 0=dark/sub-heavy, 1=bright/crispy/airy
+      reverb_tail    — 0=punchy/dry, 1=spacious/wet/roomy
+      dynamic_feel   — 0=crushed/heavily compressed, 1=open/dynamic
+      texture        — 0=smooth/polished, 1=gritty/distorted/rough
+      transient_punch— 0=soft/smooth attacks, 1=sharp/hard-hitting kicks
+    """
+    clip = inst_mono[:SR * 30].astype(np.float32)
+    hop  = 512
+    n_fft = 2048
+
+    S     = np.abs(librosa.stft(clip, n_fft=n_fft, hop_length=hop))
+    freqs = librosa.fft_frequencies(sr=SR, n_fft=n_fft)
+
+    def band_e(lo, hi):
+        m = (freqs >= lo) & (freqs < hi)
+        return float(S[m].mean()) if m.any() else 1e-9
+
+    # Saturation: ratio of harmonic zone (600-2kHz) to fundamental zone (150-600Hz)
+    # Saturated/driven signal generates extra harmonic content above the fundamental.
+    sat_raw = band_e(600, 2000) / (band_e(150, 600) + 1e-9)
+    saturation = float(np.clip((sat_raw - 0.4) / 1.6, 0, 1))
+
+    # Brightness: spectral slope from 200 Hz to 6 kHz
+    oct_bands = [(200,400),(400,800),(800,1600),(1600,3200),(3200,6400)]
+    oct_db    = [20*np.log10(band_e(lo, hi)+1e-9) for lo, hi in oct_bands]
+    try:
+        slope = float(np.polyfit(range(len(oct_db)), oct_db, 1)[0])
+    except Exception:
+        slope = -5.0
+    brightness = float(np.clip((slope + 10.0) / 10.0, 0, 1))  # -10→0, 0→1
+
+    # Reverb tail: ratio of onset envelope valley (tail) to peak (transient)
+    onset_env = librosa.onset.onset_strength(y=clip, sr=SR, hop_length=hop)
+    p75 = float(np.percentile(onset_env, 75)) + 1e-9
+    p25 = float(np.percentile(onset_env, 25))
+    reverb_tail = float(np.clip(p25 / p75, 0, 1))
+
+    # Dynamic feel: RMS envelope peak-to-floor ratio
+    # Low ratio (≤2) = heavily compressed/flat, high (≥8) = very dynamic
+    rms_f = librosa.feature.rms(y=clip, frame_length=n_fft, hop_length=hop)[0]
+    rms_ratio = float(np.percentile(rms_f, 90) / (np.percentile(rms_f, 10) + 1e-9))
+    dynamic_feel = float(np.clip((rms_ratio - 1.5) / 6.0, 0, 1))
+
+    # Texture: spectral flatness — 0=tonal/smooth, 1=noisy/gritty
+    flatness = float(librosa.feature.spectral_flatness(y=clip).mean())
+    texture  = float(np.clip(flatness / 0.08, 0, 1))
+
+    # Transient punch: onset peak vs mean — sharp peaks = punchy kick energy
+    if len(onset_env) > 10:
+        tp = float(np.percentile(onset_env, 95) / (onset_env.mean() + 1e-9))
+        transient_punch = float(np.clip((tp - 1.0) / 6.0, 0, 1))
+    else:
+        transient_punch = 0.5
+
+    return {
+        "saturation":      round(saturation, 3),
+        "brightness":      round(brightness, 3),
+        "reverb_tail":     round(reverb_tail, 3),
+        "dynamic_feel":    round(dynamic_feel, 3),
+        "texture":         round(texture, 3),
+        "transient_punch": round(transient_punch, 3),
+        "_bpm":            bpm,
+    }
+
+
+def _produce_vocal_for_beat(vox: np.ndarray, fp: dict, bpm: float) -> np.ndarray:
+    """
+    Re-produce the vocal to sound like it belongs in the beat's sonic universe.
+
+    A producer listening to a beat before recording vocals would instinctively
+    choose:  the right amount of saturation, the right room/reverb character,
+    the right tonal brightness, and BPM-synced effects for cohesion.
+    We do this analytically from the beat fingerprint (fp).
+
+    Stages:
+      1. Character saturation  — match the beat's warmth/harmonic richness
+      2. Tonal integration     — spectral tilt so vocal complements (not clashes with) beat
+      3. Beat-matched reverb   — room size and pre-delay tuned to beat's space
+      4. BPM-synced delay      — 1/8-note echo locks vocal timing to beat grid
+      5. Dynamic feel matching — if beat is squashed, vocal gets matching glue comp
+    """
+    result = vox.copy().astype(np.float32)
+
+    # ── 1. Character saturation ───────────────────────────────────────────────
+    # Parallel tanh drive: warm if beat is saturated/driven, clean if digital.
+    # Applied at 10-18% wet — enough to match character, never distort the vocal.
+    sat_wet = float(np.interp(fp["saturation"], [0.2, 0.8], [0.0, 0.18]))
+    if sat_wet > 0.02:
+        drive   = float(np.interp(fp["saturation"], [0.2, 0.8], [0.8, 1.8]))
+        vox_M   = ((result[:, 0] + result[:, 1]) / 2.0).astype(np.float64)
+        sat_sig = (np.tanh(vox_M * drive) / (drive + 1e-9)).astype(np.float32)
+        sat_st  = np.stack([sat_sig, sat_sig], axis=1)
+        result  = (result * (1.0 - sat_wet) + sat_st * sat_wet).astype(np.float32)
+
+    # ── 2. Tonal integration ──────────────────────────────────────────────────
+    # Dark beat → vocal needs extra presence (+2 dB shelf at 3 kHz) to cut through.
+    # Bright beat → vocal needs warmth (+1.5 dB shelf at 250 Hz) to not sound thin.
+    dark_presence_db  = float(np.interp(fp["brightness"], [0.2, 0.7], [2.0, 0.0]))
+    bright_warmth_db  = float(np.interp(fp["brightness"], [0.3, 0.8], [0.0, 1.5]))
+    tonal_eq = Pedalboard([
+        LowShelfFilter( cutoff_frequency_hz=250.0,  gain_db=bright_warmth_db),
+        HighShelfFilter(cutoff_frequency_hz=3000.0, gain_db=dark_presence_db),
+    ])
+    result = tonal_eq(result.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # ── 3. Beat-matched reverb ────────────────────────────────────────────────
+    # Room size and damping derived from the beat's own reverb character.
+    # Pre-delay synced to a 16th note at the beat's BPM — rhythmically cohesive.
+    # Damping: bright beat → less damped (airy tail), dark → more damped (murky).
+    room   = float(np.interp(fp["reverb_tail"],  [0.0, 1.0], [0.06, 0.28]))
+    damp   = float(np.interp(fp["brightness"],   [0.0, 1.0], [0.85, 0.40]))
+    wet    = float(np.interp(fp["reverb_tail"],  [0.0, 1.0], [0.02, 0.09]))
+    rev_board = Pedalboard([Reverb(room_size=room, damping=damp,
+                                   wet_level=wet, dry_level=1.0)])
+    predelay_samps = int(60000.0 / bpm / 4.0 * SR / 1000)  # 16th-note pre-delay
+    # Pre-delay: shift the signal before feeding into reverb, then recombine
+    vox_shifted = np.zeros_like(result)
+    if 0 < predelay_samps < len(result):
+        vox_shifted[predelay_samps:] = result[:-predelay_samps]
+    rev_out = rev_board(vox_shifted.T.astype(np.float32), SR).T.astype(np.float32)
+    result  = np.clip(result + rev_out * 0.6, -1.0, 1.0).astype(np.float32)
+
+    # ── 4. BPM-synced 1/8-note delay ─────────────────────────────────────────
+    # Subtle slapback at the 8th-note interval locks the vocal to the beat grid.
+    # Producers always sync delays to tempo — it's what makes a vocal feel "in"
+    # the track rather than floating over it.  6% wet = subtle glue, not echo.
+    delay_samps = int(60000.0 / bpm / 2.0 * SR / 1000)   # 8th note
+    if 0 < delay_samps < len(result) // 2:
+        delay_sig          = np.zeros_like(result)
+        delay_sig[delay_samps:] = result[:-delay_samps] * 0.45  # -7dB echo
+        result = np.clip(result + delay_sig * 0.06, -1.0, 1.0).astype(np.float32)
+
+    # ── 5. Dynamic feel matching ──────────────────────────────────────────────
+    # Heavily compressed beat (dynamic_feel < 0.3) → light glue comp on vocal.
+    # Both elements then breathe and pump together instead of fighting each other.
+    if fp["dynamic_feel"] < 0.35:
+        glue_ratio = float(np.interp(fp["dynamic_feel"], [0.0, 0.35], [2.8, 1.5]))
+        glue = Pedalboard([Compressor(threshold_db=-16.0, ratio=glue_ratio,
+                                      attack_ms=25.0, release_ms=180.0)])
+        result = glue(result.T.astype(np.float32), SR).T.astype(np.float32)
+
+    return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
 def _smart_key_shift(n_semi: int, key_b_root: int, key_b_mode: str,
                      key_a_root: int, key_a_mode: str) -> tuple:
     """
@@ -2754,6 +2906,19 @@ def fuse(song_a: str, song_b: str, out_path: str,
                           target_root=key_a_root, target_mode=key_a_mode,
                           bpm=bpm_a)
     vox = _check(vox, "post-vocal-chain")
+
+    # ── Vocal Production for Beat ──────────────────────────────────────────────
+    # The vocal was produced for Song B's sonic universe. This step re-produces
+    # it for Song A's world: matching saturation character, reverb space, tonal
+    # tilt, BPM-synced delay, and dynamic feel — making both elements feel like
+    # they came from the same session rather than being pasted together.
+    print("      Analyzing beat sonic fingerprint…", flush=True)
+    fp = _beat_sonic_fingerprint(_to_mono(inst), bpm_a)
+    print(f"      Fingerprint: sat={fp['saturation']:.2f}  bright={fp['brightness']:.2f}  "
+          f"reverb={fp['reverb_tail']:.2f}  dynamic={fp['dynamic_feel']:.2f}  "
+          f"texture={fp['texture']:.2f}  punch={fp['transient_punch']:.2f}", flush=True)
+    vox = _produce_vocal_for_beat(vox, fp, bpm_a)
+    vox = _check(vox, "post-vocal-production")
 
     step(8, TOTAL, "Mixing (chorus-align + beat-snap + spectral carve + M/S + sidechain)…")
 
