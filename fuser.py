@@ -1091,8 +1091,8 @@ def _oracle_wiener_clean(vox: np.ndarray,
 
     N_FFT = 2048
     HH_LO, HH_HI = 4000, 16000   # hi-hat range for extra drum suppression
-    DRUM_WEIGHT  = 2.0            # drums count 2× as interference in hi-hat band
-    MASK_FLOOR   = 0.10
+    DRUM_WEIGHT  = 3.5            # drums count 3.5× as interference in hi-hat band
+    MASK_FLOOR   = 0.08           # lower floor (oracle accuracy → can suppress more)
 
     freqs = librosa.fft_frequencies(sr=SR, n_fft=N_FFT)
     hh_bins = (freqs >= HH_LO) & (freqs <= HH_HI)
@@ -1128,6 +1128,60 @@ def _oracle_wiener_clean(vox: np.ndarray,
             D_clean, length=vox.shape[0], n_fft=N_FFT).astype(np.float32)
 
     return vox_clean.astype(np.float32)
+
+
+def _targeted_hihat_suppression(vox: np.ndarray, drums: np.ndarray) -> np.ndarray:
+    """
+    Spectral subtraction of drum-stem hi-hat content from vocal in 6-16 kHz.
+
+    After oracle Wiener mask reduces bleed by ~70-80%, this stage handles
+    the residual.  Uses the drum stem as a direct noise reference:
+
+        mag_out[hh] = max(|V[hh]| - α·|D[hh]|, β·|V[hh]|)
+
+    α = subtraction strength (0.90 — aggressive but leaves a floor)
+    β = spectral floor (0.06 = 6% of original remains — protects sibilants)
+
+    The floor β ensures we never mute genuine vocal sibilants (S/SH/CH),
+    which share the hi-hat frequency range.  Without it, suppression creates
+    a "hole" that sounds worse than light bleed.
+    """
+    import librosa
+
+    N_FFT  = 2048
+    HH_LO  = 6000    # Hz — upper hi-hat range only (more sibilant-safe than 4kHz)
+    HH_HI  = 16000   # Hz
+    ALPHA  = 0.90    # spectral subtraction coefficient
+    BETA   = 0.06    # floor: never suppress below 6% of original
+
+    freqs   = librosa.fft_frequencies(sr=SR, n_fft=N_FFT)
+    hh_bins = (freqs >= HH_LO) & (freqs <= HH_HI)
+
+    min_len = min(vox.shape[0], drums.shape[0])
+    out = vox.copy()
+
+    for c in range(vox.shape[1]):
+        ic_d = min(c, drums.shape[1] - 1)
+        D_v  = librosa.stft(vox[:min_len,   c],     n_fft=N_FFT)
+        D_d  = librosa.stft(drums[:min_len, ic_d],  n_fft=N_FFT)
+
+        mag_v = np.abs(D_v)
+        mag_d = np.abs(D_d)
+        ph_v  = np.angle(D_v)
+
+        mag_out = mag_v.copy()
+        mag_out[hh_bins, :] = np.maximum(
+            mag_v[hh_bins, :] - ALPHA * mag_d[hh_bins, :],
+            BETA  * mag_v[hh_bins, :]
+        )
+
+        reconstructed = librosa.istft(
+            mag_out * np.exp(1j * ph_v), length=min_len, n_fft=N_FFT
+        ).astype(np.float32)
+        out[:min_len, c] = reconstructed
+        # tail beyond min_len keeps the original vocal (drums ended earlier)
+
+    return out.astype(np.float32)
 
 
 def _harmonic_vocal_enhance(vox: np.ndarray) -> np.ndarray:
@@ -2981,6 +3035,11 @@ def fuse(song_a: str, song_b: str, out_path: str,
             vox = _oracle_wiener_clean(
                 vox, stems_b["drums"], stems_b["bass"], stems_b["other"])
             print("      Oracle Wiener done.", flush=True)
+            # Targeted spectral subtraction: remove residual drum hi-hat content
+            # directly from the 6-16kHz band of the vocal (after Wiener mask).
+            print("      Targeted hi-hat spectral subtraction…", flush=True)
+            vox = _targeted_hihat_suppression(vox, stems_b["drums"])
+            print("      Hi-hat suppression done.", flush=True)
         except Exception as _e:
             print(f"      [Oracle Wiener failed: {_e} — falling back to 2-stem]",
                   flush=True)

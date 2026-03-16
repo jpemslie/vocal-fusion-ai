@@ -107,10 +107,10 @@ REF = {
     # Above 0.005 = audible clicks/pops.
     "click_artifact_score": (0.0, 0.005),
 
-    # vocal_bleed_score: hi-hat-band roughness vs vocal-presence-band roughness.
-    # 0.0 = clean vocals, no beat bleed. Above 0.45 = audible scratchiness.
-    # Above 0.70 = severe bleed — reject before playback.
-    "vocal_bleed_score":    (0.0, 0.45),
+    # vocal_bleed_score: voiced-frame hi-hat cross-modulation.
+    # 0.0 = no bleed (beat hi-hats constant regardless of vocal activity).
+    # Above 0.30 = audible scratchiness. Above 0.60 = severe bleed.
+    "vocal_bleed_score":    (0.0, 0.30),
 }
 
 REF_STRICT = {**REF,
@@ -207,11 +207,13 @@ CORRECTIONS = {
     "ratio_himid_to_mid":   ("presence_db",   +0.5, -0.5),   # dull → more presence; harsh → less
     "ratio_high_to_mid":    ("air_db",        +1.0, -1.0),   # dark → more air; bright → less
     "ratio_bass_to_mid":    ("vocal_level",   -0.05, +0.05), # bass too heavy → lower vocal to balance
-    "transient_clarity":    ("parallel_wet",   0.0, -0.04),  # smashed → less parallel compression
-    "crest_factor_db":      ("lufs_delta",     0.0, -1.0),   # smashed → reduce LUFS target
-    "kick_headroom_db":     ("parallel_wet",   0.0, -0.03),  # kick buried → less parallel comp
-    "section_consistency_lu":("vocal_level",  -0.05, +0.05), # inconsistent → adjust vocal level
-    "beat_sync_score":      ("vocal_level",   +0.05,  0.0),  # low sync → slightly boost vocal
+    "transient_clarity":    ("lufs_delta",      0.0, -1.0),   # smashed → reduce LUFS target
+    "crest_factor_db":      ("lufs_delta",      0.0, -1.0),   # smashed → reduce LUFS target
+    "kick_headroom_db":     ("carve_db",        0.0, +1.0),   # kick buried → carve more space
+    "section_consistency_lu":("vocal_level",   -0.05, +0.05), # inconsistent → adjust vocal level
+    "beat_sync_score":      ("vocal_level",    +0.05,  0.0),  # low sync → slightly boost vocal
+    # Bleed: carve deeper (reduces hi-freq mask energy) + pull air shelf back
+    "vocal_bleed_score":    ("carve_db",        0.0, +1.5),   # bleed detected → more spectral carve
 }
 
 
@@ -409,23 +411,28 @@ def _measure(audio_path: str) -> dict:
         click_artifact_score = 0.0
 
     # ── Vocal bleed score: detects beat artifacts (hi-hats, drums) bleeding ──
-    # into the vocal, causing the characteristic "scratchy" sound.
+    # into the vocal stem, causing the characteristic "scratchy" sound.
     #
-    # Method: beat bleed creates rhythmically-modulated energy in the 6-16kHz
-    # hi-hat range. We compute the ROUGHNESS of the 6-16kHz band — how
-    # choppy/modulated it is frame-to-frame. A clean vocal-over-beat mix has
-    # SMOOTH high-frequency energy (hi-hats are part of the beat, not inside
-    # the voice). Vocal bleed makes the 6-16kHz modulate with vocal syllable
-    # timing → high roughness correlated with vocal onsets = scratchiness.
+    # Method: VOICED-FRAME CROSS-MODULATION
+    # Beat hi-hats live in 6-16kHz and are part of the instrumental (Song A).
+    # They play at a constant pattern regardless of when the vocal sings.
+    # If the vocal STEM carries hi-hat bleed, the 6-16kHz in the FINAL MIX
+    # will be HIGHER during voiced sections (vocal active) than during
+    # instrumental-only sections — because the vocal stem adds extra hi-hat
+    # energy on top of the beat's own hi-hats.
     #
-    # vocal_bleed_score: 0.0 = no bleed (clean), 1.0 = severe artifact bleed.
-    # Computed as: hi-hat band roughness / (mid vocal band roughness + eps)
-    # Clean mix: hi-hat roughness ≈ mid roughness → ratio ≈ 1 → score ≈ 0
-    # Bleed mix: hi-hat roughness >> mid roughness → ratio >> 1 → score high
+    # Clean mix: hh energy ≈ same whether vocal is singing or not (beat only)
+    # Bleed mix: hh energy noticeably higher during vocal → bleed detected
+    #
+    # Score = (hh_voiced_mean - hh_unvoiced_mean) / hh_unvoiced_mean
+    # 0.0 = no modulation (clean), 1.0 = hi-hat doubles when vocal enters (severe)
+    #
+    # This replaces the old roughness-ratio approach, which was broken:
+    # Harmonic vocal enhancement reduced vp_rough (a GOOD thing) but inflated
+    # the ratio hh_rough/vp_rough, incorrectly reporting MORE bleed.
     try:
         nyq = SR / 2.0
         hop_b = 512
-        # Extract hi-hat band (6-16kHz) and vocal-presence band (1-4kHz)
         sos_hh_hp = butter(4,  6000.0 / nyq, btype="high", output="sos")
         sos_hh_lp = butter(4, 16000.0 / nyq, btype="low",  output="sos")
         sos_vp_hp = butter(4,  1000.0 / nyq, btype="high", output="sos")
@@ -434,19 +441,25 @@ def _measure(audio_path: str) -> dict:
         hh_band = sosfilt(sos_hh_lp, sosfilt(sos_hh_hp, mono, axis=0))
         vp_band = sosfilt(sos_vp_lp, sosfilt(sos_vp_hp, mono, axis=0))
 
-        # Frame-level RMS
         hh_frames = librosa.feature.rms(y=hh_band, frame_length=1024, hop_length=hop_b)[0]
         vp_frames = librosa.feature.rms(y=vp_band, frame_length=1024, hop_length=hop_b)[0]
 
-        # Roughness = normalised standard deviation of the RMS envelope
-        # High roughness = rapid, choppy energy changes = bleed artifacts
-        hh_rough = float(hh_frames.std() / (hh_frames.mean() + 1e-9))
-        vp_rough = float(vp_frames.std() / (vp_frames.mean() + 1e-9))
+        # Voiced frames: 1-4kHz RMS above its own median → vocal is active.
+        vp_med = float(np.median(vp_frames))
+        voiced_mask   = vp_frames > vp_med
+        unvoiced_mask = ~voiced_mask
 
-        # Bleed ratio: hi-hat roughness should be similar to or lower than vocal
-        # presence roughness in a clean mix. If hh_rough >> vp_rough → bleed.
-        bleed_ratio = float(hh_rough / (vp_rough + 1e-9))
-        vocal_bleed_score = float(np.clip((bleed_ratio - 0.8) / 1.4, 0.0, 1.0))
+        if voiced_mask.sum() > 10 and unvoiced_mask.sum() > 10:
+            hh_voiced   = float(hh_frames[voiced_mask].mean())
+            hh_unvoiced = float(hh_frames[unvoiced_mask].mean())
+            # Normalised modulation: 0.0 = constant hi-hat (beat only, no bleed)
+            #                        1.0 = hi-hat doubles when vocal sings (severe bleed)
+            bleed_mod = (hh_voiced - hh_unvoiced) / (hh_unvoiced + 1e-9)
+            vocal_bleed_score = float(np.clip(bleed_mod / 1.0, 0.0, 1.0))
+        else:
+            # Fallback: absolute roughness of hi-hat band alone (no vp division)
+            hh_rough = float(hh_frames.std() / (hh_frames.mean() + 1e-9))
+            vocal_bleed_score = float(np.clip((hh_rough - 0.6) / 1.2, 0.0, 1.0))
     except Exception:
         vocal_bleed_score = 0.0
 
