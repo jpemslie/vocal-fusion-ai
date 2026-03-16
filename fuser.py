@@ -836,7 +836,8 @@ def _has_gpu() -> bool:
         return False
 
 
-def separate(audio_path: str, cache_dir: str = "vf_data/stems") -> dict:
+def separate(audio_path: str, cache_dir: str = "vf_data/stems",
+             upgrade_vocal: bool = False) -> dict:
     """
     Separate vocals using the best available model:
       GPU available → BS-Roformer via audio-separator (SDR ~13, fast on GPU)
@@ -899,9 +900,11 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems") -> dict:
             # STFT-domain blend of both vocals = best of both models.
             print("      CPU path: Demucs htdemucs_ft 4-stem (oracle stems)…", flush=True)
             _separate_demucs(audio_path, cached)
-            # Try to upgrade the vocal stem with MDX-Net (better SDR)
+            # Only upgrade vocal stem for the vocal source song (Song B), not the beat.
+            # MDX-Net loads ~2GB ONNX model in-process; running it on Song A wastes
+            # memory and caused OOM on the beat separation which doesn't use vocals.
             _sentinel = cached / "_mdx_vocal_upgraded"
-            if not _sentinel.exists():
+            if upgrade_vocal and not _sentinel.exists():
                 try:
                     _upgrade_vocal_mdx(audio_path, cached, cache_dir)
                     _sentinel.touch()
@@ -3116,10 +3119,10 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
     sep_model = "BS-Roformer" if _has_gpu() else "MDX-Net Kim Vocal 2→Demucs fallback"
     step(4, TOTAL, f"Separating stems — Song A (instrumental) via {sep_model}…")
-    stems_a = separate(song_a, stems_cache)
+    stems_a = separate(song_a, stems_cache, upgrade_vocal=False)  # beat — no vocal needed
 
     step(5, TOTAL, f"Separating stems — Song B (vocals) via {sep_model}…")
-    stems_b = separate(song_b, stems_cache)
+    stems_b = separate(song_b, stems_cache, upgrade_vocal=True)   # vocal source — upgrade
 
     inst = stems_a["no_vocals"]   # (samples, 2)
     vox  = stems_b["vocals"]      # (samples, 2)
