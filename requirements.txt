@@ -24,3 +24,9 @@ pyloudnorm>=0.1.0
 
 # Spectral noise reduction (removes Demucs bleed artifacts from vocal stem)
 noisereduce>=3.0.0
+
+# AI Director — uses Claude API to reason about mix quality and make decisions
+anthropic>=0.20.0
+
+# Neural vocal restoration (perceptual enhancer trained on speech/music)
+# resemble-enhance>=0.0.1  # optional — large download (~600MB), enables neural vocal enhancement

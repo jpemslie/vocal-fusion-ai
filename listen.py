@@ -242,7 +242,8 @@ def _band_db(S: np.ndarray, freqs: np.ndarray, lo: float, hi: float) -> float:
     mask = (freqs >= lo) & (freqs < hi)
     if not mask.any():
         return -60.0
-    return float(librosa.amplitude_to_db(S[mask].mean() + 1e-9, ref=1.0))
+    # Use manual dB conversion to avoid librosa scalar/array type issues across versions
+    return float(20.0 * np.log10(float(S[mask].mean()) + 1e-9))
 
 
 def _load(audio_path: str):

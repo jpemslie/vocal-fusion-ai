@@ -1072,7 +1072,9 @@ def _separate_mdx(audio_path: str, out_dir: Path, cache_dir: str) -> None:
 def _oracle_wiener_clean(vox: np.ndarray,
                           drums: np.ndarray,
                           bass: np.ndarray,
-                          other: np.ndarray) -> np.ndarray:
+                          other: np.ndarray,
+                          drum_weight_hh: float = 3.5,
+                          mask_floor: float = 0.08) -> np.ndarray:
     """
     Oracle Wiener mask using all 4 Demucs stems.
 
@@ -1092,8 +1094,8 @@ def _oracle_wiener_clean(vox: np.ndarray,
 
     N_FFT = 2048
     HH_LO, HH_HI = 4000, 16000   # hi-hat range for extra drum suppression
-    DRUM_WEIGHT  = 3.5            # drums count 3.5× as interference in hi-hat band
-    MASK_FLOOR   = 0.08           # lower floor (oracle accuracy → can suppress more)
+    DRUM_WEIGHT  = drum_weight_hh  # AI-tunable: drums count N× as interference in hi-hat band
+    MASK_FLOOR   = mask_floor      # AI-tunable: lower floor → more aggressive suppression
 
     freqs = librosa.fft_frequencies(sr=SR, n_fft=N_FFT)
     hh_bins = (freqs >= HH_LO) & (freqs <= HH_HI)
@@ -1131,7 +1133,8 @@ def _oracle_wiener_clean(vox: np.ndarray,
     return vox_clean.astype(np.float32)
 
 
-def _targeted_hihat_suppression(vox: np.ndarray, drums: np.ndarray) -> np.ndarray:
+def _targeted_hihat_suppression(vox: np.ndarray, drums: np.ndarray,
+                                 hihat_alpha: float = 0.90) -> np.ndarray:
     """
     Spectral subtraction of drum-stem hi-hat content from vocal in 6-16 kHz.
 
@@ -1152,8 +1155,8 @@ def _targeted_hihat_suppression(vox: np.ndarray, drums: np.ndarray) -> np.ndarra
     N_FFT  = 2048
     HH_LO  = 6000    # Hz — upper hi-hat range only (more sibilant-safe than 4kHz)
     HH_HI  = 16000   # Hz
-    ALPHA  = 0.90    # spectral subtraction coefficient
-    BETA   = 0.06    # floor: never suppress below 6% of original
+    ALPHA  = hihat_alpha  # AI-tunable spectral subtraction coefficient
+    BETA   = 0.06         # floor: never suppress below 6% of original
 
     freqs   = librosa.fft_frequencies(sr=SR, n_fft=N_FFT)
     hh_bins = (freqs >= HH_LO) & (freqs <= HH_HI)
@@ -1185,7 +1188,7 @@ def _targeted_hihat_suppression(vox: np.ndarray, drums: np.ndarray) -> np.ndarra
     return out.astype(np.float32)
 
 
-def _harmonic_vocal_process(vox: np.ndarray) -> np.ndarray:
+def _harmonic_vocal_process(vox: np.ndarray, mix_dry: float = 0.50) -> np.ndarray:
     """
     Combined voice harmonic resynthesis + enhancement in one STFT pass.
 
@@ -1224,7 +1227,7 @@ def _harmonic_vocal_process(vox: np.ndarray) -> np.ndarray:
     N_HARM   = 24       # track up to 24th harmonic
     FLOOR    = 0.10     # inter-harmonic floor in hi-hat zone
     BOOST    = 10 ** (1.5 / 20.0)   # +1.5 dB harmonic boost
-    MIX_DRY  = 0.50     # 50% original — prevents vocoder character
+    MIX_DRY  = mix_dry  # AI-tunable: higher = more natural, lower = cleaner/more harmonic
 
     # KEY: only suppress inter-harmonic content ABOVE HH_BIN.
     # Below that, the voice character (formants, vowels) lives — leave it alone.
@@ -2748,7 +2751,7 @@ def _auto_evaluate(mix: np.ndarray, inst: np.ndarray, vox: np.ndarray,
 
     def _bdb(lo, hi):
         m = (freqs >= lo) & (freqs < hi)
-        return float(librosa.amplitude_to_db(S[m].mean() + 1e-9, ref=1.0))
+        return float(20.0 * np.log10(float(S[m].mean()) + 1e-9))
 
     bands = {
         "Bass (20-250 Hz)":      (_bdb(20,   250),  25, 34),
@@ -3064,6 +3067,15 @@ def fuse(song_a: str, song_b: str, out_path: str,
     inst = stems_a["no_vocals"]   # (samples, 2)
     vox  = stems_b["vocals"]      # (samples, 2)
 
+    # ── AI-tunable bleed removal parameters (adjusted by director on correction passes) ──
+    _bleed_params = {
+        "drum_weight_hh":       3.5,   # oracle Wiener drum weight in hi-hat band
+        "wiener_mask_floor":    0.08,  # oracle Wiener minimum mask floor
+        "hihat_alpha":          0.90,  # spectral subtraction coefficient
+        "harmonic_mix_dry":     0.50,  # PYIN harmonic resynthesis dry/wet blend
+        "noisereduce_strength": 0.15,  # reference noisereduce prop_decrease
+    }
+
     # ── Vocal bleed removal ──────────────────────────────────────────────────
     # Oracle path (4-stem Demucs): use drums/bass/other as oracle interference
     # sources for an exact Wiener mask.  The mask for bin (t,f) is:
@@ -3079,12 +3091,16 @@ def fuse(song_a: str, song_b: str, out_path: str,
         print("      Oracle Wiener mask (4-stem Demucs)…", flush=True)
         try:
             vox = _oracle_wiener_clean(
-                vox, stems_b["drums"], stems_b["bass"], stems_b["other"])
+                vox, stems_b["drums"], stems_b["bass"], stems_b["other"],
+                drum_weight_hh=_bleed_params["drum_weight_hh"],
+                mask_floor=_bleed_params["wiener_mask_floor"])
             print("      Oracle Wiener done.", flush=True)
             # Targeted spectral subtraction: remove residual drum hi-hat content
             # directly from the 6-16kHz band of the vocal (after Wiener mask).
             print("      Targeted hi-hat spectral subtraction…", flush=True)
-            vox = _targeted_hihat_suppression(vox, stems_b["drums"])
+            vox = _targeted_hihat_suppression(
+                vox, stems_b["drums"],
+                hihat_alpha=_bleed_params["hihat_alpha"])
             print("      Hi-hat suppression done.", flush=True)
         except Exception as _e:
             print(f"      [Oracle Wiener failed: {_e} — falling back to 2-stem]",
@@ -3113,10 +3129,56 @@ def fuse(song_a: str, song_b: str, out_path: str,
         # over-suppressed — both in one PYIN pass.
         print("      Harmonic resynthesis (PYIN F0 skeleton rebuild)…", flush=True)
         try:
-            vox = _harmonic_vocal_process(vox)
+            vox = _harmonic_vocal_process(
+                vox, mix_dry=_bleed_params["harmonic_mix_dry"])
             print("      Harmonic resynthesis done.", flush=True)
         except Exception as _he:
             print(f"      [Harmonic resynth failed: {_he} — skipping]", flush=True)
+
+        # Resemble Enhance: neural perceptual vocal enhancement.
+        # Restores harmonic bandwidth + natural voice character that spectral processing
+        # may have softened. Enhancement-only mode (lambd=0.05) — denoiser disabled
+        # because it fights musical content (same issue as DeepFilterNet).
+        try:
+            from resemble_enhance.enhancer.inference import enhance as _re_enhance
+            import torch as _torch
+            # Pre-check: if the model repo clone failed (git-lfs missing), skip gracefully
+            import resemble_enhance as _re_pkg
+            _re_model_path = Path(_re_pkg.__file__).parent / "model_repo"
+            _re_has_weights = (_re_model_path / "pytorch_model.bin").exists() or \
+                              any((_re_model_path).glob("*.bin")) or \
+                              any((_re_model_path).glob("*.safetensors"))
+            if not _re_has_weights:
+                print("      [Neural enhance: model weights not downloaded — skipping]",
+                      flush=True)
+            else:
+                print("      Neural vocal enhancement (Resemble Enhance)…", flush=True)
+                _vox_t = _torch.from_numpy(vox.T.astype(np.float32))  # (C, N)
+                _enhanced_chs = []
+                for _ci in range(_vox_t.shape[0]):
+                    _ch_tensor = _vox_t[_ci].unsqueeze(0)             # (1, N)
+                    _enh, _sr_enh = _re_enhance(
+                        _ch_tensor, SR,
+                        device="cpu",
+                        nfe=8,         # 8 diffusion steps — fast on CPU
+                        solver="midpoint",
+                        lambd=0.05,    # 0.0=full enhance, 1.0=denoise only; 0.05=mostly enhance
+                        tau=0.5,
+                    )
+                    _enhanced_chs.append(_enh.squeeze(0).numpy())
+                _vox_enh = np.stack(_enhanced_chs, axis=1).astype(np.float32)  # (N, C)
+                # Safety: don't allow enhancement to increase peak more than 12dB
+                _peak_before = np.abs(vox).max() + 1e-9
+                _peak_after  = np.abs(_vox_enh).max() + 1e-9
+                if _peak_after / _peak_before < 4.0:
+                    vox = _vox_enh
+                    print("      Neural vocal enhancement done.", flush=True)
+                else:
+                    print("      [Neural enhance: peak gain too high — skipping]", flush=True)
+        except ImportError:
+            pass   # resemble-enhance not installed — silently skip
+        except Exception as _ree:
+            print(f"      [Neural enhance failed: {_ree} — skipping]", flush=True)
 
         # Reference-guided noisereduce (moderate — oracle mask handles bulk).
         if "no_vocals" in stems_b:
@@ -3132,7 +3194,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
                         y_noise=ref_inst[:min_len_nr, ic].astype(np.float32),
                         sr=SR,
                         stationary=False,
-                        prop_decrease=0.35,   # gentler — oracle mask already did heavy lifting
+                        prop_decrease=_bleed_params["noisereduce_strength"],
                         n_fft=2048,
                     )
                     vox_ref[:min_len_nr, c] = np.nan_to_num(
@@ -3379,20 +3441,31 @@ def fuse(song_a: str, song_b: str, out_path: str,
     sf.write(out_path, mix, SR, subtype="PCM_24")
     print(f"Done → {out_path}", flush=True)
 
-    # ── Auto-correction loop ─────────────────────────────────────────────────
-    # Score the mix. If it fails (< 75/100 or CRITICAL issue), apply the
-    # corrections() map to DSP params and re-run just mix+master. Up to 3 passes.
-    # The user never needs to listen and tell us what's wrong — we fix it ourselves.
+    # ── Auto-correction loop (AI Director) ───────────────────────────────────
+    # Score the mix. If it fails, the AI Director (Claude API) reads all 23 metrics,
+    # reasons about root causes using causal knowledge of the DSP chain, and outputs
+    # specific parameter adjustments. Falls back to lookup table if API unavailable.
+    # Up to 3 passes — re-runs bleed-removal + mix + master on correction iterations.
     try:
-        from listen import auto_score as _auto_score, corrections as _corrections
+        from listen import auto_score as _auto_score, corrections as _corrections, \
+            score_file as _score_file
+        try:
+            from director import get_corrections as _get_ai_corrections
+            _has_director = True
+        except ImportError:
+            _has_director = False
+
         best_score = 0
         best_mix   = mix.copy()
         _lufs_target = -12.0   # mutable within this loop
+        _correction_history = []   # tracks prior attempts for director context
 
         for _attempt in range(3):
             print(f"\n── Quality Check (attempt {_attempt + 1}/3) {'─' * 35}",
                   flush=True)
             _passed, _score, _summary, _issues = _auto_score(out_path)
+            # Also get raw metrics for the AI director
+            _, _, _metrics = _score_file(out_path, print_report=False)
             print(f"  → {_summary}", flush=True)
 
             if _score > best_score:
@@ -3407,37 +3480,135 @@ def fuse(song_a: str, song_b: str, out_path: str,
                 print("  Max correction attempts reached — using best result.", flush=True)
                 break
 
-            # Get parameter deltas from issue map
-            _adj = _corrections(_issues)
+            # Record this attempt in history for the director's context
+            _correction_history.append({
+                "attempt": _attempt,
+                "score": _score,
+                "params": {
+                    "carve_db": style["carve_db"],
+                    "presence_db": style.get("presence_db", 2.0),
+                    "air_db": style.get("air_db", 2.5),
+                    "vocal_level": style["vocal_level"],
+                    "lufs_target": _lufs_target,
+                    **_bleed_params,
+                },
+                "issues": [i[1] for i in _issues],
+            })
+
+            # Build current param snapshot for the director
+            _current_params = {
+                "carve_db": style["carve_db"],
+                "presence_db": style.get("presence_db", 2.0),
+                "air_db": style.get("air_db", 2.5),
+                "vocal_level": style["vocal_level"],
+                "lufs_target": _lufs_target,
+                **_bleed_params,
+            }
+
+            # Ask AI Director (or fall back to lookup table)
+            if _has_director:
+                _adj = _get_ai_corrections(
+                    metrics=_metrics,
+                    issues=_issues,
+                    current_params=_current_params,
+                    attempt_num=_attempt,
+                    history=_correction_history[:-1],  # exclude current attempt
+                )
+            else:
+                _adj = {}
+
+            if not _adj:
+                # Fall back to static lookup table
+                _adj_raw = _corrections(_issues)
+                # Convert deltas to absolute values
+                _adj = {}
+                if "carve_db" in _adj_raw:
+                    _adj["carve_db"] = float(np.clip(
+                        style["carve_db"] + _adj_raw["carve_db"], 3.0, 12.0))
+                if "presence_db" in _adj_raw:
+                    _adj["presence_db"] = float(np.clip(
+                        style.get("presence_db", 1.5) + _adj_raw["presence_db"], 0.0, 4.0))
+                if "air_db" in _adj_raw:
+                    _adj["air_db"] = float(np.clip(
+                        style.get("air_db", 2.5) + _adj_raw["air_db"], 0.0, 5.0))
+                if "vocal_level" in _adj_raw:
+                    _adj["vocal_level"] = float(np.clip(
+                        style["vocal_level"] + _adj_raw["vocal_level"], 0.5, 4.0))
+                if "lufs_delta" in _adj_raw:
+                    _adj["lufs_target"] = float(np.clip(
+                        _lufs_target + _adj_raw["lufs_delta"], -16.0, -9.0))
+
             if not _adj:
                 print("  No correctable issues found — keeping current mix.", flush=True)
                 break
 
-            print(f"  Auto-correcting: {_adj}", flush=True)
+            print(f"  Applying: {_adj}", flush=True)
 
-            # Apply corrections to style dict (clamped to safe ranges)
-            if "carve_db" in _adj:
-                style["carve_db"] = float(np.clip(
-                    style["carve_db"] + _adj["carve_db"], 3.0, 12.0))
+            # Determine if we need to re-run bleed removal (bleed params changed)
+            _bleed_changed = any(k in _adj for k in _bleed_params)
+
+            # Apply mix-layer parameter adjustments
+            if "carve_db"    in _adj:
+                style["carve_db"]    = float(np.clip(_adj["carve_db"], 3.0, 12.0))
             if "presence_db" in _adj:
-                style["presence_db"] = float(np.clip(
-                    style.get("presence_db", 1.5) + _adj["presence_db"], 0.0, 4.0))
-            if "air_db" in _adj:
-                style["air_db"] = float(np.clip(
-                    style.get("air_db", 2.5) + _adj["air_db"], 0.0, 5.0))
+                style["presence_db"] = float(np.clip(_adj["presence_db"], 0.0, 4.0))
+            if "air_db"      in _adj:
+                style["air_db"]      = float(np.clip(_adj["air_db"], 0.0, 5.0))
             if "vocal_level" in _adj:
-                style["vocal_level"] = float(np.clip(
-                    style["vocal_level"] + _adj["vocal_level"], 0.5, 2.5))
-            if "lufs_delta" in _adj:
-                _lufs_target = float(np.clip(_lufs_target + _adj["lufs_delta"], -16.0, -9.0))
+                style["vocal_level"] = float(np.clip(_adj["vocal_level"], 1.0, 4.0))
+            if "lufs_target" in _adj:
+                _lufs_target = float(np.clip(_adj["lufs_target"], -16.0, -9.0))
+
+            # Apply bleed-removal parameter adjustments
+            for _bp in _bleed_params:
+                if _bp in _adj:
+                    _bleed_params[_bp] = _adj[_bp]
 
             print(f"  New params: carve={style['carve_db']:.1f}dB  "
+                  f"presence={style.get('presence_db',2.0):.1f}dB  "
                   f"vocal_level={style['vocal_level']:.2f}  "
                   f"lufs={_lufs_target:.1f}", flush=True)
 
+            # If bleed params changed, re-run bleed removal on the original stems
+            _vox_for_remix = vox_remix
+            if _bleed_changed and all(k in stems_b for k in ("drums", "bass", "other")):
+                print("  Re-running bleed removal with updated parameters…", flush=True)
+                try:
+                    _vox_rebleed = stems_b["vocals"].copy()
+                    _vox_rebleed = _oracle_wiener_clean(
+                        _vox_rebleed, stems_b["drums"], stems_b["bass"], stems_b["other"],
+                        drum_weight_hh=_bleed_params["drum_weight_hh"],
+                        mask_floor=_bleed_params["wiener_mask_floor"])
+                    _vox_rebleed = _targeted_hihat_suppression(
+                        _vox_rebleed, stems_b["drums"],
+                        hihat_alpha=_bleed_params["hihat_alpha"])
+                    _vox_rebleed = _harmonic_vocal_process(
+                        _vox_rebleed, mix_dry=_bleed_params["harmonic_mix_dry"])
+                    if "no_vocals" in stems_b:
+                        _ref_i = stems_b["no_vocals"]
+                        _ml_nr = min(_vox_rebleed.shape[0], _ref_i.shape[0])
+                        _vb_nr = np.zeros_like(_vox_rebleed)
+                        for _c in range(_vox_rebleed.shape[1]):
+                            _ic = min(_c, _ref_i.shape[1] - 1)
+                            _cl = nr.reduce_noise(
+                                y=_vox_rebleed[:_ml_nr, _c].astype(np.float32),
+                                y_noise=_ref_i[:_ml_nr, _ic].astype(np.float32),
+                                sr=SR, stationary=False,
+                                prop_decrease=_bleed_params["noisereduce_strength"],
+                                n_fft=2048)
+                            _vb_nr[:_ml_nr, _c] = np.nan_to_num(
+                                _cl, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                            if _ml_nr < _vox_rebleed.shape[0]:
+                                _vb_nr[_ml_nr:, _c] = _vox_rebleed[_ml_nr:, _c]
+                        _vox_rebleed = _vb_nr.astype(np.float32)
+                    _vox_for_remix = _vox_rebleed
+                    print("  Bleed removal updated.", flush=True)
+                except Exception as _bre:
+                    print(f"  [Bleed re-run failed: {_bre} — using cached stems]", flush=True)
+
             # Re-run mix + master with adjusted params
             print("  Re-mixing…", flush=True)
-            mix = _iterative_mix(inst_remix, vox_remix, style, sidechain_depth, bpm_a)
+            mix = _iterative_mix(inst_remix, _vox_for_remix, style, sidechain_depth, bpm_a)
             mix = _check(mix, f"remix-{_attempt+2}/mix")
             mix = _fade(mix, fade_s=2.0)
             mix = _master(mix, bpm=bpm_a)
@@ -3449,7 +3620,9 @@ def fuse(song_a: str, song_b: str, out_path: str,
         print(f"\n  Final score: {best_score}/100 — {out_path}", flush=True)
 
     except Exception as _qe:
+        import traceback
         print(f"  [Auto-correction unavailable: {_qe}]", flush=True)
+        traceback.print_exc()
         # Legacy 7-point check as fallback
         ev = _auto_evaluate(mix, inst, vox, bpm_a)
         print(f"  Beat sync: {ev['beat_sync_pct']}%  "
