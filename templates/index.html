@@ -2,49 +2,285 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VocalFusion</title>
 <style>
-  body { font-family: monospace; max-width: 560px; margin: 80px auto; padding: 0 20px; background: #fff; color: #111; }
-  h1 { font-size: 1.3em; margin-bottom: 32px; }
-  label { display: block; margin: 18px 0 4px; font-size: .85em; letter-spacing: .05em; text-transform: uppercase; }
-  input[type=file] { display: block; width: 100%; }
-  button { margin-top: 28px; padding: 10px 32px; font-size: 1em; cursor: pointer; font-family: monospace; }
-  button:disabled { opacity: .4; cursor: default; }
-  #status { margin-top: 20px; font-size: .85em; color: #555; min-height: 1.2em; }
-  progress { width: 100%; margin-top: 8px; display: none; }
-  audio { margin-top: 24px; width: 100%; display: none; }
-  .err { color: #c00; }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:      #0a0a0a;
+    --surface: #111;
+    --border:  #222;
+    --accent:  #7c3aed;
+    --accent2: #a855f7;
+    --text:    #e5e5e5;
+    --muted:   #666;
+    --err:     #ef4444;
+    --good:    #22c55e;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'SF Mono', 'Fira Code', 'Menlo', monospace;
+    min-height: 100vh;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 48px 20px 80px;
+  }
+
+  .wrap { width: 100%; max-width: 580px; }
+
+  /* Header */
+  .header { margin-bottom: 40px; }
+  .header h1 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--accent2);
+  }
+  .header p { font-size: .75rem; color: var(--muted); margin-top: 4px; }
+
+  /* Upload zone */
+  .upload-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 24px; }
+
+  .drop-zone {
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 20px 16px;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+    position: relative;
+    overflow: hidden;
+  }
+  .drop-zone:hover, .drop-zone.over { border-color: var(--accent); background: rgba(124,58,237,.06); }
+  .drop-zone.has-file { border-color: var(--accent2); border-style: solid; }
+
+  .drop-zone input[type=file] {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+  }
+  .drop-label {
+    font-size: .7rem; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--muted); display: block; margin-bottom: 8px;
+  }
+  .drop-icon { font-size: 1.6rem; display: block; margin-bottom: 6px; }
+  .drop-name {
+    font-size: .72rem; color: var(--accent2);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    max-width: 100%; display: none;
+  }
+  .drop-hint { font-size: .68rem; color: var(--muted); }
+
+  /* Fuse button */
+  .fuse-btn {
+    width: 100%; padding: 13px;
+    background: var(--accent);
+    color: #fff;
+    border: none; border-radius: 8px;
+    font-family: inherit; font-size: .85rem; font-weight: 600;
+    letter-spacing: .1em; text-transform: uppercase;
+    cursor: pointer; transition: opacity .15s, background .15s;
+    margin-bottom: 24px;
+  }
+  .fuse-btn:hover:not(:disabled) { background: var(--accent2); }
+  .fuse-btn:disabled { opacity: .35; cursor: default; }
+
+  /* Progress */
+  .progress-wrap { margin-bottom: 16px; display: none; }
+  .progress-track {
+    width: 100%; height: 3px; background: var(--border); border-radius: 2px; overflow: hidden;
+  }
+  .progress-bar {
+    height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 2px; transition: width .4s ease; width: 0%;
+  }
+  .progress-msg { font-size: .72rem; color: var(--muted); margin-top: 6px; }
+
+  /* Status */
+  .status { font-size: .75rem; color: var(--muted); min-height: 1.2em; margin-bottom: 16px; }
+  .status.err { color: var(--err); }
+
+  /* Score badge */
+  .score-wrap { display: none; margin-bottom: 24px; }
+  .score-inner {
+    display: inline-flex; align-items: center; gap: 10px;
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 16px; background: var(--surface);
+  }
+  .score-label { font-size: .65rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .score-val { font-size: 1.5rem; font-weight: 700; color: var(--good); }
+  .score-grade { font-size: .85rem; color: var(--muted); }
+
+  /* Variant tabs */
+  .variants-wrap { display: none; }
+  .tab-row {
+    display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 0;
+  }
+  .tab {
+    padding: 8px 20px; font-family: inherit; font-size: .72rem;
+    letter-spacing: .08em; text-transform: uppercase;
+    background: none; border: none; color: var(--muted);
+    cursor: pointer; border-bottom: 2px solid transparent;
+    margin-bottom: -1px; transition: color .15s, border-color .15s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent2); border-bottom-color: var(--accent2); }
+  .tab-badge {
+    font-size: .6rem; padding: 1px 5px; border-radius: 3px;
+    background: var(--border); color: var(--muted); margin-left: 5px; vertical-align: middle;
+  }
+
+  .player-wrap {
+    background: var(--surface); border: 1px solid var(--border);
+    border-top: none; border-radius: 0 0 8px 8px; padding: 16px;
+  }
+  audio { width: 100%; height: 36px; display: block; }
+  audio::-webkit-media-controls-panel { background: var(--surface); }
+
+  .dl-link {
+    display: inline-block; margin-top: 10px;
+    font-size: .68rem; color: var(--accent2); text-decoration: none;
+    letter-spacing: .06em; text-transform: uppercase;
+  }
+  .dl-link:hover { text-decoration: underline; }
+
+  /* Variant descriptions */
+  .variant-desc {
+    font-size: .66rem; color: var(--muted); margin-top: 8px; line-height: 1.5;
+  }
 </style>
 </head>
 <body>
-<h1>VocalFusion</h1>
+<div class="wrap">
 
-<label>Song A — Beat / Instrumental</label>
-<input type="file" id="songA" accept="audio/*">
+  <div class="header">
+    <h1>VocalFusion</h1>
+    <p>Advanced AI vocal fusion engine · MDX-Net + Demucs · CREPE · Structural automation</p>
+  </div>
 
-<label>Song B — Vocal Source</label>
-<input type="file" id="songB" accept="audio/*">
+  <div class="upload-grid">
+    <div class="drop-zone" id="zoneA" ondragover="onDrag(event,'A')" ondragleave="offDrag('A')" ondrop="onDrop(event,'A')">
+      <input type="file" id="songA" accept="audio/*" onchange="onPick('A')">
+      <span class="drop-label">Song A</span>
+      <span class="drop-icon">🎹</span>
+      <span class="drop-hint">Beat · Instrumental</span>
+      <span class="drop-name" id="nameA"></span>
+    </div>
+    <div class="drop-zone" id="zoneB" ondragover="onDrag(event,'B')" ondragleave="offDrag('B')" ondrop="onDrop(event,'B')">
+      <input type="file" id="songB" accept="audio/*" onchange="onPick('B')">
+      <span class="drop-label">Song B</span>
+      <span class="drop-icon">🎤</span>
+      <span class="drop-hint">Vocal Source</span>
+      <span class="drop-name" id="nameB"></span>
+    </div>
+  </div>
 
-<button id="btn" onclick="startFuse()">Fuse</button>
+  <button class="fuse-btn" id="btn" onclick="startFuse()">Fuse</button>
 
-<div id="status"></div>
-<progress id="bar" max="100"></progress>
-<audio id="player" controls></audio>
+  <div class="progress-wrap" id="progressWrap">
+    <div class="progress-track"><div class="progress-bar" id="bar"></div></div>
+    <div class="progress-msg" id="progressMsg"></div>
+  </div>
+
+  <div class="status" id="status"></div>
+
+  <div class="score-wrap" id="scoreWrap">
+    <div class="score-inner">
+      <div>
+        <div class="score-label">Quality Score</div>
+        <div><span class="score-val" id="scoreVal">—</span> <span class="score-grade" id="scoreGrade"></span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="variants-wrap" id="variantsWrap">
+    <div class="tab-row">
+      <button class="tab active" id="tabRadio" onclick="switchTab('radio')">
+        Radio <span class="tab-badge">-12 LUFS</span>
+      </button>
+      <button class="tab" id="tabClub" onclick="switchTab('club')" style="display:none">
+        Club <span class="tab-badge">-9 LUFS</span>
+      </button>
+      <button class="tab" id="tabIntimate" onclick="switchTab('intimate')" style="display:none">
+        Intimate <span class="tab-badge">-14 LUFS</span>
+      </button>
+    </div>
+    <div class="player-wrap">
+      <audio id="player" controls></audio>
+      <a class="dl-link" id="dlLink" href="#" download>↓ Download</a>
+      <div class="variant-desc" id="variantDesc"></div>
+    </div>
+  </div>
+
+</div>
 
 <script>
-let pollId = null;
+const DESCS = {
+  radio:    'Balanced mix · -12 LUFS · optimised for streaming and casual listening.',
+  club:     'Punchier sub, harder glue compression · -9 LUFS · optimised for large speakers and DJ playback.',
+  intimate: 'Wide stereo, high dynamic range · -14 LUFS · optimised for headphones and streaming platforms.',
+};
 
+let pollId   = null;
+let _variants = {};
+let _active   = 'radio';
+
+// ── Drag & drop helpers ──────────────────────────────────────────────────────
+function onDrag(e, id) { e.preventDefault(); document.getElementById('zone'+id).classList.add('over'); }
+function offDrag(id)    { document.getElementById('zone'+id).classList.remove('over'); }
+function onDrop(e, id)  {
+  e.preventDefault();
+  offDrag(id);
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  const input = document.getElementById('song'+id);
+  const dt = new DataTransfer(); dt.items.add(file); input.files = dt.files;
+  setName(id, file.name);
+}
+function onPick(id) {
+  const f = document.getElementById('song'+id).files[0];
+  if (f) setName(id, f.name);
+}
+function setName(id, name) {
+  const z = document.getElementById('zone'+id);
+  z.classList.add('has-file');
+  const n = document.getElementById('name'+id);
+  n.textContent = name;
+  n.style.display = 'block';
+  z.querySelector('.drop-hint').style.display = 'none';
+}
+
+// ── Tab switching ────────────────────────────────────────────────────────────
+function switchTab(variant) {
+  if (!_variants[variant]) return;
+  _active = variant;
+  ['radio','club','intimate'].forEach(v => {
+    const t = document.getElementById('tab' + v.charAt(0).toUpperCase() + v.slice(1));
+    if (t) t.classList.toggle('active', v === variant);
+  });
+  const url = _variants[variant];
+  document.getElementById('player').src = url;
+  document.getElementById('player').play().catch(()=>{});
+  document.getElementById('dlLink').href = url;
+  document.getElementById('dlLink').download = url.split('/').pop();
+  document.getElementById('variantDesc').textContent = DESCS[variant] || '';
+}
+
+// ── Fuse ─────────────────────────────────────────────────────────────────────
 async function startFuse() {
   const a = document.getElementById('songA').files[0];
   const b = document.getElementById('songB').files[0];
-  if (!a || !b) { alert('Select both files first.'); return; }
+  if (!a || !b) { setStatus('Select both files first.', false); return; }
 
   clearInterval(pollId);
-  const btn = document.getElementById('btn');
-  btn.disabled = true;
-  document.getElementById('player').style.display = 'none';
-  document.getElementById('bar').style.display = 'block';
-  setStatus('Uploading…', 0);
+  document.getElementById('btn').disabled = true;
+  document.getElementById('variantsWrap').style.display = 'none';
+  document.getElementById('scoreWrap').style.display    = 'none';
+  document.getElementById('progressWrap').style.display = 'block';
+  setStatus('Uploading…');
+  setBar(0, 'Uploading…');
 
   const fd = new FormData();
   fd.append('song_a', a);
@@ -52,47 +288,81 @@ async function startFuse() {
 
   let res, data;
   try {
-    res = await fetch('/fuse', { method: 'POST', body: fd });
+    res  = await fetch('/fuse', { method: 'POST', body: fd });
     data = await res.json();
   } catch (e) {
-    setStatus('Upload error: ' + e, 0, true);
-    btn.disabled = false;
+    setStatus('Upload error: ' + e, true);
+    document.getElementById('btn').disabled = false;
+    document.getElementById('progressWrap').style.display = 'none';
     return;
   }
-  if (!res.ok) { setStatus(data.error || 'Server error', 0, true); btn.disabled = false; return; }
+  if (!res.ok) {
+    setStatus(data.error || 'Server error', true);
+    document.getElementById('btn').disabled = false;
+    document.getElementById('progressWrap').style.display = 'none';
+    return;
+  }
 
-  pollId = setInterval(() => poll(data.job_id, btn), 1500);
+  pollId = setInterval(() => poll(data.job_id), 1500);
 }
 
-async function poll(job_id, btn) {
+async function poll(job_id) {
   let job;
-  try {
-    const r = await fetch('/status/' + job_id);
-    job = await r.json();
-  } catch { return; }
+  try { job = await (await fetch('/status/' + job_id)).json(); }
+  catch { return; }
 
-  setStatus(job.message, job.progress, job.status === 'error');
+  setBar(job.progress || 0, job.message || '');
+  setStatus(job.message || '', job.status === 'error');
 
   if (job.status === 'done') {
     clearInterval(pollId);
-    document.getElementById('bar').style.display = 'none';
-    const player = document.getElementById('player');
-    player.src = job.output_url;
-    player.style.display = 'block';
-    player.play().catch(() => {});
-    btn.disabled = false;
+    document.getElementById('btn').disabled = false;
+    document.getElementById('progressWrap').style.display = 'none';
+
+    // Score badge
+    if (job.score != null) {
+      const grade = scoreGrade(job.score);
+      document.getElementById('scoreVal').textContent   = job.score;
+      document.getElementById('scoreGrade').textContent = grade;
+      document.getElementById('scoreWrap').style.display = 'block';
+    }
+
+    // Variants
+    _variants = job.variants || {};
+    if (_variants.radio) {
+      showTab('tabRadio', true);
+      showTab('tabClub',     !!_variants.club);
+      showTab('tabIntimate', !!_variants.intimate);
+      document.getElementById('variantsWrap').style.display = 'block';
+      switchTab('radio');
+    }
+
   } else if (job.status === 'error') {
     clearInterval(pollId);
-    document.getElementById('bar').style.display = 'none';
-    btn.disabled = false;
+    document.getElementById('btn').disabled = false;
+    document.getElementById('progressWrap').style.display = 'none';
   }
 }
 
-function setStatus(msg, pct, isErr) {
+function showTab(id, visible) {
+  const el = document.getElementById(id);
+  if (el) el.style.display = visible ? '' : 'none';
+}
+
+function setBar(pct, msg) {
+  document.getElementById('bar').style.width = pct + '%';
+  if (msg) document.getElementById('progressMsg').textContent = msg;
+}
+function setStatus(msg, isErr) {
   const el = document.getElementById('status');
   el.textContent = msg || '';
-  el.className = isErr ? 'err' : '';
-  if (pct !== undefined) document.getElementById('bar').value = pct;
+  el.className   = 'status' + (isErr ? ' err' : '');
+}
+function scoreGrade(s) {
+  if (s >= 95) return 'A+'; if (s >= 90) return 'A';
+  if (s >= 85) return 'B+'; if (s >= 80) return 'B';
+  if (s >= 75) return 'C+'; if (s >= 70) return 'C';
+  return 'D';
 }
 </script>
 </body>

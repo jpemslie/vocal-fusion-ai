@@ -2164,6 +2164,44 @@ def _harmonic_excite(audio_ch: np.ndarray, crossover_hz: float = 3000.0,
     return (audio_f64 + harmonics_only * mix_level).astype(np.float32)
 
 
+def _crepe_pitch_correct(vox_ch: np.ndarray) -> np.ndarray:
+    """
+    Global tuning correction via CREPE neural F0 estimator.
+
+    Safer than PYIN on separated stems — CREPE is trained on polyphonic audio
+    and is robust to residual bleed. Only corrects systematic tuning offset
+    (vocalist recorded sharp/flat) by up to ±20 cents. Does NOT do note-by-note
+    correction — no frame-level artifacts, no robotic sound.
+
+    Algorithm: analyse first 30s → compute median cents-deviation from nearest
+    semitone across high-confidence voiced frames → if deviation >5 cents, apply
+    a single global pitch-shift to centre the tuning.
+    """
+    try:
+        import crepe as _crepe
+        clip = vox_ch[:SR * 30].astype(np.float32)
+        _, frequency, confidence, _ = _crepe.predict(
+            clip, SR, viterbi=True, verbose=0,
+            model_capacity='tiny')          # tiny model: 4 MB, no GPU needed
+        voiced_f = frequency[(confidence > 0.80) & (frequency > 60) & (frequency < 1100)]
+        if len(voiced_f) < 30:
+            return vox_ch
+        cents_off = [1200.0 * np.log2(f / (440.0 * 2 ** (round(12 * np.log2(f / 440.0)) / 12)))
+                     for f in voiced_f]
+        median_c = float(np.median(cents_off))
+        if abs(median_c) < 5.0:
+            return vox_ch   # negligible — don't touch
+        shift_st = -float(np.clip(median_c, -20.0, 20.0)) / 100.0
+        print(f"      CREPE tuning: median {median_c:+.1f} ¢ → correcting {shift_st:+.4f} st",
+              flush=True)
+        if HAS_PYRUBBERBAND:
+            return rb.pitch_shift(vox_ch.astype(np.float32), SR, shift_st,
+                                   rbargs={'-3': ''}).astype(np.float32)
+    except Exception as _e:
+        print(f"      [CREPE skipped: {_e}]", flush=True)
+    return vox_ch
+
+
 def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     """
     Spectral gating with noisereduce to remove Demucs bleed artifacts.
@@ -2389,6 +2427,10 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         np.nan_to_num(_clean_vocal(vox_ch[c]), nan=0.0, posinf=0.0, neginf=0.0)
         for c in range(vox_ch.shape[0])
     ], axis=0)
+
+    # Stage 0b — CREPE global tuning correction (only if library installed)
+    for c in range(vox.shape[1]):
+        vox[:, c] = _crepe_pitch_correct(vox[:, c])
 
     # Stage 1: HPF 80 Hz + subtractive EQ + hi-hat bleed roll-off
     # The 8kHz shelf always rolls off the hi-hat zone regardless of pitch shift.
@@ -3025,8 +3067,8 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         PeakFilter(cutoff_frequency_hz=250.0,  gain_db=-0.5,  q=0.8),  # mud cut
         PeakFilter(cutoff_frequency_hz=500.0,  gain_db=-1.5,  q=0.7),  # lo-mid warmth control (250-800Hz)
         PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5,  q=2.5),  # ear-fatigue notch
-        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.0,  q=1.0),  # hi-mid harshness cut
-        PeakFilter(cutoff_frequency_hz=4000.0, gain_db=-1.5,  q=1.0),  # upper presence cut (2.5-6kHz)
+        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.5,  q=0.7),  # hi-mid harshness (broadened: was Q1.0 -2.0dB)
+        PeakFilter(cutoff_frequency_hz=4500.0, gain_db=-2.0,  q=0.7),  # broad 3-6kHz cut (addresses Hi-Mid ratio)
         HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-1.5),
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
@@ -3113,6 +3155,147 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     return mix
 
 
+def _master_club(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
+    """
+    Club variant mastering: punchier sub, harder sidechain glue, LUFS -9.
+    Optimised for large speaker systems and DJ playback.
+    """
+    # Safety normalize
+    peak_in = float(np.max(np.abs(mix)))
+    if peak_in > 0.5:
+        mix = (mix * (0.5 / peak_in)).astype(np.float32)
+
+    # M/S EQ — more sub on Mid, wider Sides
+    if mix.ndim == 2 and mix.shape[1] == 2:
+        M, S = _ms_encode(mix)
+        mid_eq = Pedalboard([
+            LowShelfFilter(cutoff_frequency_hz=80.0,  gain_db=+1.5),  # sub boost
+            PeakFilter(cutoff_frequency_hz=350.0,     gain_db=-0.5, q=1.2),
+        ])
+        sides_eq = Pedalboard([
+            HighpassFilter(cutoff_frequency_hz=120.0),
+            PeakFilter(cutoff_frequency_hz=400.0,     gain_db=-2.0, q=0.8),
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=+1.5),  # more air
+        ])
+        M_p = mid_eq(M[np.newaxis, :].astype(np.float32), SR)[0]
+        S_p = sides_eq(S[np.newaxis, :].astype(np.float32), SR)[0]
+        mix = _ms_decode(M_p.astype(np.float32), S_p.astype(np.float32))
+
+    # Mastering EQ — keep the lows, cut harshness
+    master_eq = Pedalboard([
+        PeakFilter(cutoff_frequency_hz=250.0,  gain_db=-0.3, q=0.8),
+        PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5, q=2.5),
+        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.0, q=1.0),
+        HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-1.0),
+    ])
+    mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    mix = _multiband_master_compress(mix)
+
+    # Soft clip
+    mix_c = np.clip(mix, -1.0, 1.0)
+    mix = (1.5 * mix_c - 0.5 * mix_c ** 3).astype(np.float32)
+
+    # Harder glue comp for club impact
+    beat_ms = 60000.0 / max(bpm, 60.0)
+    glue_release_ms = float(np.clip(beat_ms * 0.55, 40.0, 350.0))
+    glue = Pedalboard([Compressor(threshold_db=-8.0, ratio=2.0,
+                                   attack_ms=10.0, release_ms=glue_release_ms)])
+    mix = glue(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # Sub-bass limiter
+    sos_sub_lp = butter(4, 80.0 / (SR / 2), btype="low",  output="sos")
+    sos_sub_hp = butter(4, 20.0 / (SR / 2), btype="high", output="sos")
+    mix_sub  = sosfilt(sos_sub_hp, sosfilt(sos_sub_lp, mix, axis=0)).astype(np.float32)
+    mix_abv  = (mix - mix_sub).astype(np.float32)
+    sub_lim  = Pedalboard([Limiter(threshold_db=-2.0, release_ms=40.0)])
+    mix_sub  = sub_lim(mix_sub.T.astype(np.float32), SR).T.astype(np.float32)
+    mix_sub  = (mix_sub * 0.6).astype(np.float32)   # -4.4 dB — more sub than radio
+    mix = (mix_abv + mix_sub).astype(np.float32)
+
+    # LUFS -9 for club loudness
+    mix = _lufs_normalize(mix, -9.0)
+    post_eq = Pedalboard([HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-2.5)])
+    mix = post_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    limiter = Pedalboard([Limiter(threshold_db=-0.5, release_ms=40.0)])
+    mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
+    clip_ceil = 10 ** (-0.5 / 20.0)
+    if float(np.max(np.abs(mix))) > clip_ceil:
+        mix = np.clip(mix, -clip_ceil, clip_ceil).astype(np.float32)
+    return mix
+
+
+def _master_intimate(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
+    """
+    Intimate variant mastering: wide stereo, LUFS -14, high dynamic range.
+    Optimised for headphone listening and streaming platforms.
+    """
+    peak_in = float(np.max(np.abs(mix)))
+    if peak_in > 0.5:
+        mix = (mix * (0.5 / peak_in)).astype(np.float32)
+
+    # M/S EQ — wider Sides, less sub
+    if mix.ndim == 2 and mix.shape[1] == 2:
+        M, S = _ms_encode(mix)
+        mid_eq = Pedalboard([
+            PeakFilter(cutoff_frequency_hz=350.0, gain_db=-0.5, q=1.2),
+            LowShelfFilter(cutoff_frequency_hz=120.0, gain_db=0.3),
+        ])
+        sides_eq = Pedalboard([
+            HighpassFilter(cutoff_frequency_hz=100.0),
+            HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=+2.0),  # wider, airier
+        ])
+        M_p = mid_eq(M[np.newaxis, :].astype(np.float32), SR)[0]
+        S_p = sides_eq(S[np.newaxis, :].astype(np.float32), SR)[0]
+        # Boost Sides for headphone width
+        mix = _ms_decode(M_p.astype(np.float32), (S_p * 1.2).astype(np.float32))
+
+    master_eq = Pedalboard([
+        PeakFilter(cutoff_frequency_hz=250.0,  gain_db=-0.5, q=0.8),
+        PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.0, q=2.5),
+        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-1.5, q=1.0),
+        HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-0.5),  # less HF cut = more air
+    ])
+    mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # No multiband compress — preserve dynamics for intimacy
+    # Soft clip only
+    mix_c = np.clip(mix, -1.0, 1.0)
+    mix = (1.5 * mix_c - 0.5 * mix_c ** 3).astype(np.float32)
+
+    # Very gentle glue — just barely touches peaks
+    beat_ms = 60000.0 / max(bpm, 60.0)
+    glue_release_ms = float(np.clip(beat_ms * 0.70, 80.0, 500.0))
+    glue = Pedalboard([Compressor(threshold_db=-14.0, ratio=1.3,
+                                   attack_ms=20.0, release_ms=glue_release_ms)])
+    mix = glue(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # Sub-bass limiter — lighter
+    sos_sub_lp = butter(4, 80.0 / (SR / 2), btype="low",  output="sos")
+    sos_sub_hp = butter(4, 20.0 / (SR / 2), btype="high", output="sos")
+    mix_sub = sosfilt(sos_sub_hp, sosfilt(sos_sub_lp, mix, axis=0)).astype(np.float32)
+    mix_abv = (mix - mix_sub).astype(np.float32)
+    sub_lim = Pedalboard([Limiter(threshold_db=-4.0, release_ms=80.0)])
+    mix_sub = sub_lim(mix_sub.T.astype(np.float32), SR).T.astype(np.float32)
+    mix_sub = (mix_sub * 0.45).astype(np.float32)   # -6.9 dB — tighter sub for headphones
+    mix = (mix_abv + mix_sub).astype(np.float32)
+
+    # LUFS -14 (streaming standard — Spotify/Apple target)
+    mix = _lufs_normalize(mix, -14.0)
+
+    # Very slight HF control
+    post_eq = Pedalboard([HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-1.5)])
+    mix = post_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    limiter = Pedalboard([Limiter(threshold_db=-1.5, release_ms=60.0)])
+    mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
+    clip_ceil = 10 ** (-1.5 / 20.0)
+    if float(np.max(np.abs(mix))) > clip_ceil:
+        mix = np.clip(mix, -clip_ceil, clip_ceil).astype(np.float32)
+    return mix
+
+
 def _fade(y: np.ndarray, fade_s: float = 2.0) -> np.ndarray:
     n = min(int(SR * fade_s), len(y) // 6)
     y = y.copy()
@@ -3164,43 +3347,37 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
     # ── AI-tunable bleed removal parameters (adjusted by director on correction passes) ──
     _bleed_params = {
-        "drum_weight_hh":       3.5,   # oracle Wiener drum weight in hi-hat band
-        "wiener_mask_floor":    0.08,  # oracle Wiener minimum mask floor
-        "hihat_alpha":          0.90,  # spectral subtraction coefficient
-        "harmonic_mix_dry":     0.50,  # PYIN harmonic resynthesis dry/wet blend
+        "drum_weight_hh":       2.0,   # oracle Wiener drum weight in hi-hat band (gentle)
+        "wiener_mask_floor":    0.20,  # oracle Wiener minimum mask floor (avoids musical noise)
         "noisereduce_strength": 0.15,  # reference noisereduce prop_decrease
     }
 
     # ── Vocal bleed removal ──────────────────────────────────────────────────
     # Oracle path (4-stem Demucs): use drums/bass/other as oracle interference
-    # sources for an exact Wiener mask.  The mask for bin (t,f) is:
+    # sources for a gentle Wiener mask.  The mask for bin (t,f) is:
     #   mask = V² / (V² + D² + B² + O²)
-    # Drums get 2× weight in the 4-16 kHz hi-hat band — this directly targets
-    # the "scratchy" artifact the user has been hearing.
-    # After masking, PYIN harmonic enhancement restores overtones the mask
-    # suppressed alongside the bleed.
+    # Gentle settings: mask_floor=0.20 (avoids musical-noise tonal static),
+    # drum_weight_hh=2.0 (avoids over-suppression in hi-hat band).
+    # NOTE: _targeted_hihat_suppression and _harmonic_vocal_process REMOVED —
+    # both caused audible artifacts (musical noise / robotic vocoder effect).
     #
     # Fallback path (2-stem / GPU): classical V²/(V²+I²) Wiener + reference
     # noisereduce with song B's instrumental as the noise profile.
     if all(k in stems_b for k in ("drums", "bass", "other")):
+        # Oracle Wiener mask — gentler settings to avoid musical noise artifacts.
+        # mask_floor=0.20 (was 0.08) — higher floor = less aggressive suppression
+        # = less "tonal static" artifact from over-suppressed frequency bins.
+        # drum_weight_hh=2.0 (was 3.5) — lighter drum weighting in hi-hat band.
         print("      Oracle Wiener mask (4-stem Demucs)…", flush=True)
         try:
             vox = _oracle_wiener_clean(
                 vox, stems_b["drums"], stems_b["bass"], stems_b["other"],
-                drum_weight_hh=_bleed_params["drum_weight_hh"],
-                mask_floor=_bleed_params["wiener_mask_floor"])
+                drum_weight_hh=_bleed_params.get("drum_weight_hh", 2.0),
+                mask_floor=_bleed_params.get("wiener_mask_floor", 0.20))
             print("      Oracle Wiener done.", flush=True)
-            # Targeted spectral subtraction: remove residual drum hi-hat content
-            # directly from the 6-16kHz band of the vocal (after Wiener mask).
-            print("      Targeted hi-hat spectral subtraction…", flush=True)
-            vox = _targeted_hihat_suppression(
-                vox, stems_b["drums"],
-                hihat_alpha=_bleed_params["hihat_alpha"])
-            print("      Hi-hat suppression done.", flush=True)
         except Exception as _e:
             print(f"      [Oracle Wiener failed: {_e} — falling back to 2-stem]",
                   flush=True)
-            # 2-stem fallback
             try:
                 n_fft_ws = 2048
                 vox_clean = np.zeros_like(vox)
@@ -3211,7 +3388,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
                     D_i = librosa.stft(inst[:min_len, ic], n_fft=n_fft_ws)
                     raw_mask = librosa.util.softmask(
                         np.abs(D_v), np.abs(D_i) + 1e-8, power=2)
-                    mask = np.maximum(raw_mask, 0.15)
+                    mask = np.maximum(raw_mask, 0.20)
                     D_clean = (mask * np.abs(D_v)) * np.exp(1j * np.angle(D_v))
                     vox_clean[:, c] = librosa.istft(
                         D_clean, length=vox.shape[0]).astype(np.float32)
@@ -3219,16 +3396,15 @@ def fuse(song_a: str, song_b: str, out_path: str,
             except Exception:
                 pass
 
-        # Harmonic resynthesis + enhancement: rebuild vocal from harmonic skeleton.
-        # Removes residual inter-harmonic bleed + boosts harmonics the Wiener
-        # over-suppressed — both in one PYIN pass.
-        print("      Harmonic resynthesis (PYIN F0 skeleton rebuild)…", flush=True)
-        try:
-            vox = _harmonic_vocal_process(
-                vox, mix_dry=_bleed_params["harmonic_mix_dry"])
-            print("      Harmonic resynthesis done.", flush=True)
-        except Exception as _he:
-            print(f"      [Harmonic resynth failed: {_he} — skipping]", flush=True)
+        # NOTE: Targeted spectral subtraction (_targeted_hihat_suppression) REMOVED.
+        # It was causing phase artifacts on top of the Wiener mask — two stages of
+        # spectral subtraction creates "musical noise" static that sounds scratchy.
+        # The Wiener mask alone handles hi-hat bleed adequately.
+
+        # NOTE: Harmonic resynthesis (_harmonic_vocal_process) REMOVED.
+        # PYIN-based harmonic masking above 4kHz removes inter-harmonic content
+        # that includes natural consonant noise — making the voice sound robotic/
+        # vocoder-like. Better to accept residual bleed than destroy voice character.
 
         # Resemble Enhance: neural perceptual vocal enhancement.
         # Runs in a subprocess so a crash/segfault can't kill the main fuse process.
@@ -3542,6 +3718,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     # ── Mix + Master (initial pass) ───────────────────────────────────────────
     mix = _iterative_mix(inst, vox, style, sidechain_depth, bpm_a)
     mix = _check(mix, "post-mix")
+    mix_pre_variants = mix.copy()  # save pre-fade/pre-master for variants
     mix = _fade(mix, fade_s=2.0)
 
     step(9, TOTAL, "Mastering…")
@@ -3551,6 +3728,28 @@ def fuse(song_a: str, song_b: str, out_path: str,
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     sf.write(out_path, mix, SR, subtype="PCM_24")
     print(f"Done → {out_path}", flush=True)
+
+    # ── Generate mix variants (Club / Intimate) ──────────────────────────────
+    # Club: punchy sub, harder glue, LUFS -9, for DJ/speaker playback
+    # Intimate: wide stereo, LUFS -14, high LRA, for headphones/streaming
+    _base, _ext = os.path.splitext(out_path)
+    out_club      = f"{_base}_club{_ext}"
+    out_intimate  = f"{_base}_intimate{_ext}"
+    _pre_master_mix = _fade(mix_pre_variants, fade_s=2.0)
+    try:
+        _mix_club = _master_club(_pre_master_mix.copy(), bpm=bpm_a)
+        sf.write(out_club, _mix_club, SR, subtype="PCM_24")
+        print(f"Club variant → {out_club}", flush=True)
+    except Exception as _ve:
+        print(f"[Club variant failed: {_ve}]", flush=True)
+        out_club = None
+    try:
+        _mix_intimate = _master_intimate(_pre_master_mix.copy(), bpm=bpm_a)
+        sf.write(out_intimate, _mix_intimate, SR, subtype="PCM_24")
+        print(f"Intimate variant → {out_intimate}", flush=True)
+    except Exception as _ve:
+        print(f"[Intimate variant failed: {_ve}]", flush=True)
+        out_intimate = None
 
     # ── Auto-correction loop (AI Director) ───────────────────────────────────
     # Score the mix. If it fails, the AI Director (Claude API) reads all 23 metrics,
@@ -3690,11 +3889,6 @@ def fuse(song_a: str, song_b: str, out_path: str,
                         _vox_rebleed, stems_b["drums"], stems_b["bass"], stems_b["other"],
                         drum_weight_hh=_bleed_params["drum_weight_hh"],
                         mask_floor=_bleed_params["wiener_mask_floor"])
-                    _vox_rebleed = _targeted_hihat_suppression(
-                        _vox_rebleed, stems_b["drums"],
-                        hihat_alpha=_bleed_params["hihat_alpha"])
-                    _vox_rebleed = _harmonic_vocal_process(
-                        _vox_rebleed, mix_dry=_bleed_params["harmonic_mix_dry"])
                     if "no_vocals" in stems_b:
                         _ref_i = stems_b["no_vocals"]
                         _ml_nr = min(_vox_rebleed.shape[0], _ref_i.shape[0])
@@ -3741,4 +3935,8 @@ def fuse(song_a: str, song_b: str, out_path: str,
               f"LUFS: {ev['lufs']}  "
               f"{'PASS' if ev['pass'] else 'FAIL'}", flush=True)
 
-    return out_path
+    return {
+        "radio":    out_path,
+        "club":     out_club,
+        "intimate": out_intimate,
+    }

@@ -3,7 +3,7 @@ VocalFusion — Flask Server
 ==========================
 GET  /              → UI
 POST /fuse          → multipart: song_a, song_b → {job_id}
-GET  /status/<id>   → {status, progress, message, output_url?}
+GET  /status/<id>   → {status, progress, message, output_url?, variants?, score?}
 GET  /output/<file> → serve completed WAV
 """
 
@@ -36,13 +36,37 @@ def _run_fuse(job_id: str, path_a: str, path_b: str, out_path: str) -> None:
             _jobs[job_id]["message"] = msg
 
     try:
-        fuse(path_a, path_b, out_path,
-             stems_cache=str(STEMS_DIR),
-             progress_cb=on_progress)
+        result = fuse(path_a, path_b, out_path,
+                      stems_cache=str(STEMS_DIR),
+                      progress_cb=on_progress)
+
+        # result is a dict {"radio": path, "club": path, "intimate": path}
+        # or a plain string (backward compat)
+        if isinstance(result, dict):
+            radio_path    = result.get("radio", out_path)
+            club_path     = result.get("club")
+            intimate_path = result.get("intimate")
+            score         = result.get("score")
+        else:
+            radio_path    = result or out_path
+            club_path     = None
+            intimate_path = None
+            score         = None
+
+        variants = {"radio": f"/output/{Path(radio_path).name}"}
+        if club_path and Path(club_path).exists():
+            variants["club"] = f"/output/{Path(club_path).name}"
+        if intimate_path and Path(intimate_path).exists():
+            variants["intimate"] = f"/output/{Path(intimate_path).name}"
+
         with _lock:
             _jobs[job_id].update(
-                status="done", progress=100, message="Complete",
-                output_url=f"/output/{Path(out_path).name}"
+                status="done",
+                progress=100,
+                message="Complete",
+                output_url=variants["radio"],   # default player src
+                variants=variants,
+                score=score,
             )
     except Exception as exc:
         with _lock:
