@@ -27,6 +27,7 @@ Mastering (v4):
 import hashlib
 import logging
 import os
+import sys
 import tempfile
 import shutil
 from pathlib import Path
