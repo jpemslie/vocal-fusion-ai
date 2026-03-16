@@ -108,9 +108,9 @@ REF = {
     "click_artifact_score": (0.0, 0.005),
 
     # vocal_bleed_score: voiced-frame hi-hat cross-modulation.
-    # 0.0 = no bleed (beat hi-hats constant regardless of vocal activity).
-    # Above 0.30 = audible scratchiness. Above 0.60 = severe bleed.
-    "vocal_bleed_score":    (0.0, 0.30),
+    # Roughness of 6-16kHz during voiced frames: 0=smooth (clean), 1=choppy (bleed).
+    # Above 0.40 = audible scratchiness (empirically calibrated: v11=0.23, v8=0.48).
+    "vocal_bleed_score":    (0.0, 0.40),
 }
 
 REF_STRICT = {**REF,
@@ -413,23 +413,28 @@ def _measure(audio_path: str) -> dict:
     # ── Vocal bleed score: detects beat artifacts (hi-hats, drums) bleeding ──
     # into the vocal stem, causing the characteristic "scratchy" sound.
     #
-    # Method: VOICED-FRAME CROSS-MODULATION
-    # Beat hi-hats live in 6-16kHz and are part of the instrumental (Song A).
-    # They play at a constant pattern regardless of when the vocal sings.
-    # If the vocal STEM carries hi-hat bleed, the 6-16kHz in the FINAL MIX
-    # will be HIGHER during voiced sections (vocal active) than during
-    # instrumental-only sections — because the vocal stem adds extra hi-hat
-    # energy on top of the beat's own hi-hats.
+    # Method: ROUGHNESS OF HI-HAT BAND DURING VOICED FRAMES
     #
-    # Clean mix: hh energy ≈ same whether vocal is singing or not (beat only)
-    # Bleed mix: hh energy noticeably higher during vocal → bleed detected
+    # The key insight: bleed creates IRREGULAR, choppy hi-hat energy during
+    # vocal sections (Song B's hi-hats don't sync with Song A's beat pattern).
+    # Clean vocals + intentional HF processing (reverb, air shelf, sibilants)
+    # create SMOOTH, consistently-textured hi-hat energy during those frames.
     #
-    # Score = (hh_voiced_mean - hh_unvoiced_mean) / hh_unvoiced_mean
-    # 0.0 = no modulation (clean), 1.0 = hi-hat doubles when vocal enters (severe)
+    # Measurement: temporal roughness (std/mean of RMS envelope) of the
+    # 6-16kHz band specifically during voiced frames (when vocal is active).
     #
-    # This replaces the old roughness-ratio approach, which was broken:
-    # Harmonic vocal enhancement reduced vp_rough (a GOOD thing) but inflated
-    # the ratio hh_rough/vp_rough, incorrectly reporting MORE bleed.
+    # Clean mix: sibilants + reverb = smooth HF → low roughness → low score
+    # Bleed mix: Song B's hi-hat pattern leaks in → choppy HF → high score
+    #
+    # Calibrated from empirical data:
+    #   v8 (MDX-Net, user reported scratchy):       rough_voiced = 0.983 → score 0.483
+    #   v11 (oracle Wiener+subtraction, clean):     rough_voiced = 0.732 → score 0.232
+    #   Raw Demucs stem (unprocessed bleed):        rough_voiced = 1.530 → score 1.000
+    # Threshold 0.40 correctly passes v11 and fails v8.
+    #
+    # Note: roughness during UNVOICED frames is typically HIGHER than voiced
+    # (percussive beat hi-hats are more impulsive than vocal sibilants).
+    # This is why the old ratio hh_rough/vp_rough was backwards.
     try:
         nyq = SR / 2.0
         hop_b = 512
@@ -446,20 +451,19 @@ def _measure(audio_path: str) -> dict:
 
         # Voiced frames: 1-4kHz RMS above its own median → vocal is active.
         vp_med = float(np.median(vp_frames))
-        voiced_mask   = vp_frames > vp_med
-        unvoiced_mask = ~voiced_mask
+        voiced_mask = vp_frames > vp_med
 
-        if voiced_mask.sum() > 10 and unvoiced_mask.sum() > 10:
-            hh_voiced   = float(hh_frames[voiced_mask].mean())
-            hh_unvoiced = float(hh_frames[unvoiced_mask].mean())
-            # Normalised modulation: 0.0 = constant hi-hat (beat only, no bleed)
-            #                        1.0 = hi-hat doubles when vocal sings (severe bleed)
-            bleed_mod = (hh_voiced - hh_unvoiced) / (hh_unvoiced + 1e-9)
-            vocal_bleed_score = float(np.clip(bleed_mod / 1.0, 0.0, 1.0))
+        if voiced_mask.sum() > 20:
+            hh_voiced_frames = hh_frames[voiced_mask]
+            # Roughness = normalised std: irregular hi-hat pattern → high
+            rough_voiced = float(
+                hh_voiced_frames.std() / (hh_voiced_frames.mean() + 1e-9))
+            # Normalize: 0.0 at rough=0.5 (very smooth), 1.0 at rough=1.5 (very choppy)
+            vocal_bleed_score = float(np.clip((rough_voiced - 0.5) / 1.0, 0.0, 1.0))
         else:
-            # Fallback: absolute roughness of hi-hat band alone (no vp division)
+            # Fallback: absolute roughness over whole track
             hh_rough = float(hh_frames.std() / (hh_frames.mean() + 1e-9))
-            vocal_bleed_score = float(np.clip((hh_rough - 0.6) / 1.2, 0.0, 1.0))
+            vocal_bleed_score = float(np.clip((hh_rough - 0.5) / 1.0, 0.0, 1.0))
     except Exception:
         vocal_bleed_score = 0.0
 
