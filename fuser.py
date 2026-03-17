@@ -62,8 +62,11 @@ except Exception:
     HAS_DEEPFILTER = False
 
 SR = 44100
-_BS_ROFORMER = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
-_MDX_VOCAL   = "Kim_Vocal_2.onnx"  # MDX-Net vocal (SDR ~9.5+, ONNX — fast on CPU)
+_BS_ROFORMER    = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+_MDX_VOCAL      = "Kim_Vocal_2.onnx"          # MDX-Net vocal (SDR ~9.5, ONNX fast on CPU)
+_MDX23C_VOCAL   = "MDX23C-8KFFT-InstVoc_HQ.ckpt"  # MDX23C vocal (SDR ~12+, better quality)
+_DENOISE_MODEL  = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"          # post-sep denoiser (SDR 27.99)
+_DEVERB_MODEL   = "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt"        # de-reverb vocal (SDR 19.17)
 
 
 def _check(y: np.ndarray, label: str) -> np.ndarray:
@@ -1080,6 +1083,59 @@ def _has_gpu() -> bool:
         return False
 
 
+def _run_roformer_on_stem(stem_path: Path, model_name: str, cache_dir: str,
+                          want_label: str = "clean") -> bool:
+    """
+    Run a Roformer model (denoiser or de-reverb) on an already-separated stem WAV.
+    Overwrites stem_path with the cleaned output.  Returns True on success.
+
+    want_label: substring to match in output filename for the "good" stem.
+                'clean' for denoiser, 'dry' or 'vocals' for de-reverb.
+    """
+    from audio_separator.separator import Separator
+    tmp_dir = Path(tempfile.mkdtemp(dir=cache_dir))
+    try:
+        sep = Separator(
+            log_level=logging.WARNING,
+            output_dir=str(tmp_dir),
+            output_format="WAV",
+            sample_rate=SR,
+            model_file_dir=str(Path(cache_dir) / "_models"),
+        )
+        sep.load_model(model_name)
+        sep.separate(str(stem_path))
+
+        # Find the desired output (the clean/dry side, not the noise/reverb side)
+        chosen = None
+        for p in tmp_dir.iterdir():
+            n = p.name.lower()
+            if want_label in n and "noise" not in n and "reverb" not in n:
+                chosen = p
+                break
+        if chosen is None:
+            # Fallback: pick the file that is NOT the noise/residual stem
+            wavs = sorted(tmp_dir.glob("*.wav"))
+            for p in wavs:
+                if "noise" not in p.name.lower() and "reverb" not in p.name.lower():
+                    chosen = p
+                    break
+            if chosen is None and wavs:
+                chosen = wavs[0]
+
+        if chosen and chosen.exists():
+            # Read, verify it's not silent, then overwrite
+            test, _ = sf.read(str(chosen), always_2d=True)
+            if np.max(np.abs(test)) > 1e-4:
+                shutil.copy2(str(chosen), str(stem_path))
+                return True
+        return False
+    except Exception as _e:
+        print(f"      [{model_name} failed: {_e}]", flush=True)
+        return False
+    finally:
+        shutil.rmtree(str(tmp_dir), ignore_errors=True)
+
+
 def separate(audio_path: str, cache_dir: str = "vf_data/stems",
              upgrade_vocal: bool = False) -> dict:
     """
@@ -1153,6 +1209,39 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
             except Exception as _me:
                 print(f"      [MDX-Net vocal upgrade failed: {_me} — using Demucs vocal]",
                       flush=True)
+
+    # ── Neural vocal cleaning cascade ─────────────────────────────────────────
+    # Step 1: Mel-Roformer-Denoise — removes bleed/noise from the vocal stem.
+    #         SDR 27.99 — extremely effective at removing instrumental bleed.
+    # Step 2: BS-Roformer-De-Reverb — removes original song's room reverb,
+    #         leaving a dry signal that sits cleanly in the new beat's space.
+    # Both run on the already-separated vocals.wav and overwrite it in-place.
+    # Sentinels prevent re-running if the file was already cleaned.
+    _voc_path = cached / "vocals.wav"
+    if _voc_path.exists():
+        _denoise_sentinel = cached / "_vocal_denoised"
+        if not _denoise_sentinel.exists():
+            print("      [Neural Denoiser] Running Mel-Roformer-Denoise on vocal stem…",
+                  flush=True)
+            ok = _run_roformer_on_stem(_voc_path, _DENOISE_MODEL, cache_dir,
+                                       want_label="clean")
+            if ok:
+                _denoise_sentinel.touch()
+                print("      [Neural Denoiser] Vocal stem cleaned.", flush=True)
+            else:
+                print("      [Neural Denoiser] Failed — using undenoised vocal.", flush=True)
+
+        _deverb_sentinel = cached / "_vocal_deverbed"
+        if not _deverb_sentinel.exists():
+            print("      [De-Reverb] Running BS-Roformer-De-Reverb on vocal stem…",
+                  flush=True)
+            ok = _run_roformer_on_stem(_voc_path, _DEVERB_MODEL, cache_dir,
+                                       want_label="dry")
+            if ok:
+                _deverb_sentinel.touch()
+                print("      [De-Reverb] Room reverb removed from vocal.", flush=True)
+            else:
+                print("      [De-Reverb] Failed — keeping vocal as-is.", flush=True)
 
     stems = {}
     for name in ("vocals", "no_vocals", "drums", "bass", "other"):
@@ -1238,6 +1327,7 @@ def _run_mdx_model(model_name: str, audio_path: str, tmp_dir: Path,
         output_format="WAV",
         sample_rate=SR,
         model_file_dir=str(Path(cache_dir) / "_models"),
+        mdx_params={"enable_denoise": True, "overlap": 0.25},  # built-in MDX denoiser
     )
     sep.load_model(model_name)
     sep.separate(audio_path)
@@ -2931,6 +3021,27 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         np.nan_to_num(_clean_vocal(vox_ch[c]), nan=0.0, posinf=0.0, neginf=0.0)
         for c in range(vox_ch.shape[0])
     ], axis=0)
+
+    # Stage 0.5: HPSS harmonic masking — removes hi-hat/percussive bleed.
+    # Hi-hats are percussive (vertical in spectrogram); vocals are harmonic (horizontal).
+    # margin=(1.0, 5.0): a bin must be 5x more percussive to be assigned to P mask.
+    # Blend: 80% HPSS-cleaned + 20% original — preserves vocal consonants (t, k, f).
+    # Community-validated (UVR): most effective hi-hat bleed removal on separated stems.
+    try:
+        n_fft_hpss = 2048
+        hpss_blend = 0.80
+        cleaned_ch = np.zeros_like(vox_ch)
+        for c in range(vox_ch.shape[0]):
+            D = librosa.stft(vox_ch[c].astype(np.float64), n_fft=n_fft_hpss)
+            H, P = librosa.decompose.hpss(np.abs(D), kernel_size=31, margin=(1.0, 5.0))
+            soft_mask = librosa.util.softmask(H, H + P, power=2)
+            D_harm = D * soft_mask
+            y_harm = librosa.istft(D_harm, length=vox_ch.shape[1]).astype(np.float32)
+            cleaned_ch[c] = (y_harm * hpss_blend + vox_ch[c] * (1.0 - hpss_blend))
+        vox_ch = np.nan_to_num(cleaned_ch, nan=0.0, posinf=0.0, neginf=0.0)
+        print("      [Stage 0.5] HPSS harmonic mask applied.", flush=True)
+    except Exception as _hpss_e:
+        print(f"      [Stage 0.5 HPSS failed: {_hpss_e}]", flush=True)
 
     # Stage 0b — CREPE global tuning correction (only if library installed)
     for c in range(vox.shape[1]):
