@@ -1665,8 +1665,8 @@ def _arrangement_gain_curves(beat_secs: list, vox_secs: list,
     Returns (beat_gain, vox_gain) — float32 arrays of length n_samples.
     """
     _BEAT_GAIN = {
-        'intro': 1.00, 'verse': 0.82, 'chorus': 1.00,
-        'drop':  1.00, 'breakdown': 0.55, 'bridge': 0.88, 'outro': 0.90,
+        'intro': 0.95, 'verse': 0.85, 'chorus': 1.00,
+        'drop':  1.00, 'breakdown': 0.70, 'bridge': 0.90, 'outro': 0.92,
     }
     _VOX_GAIN = {
         'intro': 0.85, 'verse': 1.00, 'chorus': 1.08,
@@ -2166,39 +2166,69 @@ def _harmonic_excite(audio_ch: np.ndarray, crossover_hz: float = 3000.0,
 
 def _crepe_pitch_correct(vox_ch: np.ndarray) -> np.ndarray:
     """
-    Global tuning correction via CREPE neural F0 estimator.
+    Global tuning correction: detect if vocalist is systematically sharp or flat
+    and apply a single tiny pitch-shift (up to ±20 cents) to centre the tuning.
 
-    Safer than PYIN on separated stems — CREPE is trained on polyphonic audio
-    and is robust to residual bleed. Only corrects systematic tuning offset
-    (vocalist recorded sharp/flat) by up to ±20 cents. Does NOT do note-by-note
-    correction — no frame-level artifacts, no robotic sound.
+    Tries CREPE (neural, most robust) first, falls back to PYIN median analysis.
+    Both approaches only detect the GLOBAL offset — no frame-by-frame correction,
+    so there is zero risk of the robotic/vocoder artifacts we saw with per-note PYIN.
 
-    Algorithm: analyse first 30s → compute median cents-deviation from nearest
-    semitone across high-confidence voiced frames → if deviation >5 cents, apply
-    a single global pitch-shift to centre the tuning.
+    5-cent dead zone: any offset below 5 cents (1/20 semitone) is left alone.
     """
-    try:
-        import crepe as _crepe
-        clip = vox_ch[:SR * 30].astype(np.float32)
-        _, frequency, confidence, _ = _crepe.predict(
-            clip, SR, viterbi=True, verbose=0,
-            model_capacity='tiny')          # tiny model: 4 MB, no GPU needed
-        voiced_f = frequency[(confidence > 0.80) & (frequency > 60) & (frequency < 1100)]
+    def _apply_global_cents(voiced_f, label):
         if len(voiced_f) < 30:
-            return vox_ch
-        cents_off = [1200.0 * np.log2(f / (440.0 * 2 ** (round(12 * np.log2(f / 440.0)) / 12)))
-                     for f in voiced_f]
+            return None
+        cents_off = [1200.0 * np.log2(f / (440.0 * 2 ** (round(12 * np.log2(max(f, 1e-6) / 440.0)) / 12)))
+                     for f in voiced_f if f > 0]
+        if not cents_off:
+            return None
         median_c = float(np.median(cents_off))
         if abs(median_c) < 5.0:
-            return vox_ch   # negligible — don't touch
+            print(f"      {label} tuning: {median_c:+.1f} ¢ offset — within 5¢ tolerance, skipping",
+                  flush=True)
+            return None
         shift_st = -float(np.clip(median_c, -20.0, 20.0)) / 100.0
-        print(f"      CREPE tuning: median {median_c:+.1f} ¢ → correcting {shift_st:+.4f} st",
+        print(f"      {label} tuning: median {median_c:+.1f} ¢ → correcting {shift_st:+.4f} st",
               flush=True)
         if HAS_PYRUBBERBAND:
             return rb.pitch_shift(vox_ch.astype(np.float32), SR, shift_st,
                                    rbargs={'-3': ''}).astype(np.float32)
+        return None
+
+    # ── Try CREPE first (needs tensorflow; silent fallback if unavailable) ─────
+    try:
+        import crepe as _crepe
+        clip = vox_ch[:SR * 30].astype(np.float32)
+        _, frequency, confidence, _ = _crepe.predict(
+            clip, SR, viterbi=True, verbose=0, model_capacity='tiny')
+        voiced_f = frequency[(confidence > 0.80) & (frequency > 60) & (frequency < 1100)]
+        result = _apply_global_cents(voiced_f, "CREPE")
+        if result is not None:
+            return result
+        return vox_ch
+    except ImportError:
+        pass  # No tensorflow — fall through to PYIN
     except Exception as _e:
-        print(f"      [CREPE skipped: {_e}]", flush=True)
+        print(f"      [CREPE error: {_e} — falling back to PYIN global tuning]", flush=True)
+
+    # ── PYIN fallback: median F0 over voiced frames ──────────────────────────
+    # Safe for global offset — we're not doing note-level correction, just
+    # detecting the systematic sharp/flat bias and removing it.
+    try:
+        clip = vox_ch[:SR * 20].astype(np.float32)  # 20s sample
+        f0, voiced_flag, _ = librosa.pyin(
+            clip, fmin=60, fmax=1100, sr=SR, hop_length=512, fill_na=None)
+        if voiced_flag is not None:
+            voiced_f = f0[voiced_flag & (f0 > 60) & (f0 < 1100)] \
+                       if f0 is not None else np.array([])
+        else:
+            voiced_f = f0[~np.isnan(f0)] if f0 is not None else np.array([])
+        result = _apply_global_cents(voiced_f.tolist() if len(voiced_f) else [], "PYIN")
+        if result is not None:
+            return result
+    except Exception as _e:
+        print(f"      [PYIN global tuning skipped: {_e}]", flush=True)
+
     return vox_ch
 
 
@@ -3068,7 +3098,7 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         PeakFilter(cutoff_frequency_hz=500.0,  gain_db=-1.5,  q=0.7),  # lo-mid warmth control (250-800Hz)
         PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5,  q=2.5),  # ear-fatigue notch
         PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.5,  q=0.7),  # hi-mid harshness (broadened: was Q1.0 -2.0dB)
-        PeakFilter(cutoff_frequency_hz=4500.0, gain_db=-2.0,  q=0.7),  # broad 3-6kHz cut (addresses Hi-Mid ratio)
+        PeakFilter(cutoff_frequency_hz=4500.0, gain_db=-3.0,  q=0.7),  # broad 3-6kHz cut (target Hi-Mid ratio < -3dB)
         HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-1.5),
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
