@@ -580,6 +580,10 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
             PeakFilter(cutoff_frequency_hz=style["comp_eq_hz"], gain_db=-3.0, q=1.2),
             PeakFilter(cutoff_frequency_hz=1200.0, gain_db=-4.0, q=0.8),
             PeakFilter(cutoff_frequency_hz=2500.0, gain_db=-2.0, q=1.0),  # upper-mid cut on beat
+            # Hi-Mid carve on the instrumental: reduces 3-5kHz beat energy to create space
+            # and lower the Hi-Mid vs Mid ratio in the final mix. Q=2.0 keeps upper -3dB
+            # at ~4.8kHz — stays clear of 6kHz hi-hat bleed measurement band.
+            PeakFilter(cutoff_frequency_hz=3800.0, gain_db=-2.5, q=2.0),
         ])
         inst_c = _comp_eq(inst_c.T.astype(np.float32), SR).T.astype(np.float32)
 
@@ -3097,8 +3101,8 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         PeakFilter(cutoff_frequency_hz=250.0,  gain_db=-0.5,  q=0.8),  # mud cut
         PeakFilter(cutoff_frequency_hz=500.0,  gain_db=-1.5,  q=0.7),  # lo-mid warmth control (250-800Hz)
         PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5,  q=2.5),  # ear-fatigue notch
-        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.5,  q=1.5),  # hi-mid harshness — Q1.5 stays 2.8-4.4kHz
-        PeakFilter(cutoff_frequency_hz=4200.0, gain_db=-2.5,  q=1.5),  # upper presence — Q1.5 stays 3.3-5.3kHz
+        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.0,  q=1.0),  # hi-mid harshness cut
+        PeakFilter(cutoff_frequency_hz=4000.0, gain_db=-1.5,  q=1.0),  # upper presence cut (2.5-6kHz)
         HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-1.5),
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
