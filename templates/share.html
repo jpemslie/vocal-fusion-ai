@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VocalFusion — {{ job.name_a }} × {{ job.name_b }}</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:      #0a0a0a;
+    --surface: #111;
+    --border:  #222;
+    --accent:  #7c3aed;
+    --accent2: #a855f7;
+    --text:    #e5e5e5;
+    --muted:   #666;
+    --err:     #ef4444;
+    --good:    #22c55e;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'SF Mono', 'Fira Code', 'Menlo', monospace;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 48px 20px 0;
+  }
+
+  .wrap { width: 100%; max-width: 580px; flex: 1; }
+
+  /* Header */
+  .header { margin-bottom: 32px; }
+  .header h1 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--accent2);
+  }
+  .header .subtitle {
+    font-size: .78rem;
+    color: var(--text);
+    margin-top: 6px;
+    line-height: 1.5;
+  }
+  .header .subtitle .song-name {
+    color: var(--accent2);
+    font-weight: 600;
+  }
+  .header p.tagline { font-size: .7rem; color: var(--muted); margin-top: 4px; }
+
+  /* Score badge */
+  .score-wrap { margin-bottom: 24px; }
+  .score-inner {
+    display: inline-flex; align-items: center; gap: 10px;
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 16px; background: var(--surface);
+  }
+  .score-label { font-size: .65rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .score-val { font-size: 1.5rem; font-weight: 700; color: var(--good); }
+  .score-grade { font-size: .85rem; color: var(--muted); }
+
+  /* Variant tabs */
+  .tab-row {
+    display: flex; gap: 0; border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    padding: 8px 20px; font-family: inherit; font-size: .72rem;
+    letter-spacing: .08em; text-transform: uppercase;
+    background: none; border: none; color: var(--muted);
+    cursor: pointer; border-bottom: 2px solid transparent;
+    margin-bottom: -1px; transition: color .15s, border-color .15s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent2); border-bottom-color: var(--accent2); }
+  .tab-badge {
+    font-size: .6rem; padding: 1px 5px; border-radius: 3px;
+    background: var(--border); color: var(--muted); margin-left: 5px; vertical-align: middle;
+  }
+
+  /* Player */
+  .player-wrap {
+    background: var(--surface); border: 1px solid var(--border);
+    border-top: none; border-radius: 0 0 8px 8px; padding: 20px;
+    margin-bottom: 24px;
+  }
+
+  #waveform {
+    width: 100%;
+    margin-bottom: 16px;
+    border-radius: 4px;
+    overflow: hidden;
+    min-height: 64px;
+    background: var(--bg);
+  }
+
+  .controls-row {
+    display: flex; align-items: center; gap: 14px; margin-bottom: 14px;
+  }
+
+  .play-btn {
+    width: 44px; height: 44px;
+    background: var(--accent);
+    border: none; border-radius: 50%;
+    color: #fff; font-size: 1.1rem;
+    cursor: pointer; transition: background .15s;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .play-btn:hover { background: var(--accent2); }
+  .play-btn:disabled { opacity: .4; cursor: default; }
+
+  .time-display {
+    font-size: .72rem; color: var(--muted); letter-spacing: .04em;
+  }
+
+  .dl-link {
+    display: inline-block;
+    font-size: .68rem; color: var(--accent2); text-decoration: none;
+    letter-spacing: .06em; text-transform: uppercase;
+  }
+  .dl-link:hover { text-decoration: underline; }
+
+  .variant-desc {
+    font-size: .66rem; color: var(--muted); margin-top: 10px; line-height: 1.5;
+  }
+
+  /* CTA row */
+  .cta-row {
+    display: flex; gap: 12px; align-items: center; margin-bottom: 48px; flex-wrap: wrap;
+  }
+
+  .cta-btn {
+    padding: 11px 22px;
+    background: var(--accent);
+    color: #fff;
+    border: none; border-radius: 8px;
+    font-family: inherit; font-size: .8rem; font-weight: 600;
+    letter-spacing: .08em; text-transform: uppercase;
+    cursor: pointer; text-decoration: none;
+    transition: background .15s;
+    display: inline-block;
+  }
+  .cta-btn:hover { background: var(--accent2); }
+
+  /* Footer */
+  footer {
+    width: 100%;
+    max-width: 580px;
+    border-top: 1px solid var(--border);
+    padding: 20px 0 32px;
+    font-size: .65rem;
+    color: var(--muted);
+    letter-spacing: .06em;
+    text-transform: uppercase;
+  }
+  footer a { color: var(--accent2); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="header">
+    <h1>VocalFusion</h1>
+    <div class="subtitle">
+      <span class="song-name">{{ job.name_a }}</span>
+      <span style="color:var(--muted)"> × </span>
+      <span class="song-name">{{ job.name_b }}</span>
+    </div>
+    <p class="tagline">AI Vocal Fusion · MDX-Net + Demucs · CREPE pitch matching</p>
+  </div>
+
+  {% if job.score is not none %}
+  <div class="score-wrap">
+    <div class="score-inner">
+      <div>
+        <div class="score-label">Quality Score</div>
+        <div>
+          <span class="score-val">{{ job.score }}</span>
+          <span class="score-grade" id="scoreGradeEl"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="tab-row" id="tabRow">
+    {% if job.variants.radio is defined %}
+    <button class="tab active" id="tabRadio" onclick="switchTab('radio')">
+      Radio <span class="tab-badge">-12 LUFS</span>
+    </button>
+    {% endif %}
+    {% if job.variants.club is defined %}
+    <button class="tab" id="tabClub" onclick="switchTab('club')">
+      Club <span class="tab-badge">-9 LUFS</span>
+    </button>
+    {% endif %}
+    {% if job.variants.intimate is defined %}
+    <button class="tab" id="tabIntimate" onclick="switchTab('intimate')">
+      Intimate <span class="tab-badge">-14 LUFS</span>
+    </button>
+    {% endif %}
+  </div>
+
+  <div class="player-wrap">
+    <div id="waveform"></div>
+    <div class="controls-row">
+      <button class="play-btn" id="playBtn" onclick="togglePlay()" disabled>▶</button>
+      <span class="time-display" id="timeDisplay">0:00 / 0:00</span>
+    </div>
+    <a class="dl-link" id="dlLink" href="#" download>↓ Download</a>
+    <div class="variant-desc" id="variantDesc"></div>
+  </div>
+
+  <div class="cta-row">
+    <a class="cta-btn" href="/">Create your own →</a>
+  </div>
+
+</div>
+
+<footer>
+  Made with <a href="/">VocalFusion</a> · AI Vocal Fusion Engine
+</footer>
+
+<script src="https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js"></script>
+<script>
+const VARIANTS = {{ job.variants | tojson }};
+const DESCS = {
+  radio:    'Balanced mix · -12 LUFS · optimised for streaming and casual listening.',
+  club:     'Punchier sub, harder glue compression · -9 LUFS · optimised for large speakers and DJ playback.',
+  intimate: 'Wide stereo, high dynamic range · -14 LUFS · optimised for headphones and streaming platforms.',
+};
+
+let ws = null;
+let _active = 'radio';
+
+function fmtTime(s) {
+  if (isNaN(s)) return '0:00';
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return m + ':' + String(sec).padStart(2, '0');
+}
+
+function initWaveSurfer(url) {
+  if (ws) { ws.destroy(); ws = null; }
+  document.getElementById('playBtn').disabled = true;
+  document.getElementById('playBtn').textContent = '▶';
+  document.getElementById('timeDisplay').textContent = '0:00 / 0:00';
+
+  ws = WaveSurfer.create({
+    container: '#waveform',
+    waveColor: '#7c3aed',
+    progressColor: '#a855f7',
+    url: url,
+    height: 64,
+    barWidth: 2,
+    barGap: 1,
+    barRadius: 2,
+    interact: true,
+  });
+
+  ws.on('ready', () => {
+    document.getElementById('playBtn').disabled = false;
+    const dur = ws.getDuration();
+    document.getElementById('timeDisplay').textContent = '0:00 / ' + fmtTime(dur);
+  });
+
+  ws.on('audioprocess', () => {
+    const cur = ws.getCurrentTime();
+    const dur = ws.getDuration();
+    document.getElementById('timeDisplay').textContent = fmtTime(cur) + ' / ' + fmtTime(dur);
+  });
+
+  ws.on('finish', () => {
+    document.getElementById('playBtn').textContent = '▶';
+  });
+
+  ws.on('play', () => {
+    document.getElementById('playBtn').textContent = '⏸';
+  });
+
+  ws.on('pause', () => {
+    document.getElementById('playBtn').textContent = '▶';
+  });
+}
+
+function togglePlay() {
+  if (ws) ws.playPause();
+}
+
+function switchTab(variant) {
+  if (!VARIANTS[variant]) return;
+  _active = variant;
+
+  ['radio', 'club', 'intimate'].forEach(v => {
+    const id = 'tab' + v.charAt(0).toUpperCase() + v.slice(1);
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('active', v === variant);
+  });
+
+  const url = VARIANTS[variant];
+  document.getElementById('dlLink').href = url;
+  document.getElementById('dlLink').download = url.split('/').pop();
+  document.getElementById('variantDesc').textContent = DESCS[variant] || '';
+
+  initWaveSurfer(url);
+}
+
+// Score grade
+{% if job.score is not none %}
+(function() {
+  const s = {{ job.score }};
+  let g = 'D';
+  if (s >= 95) g = 'A+'; else if (s >= 90) g = 'A';
+  else if (s >= 85) g = 'B+'; else if (s >= 80) g = 'B';
+  else if (s >= 75) g = 'C+'; else if (s >= 70) g = 'C';
+  document.getElementById('scoreGradeEl').textContent = g;
+})();
+{% endif %}
+
+// Init on first available variant
+(function() {
+  const first = ['radio', 'club', 'intimate'].find(v => VARIANTS[v]);
+  if (first) switchTab(first);
+})();
+</script>
+</body>
+</html>

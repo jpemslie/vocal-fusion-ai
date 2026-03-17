@@ -150,6 +150,21 @@
   .variant-desc {
     font-size: .66rem; color: var(--muted); margin-top: 8px; line-height: 1.5;
   }
+
+  /* Share row */
+  .share-row { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  .share-btn {
+    padding: 7px 18px;
+    background: transparent;
+    border: 1px solid var(--accent2);
+    color: var(--accent2);
+    border-radius: 6px;
+    font-family: inherit; font-size: .72rem; font-weight: 600;
+    letter-spacing: .08em; text-transform: uppercase;
+    cursor: pointer; transition: background .15s, color .15s;
+  }
+  .share-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .share-confirm { font-size: .7rem; color: var(--good); }
 </style>
 </head>
 <body>
@@ -212,6 +227,10 @@
       <a class="dl-link" id="dlLink" href="#" download>↓ Download</a>
       <div class="variant-desc" id="variantDesc"></div>
     </div>
+    <div class="share-row" id="shareRow" style="display:none">
+      <button class="share-btn" id="shareBtn" onclick="copyShare()">Share</button>
+      <span class="share-confirm" id="shareConfirm" style="display:none">Link copied!</span>
+    </div>
   </div>
 
 </div>
@@ -223,9 +242,10 @@ const DESCS = {
   intimate: 'Wide stereo, high dynamic range · -14 LUFS · optimised for headphones and streaming platforms.',
 };
 
-let pollId   = null;
+let pollId    = null;
 let _variants = {};
 let _active   = 'radio';
+let _jobId    = null;
 
 // ── Drag & drop helpers ──────────────────────────────────────────────────────
 function onDrag(e, id) { e.preventDefault(); document.getElementById('zone'+id).classList.add('over'); }
@@ -303,6 +323,7 @@ async function startFuse() {
     return;
   }
 
+  _jobId = data.job_id;
   pollId = setInterval(() => poll(data.job_id), 1500);
 }
 
@@ -334,6 +355,7 @@ async function poll(job_id) {
       showTab('tabClub',     !!_variants.club);
       showTab('tabIntimate', !!_variants.intimate);
       document.getElementById('variantsWrap').style.display = 'block';
+      document.getElementById('shareRow').style.display = 'flex';
       switchTab('radio');
     }
 
@@ -363,6 +385,15 @@ function scoreGrade(s) {
   if (s >= 85) return 'B+'; if (s >= 80) return 'B';
   if (s >= 75) return 'C+'; if (s >= 70) return 'C';
   return 'D';
+}
+
+function copyShare() {
+  const url = window.location.origin + '/share/' + _jobId;
+  navigator.clipboard.writeText(url).then(() => {
+    const confirm = document.getElementById('shareConfirm');
+    confirm.style.display = 'inline';
+    setTimeout(() => { confirm.style.display = 'none'; }, 2000);
+  });
 }
 </script>
 </body>

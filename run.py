@@ -67,6 +67,7 @@ def _run_fuse(job_id: str, path_a: str, path_b: str, out_path: str) -> None:
                 output_url=variants["radio"],   # default player src
                 variants=variants,
                 score=score,
+                share_url=f"/share/{job_id}",
             )
     except Exception as exc:
         with _lock:
@@ -94,7 +95,11 @@ def fuse_route():
     out_path = str(OUTPUT_DIR / f"{job_id}_fusion.wav")
 
     with _lock:
-        _jobs[job_id] = {"status": "running", "progress": 0, "message": "Starting…"}
+        _jobs[job_id] = {
+            "status": "running", "progress": 0, "message": "Starting…",
+            "name_a": Path(file_a.filename).stem,
+            "name_b": Path(file_b.filename).stem,
+        }
 
     t = threading.Thread(
         target=_run_fuse, args=(job_id, path_a, path_b, out_path), daemon=True
@@ -110,9 +115,22 @@ def status(job_id: str):
     return (jsonify(job), 200) if job else (jsonify(error="Unknown job"), 404)
 
 
+@app.route("/share/<job_id>")
+def share(job_id: str):
+    with _lock:
+        job = _jobs.get(job_id)
+    if not job or job.get("status") != "done":
+        return "Share link not ready or invalid.", 404
+    return render_template("share.html", job_id=job_id, job=job)
+
+
 @app.route("/output/<filename>")
 def output_file(filename: str):
     return send_from_directory(str(OUTPUT_DIR.resolve()), filename)
+
+
+from api import api_bp
+app.register_blueprint(api_bp)
 
 
 if __name__ == "__main__":
@@ -120,4 +138,5 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=5000)
     args = p.parse_args()
+    print(f"API: http://0.0.0.0:{args.port}/api/v1/  (see /api/v1/keys for auth)")
     app.run(host="0.0.0.0", port=args.port, debug=False)
