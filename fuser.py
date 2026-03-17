@@ -580,10 +580,6 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
             PeakFilter(cutoff_frequency_hz=style["comp_eq_hz"], gain_db=-3.0, q=1.2),
             PeakFilter(cutoff_frequency_hz=1200.0, gain_db=-4.0, q=0.8),
             PeakFilter(cutoff_frequency_hz=2500.0, gain_db=-2.0, q=1.0),  # upper-mid cut on beat
-            # Hi-Mid carve on the instrumental: reduces 3-5kHz beat energy to create space
-            # and lower the Hi-Mid vs Mid ratio in the final mix. Q=2.0 keeps upper -3dB
-            # at ~4.8kHz — stays clear of 6kHz hi-hat bleed measurement band.
-            PeakFilter(cutoff_frequency_hz=3800.0, gain_db=-2.5, q=2.0),
         ])
         inst_c = _comp_eq(inst_c.T.astype(np.float32), SR).T.astype(np.float32)
 

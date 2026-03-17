@@ -59,7 +59,7 @@ REF = {
     "ratio_sub_to_mid":    (+4.0, +18.0),
     "ratio_bass_to_mid":   (+2.0, +20.0),
     "ratio_lowmid_to_mid": (-3.0, +10.0),   # > +10 = MUDDY (EDM/hip-hop naturally warm)
-    "ratio_himid_to_mid":  (-20.0, -3.0),  # > -3 = HARSH, < -20 = DULL
+    "ratio_himid_to_mid":  (-20.0, -1.0),  # > -1 = HARSH. Rap/EDM vocal mixes naturally sit at -1 to -2 dB
     "ratio_high_to_mid":   (-32.0, -8.0),  # > -8 = BRIGHT, < -32 = DARK
 
     # Derived ratios
@@ -133,7 +133,7 @@ REF_STRICT = {**REF,
     "mud_index":             (1.2, 4.5),
     "section_consistency_lu":(0.0, 3.5),
     "ratio_lowmid_to_mid":   (-3.0, +6.0),
-    "ratio_himid_to_mid":    (-18.0, -4.0),
+    "ratio_himid_to_mid":    (-18.0, -1.5),  # rap/EDM vocal mixes sit at -1 to -2 dB naturally
 }
 
 PENALTIES = {
