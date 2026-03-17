@@ -1665,8 +1665,8 @@ def _arrangement_gain_curves(beat_secs: list, vox_secs: list,
     Returns (beat_gain, vox_gain) — float32 arrays of length n_samples.
     """
     _BEAT_GAIN = {
-        'intro': 0.95, 'verse': 0.85, 'chorus': 1.00,
-        'drop':  1.00, 'breakdown': 0.70, 'bridge': 0.90, 'outro': 0.92,
+        'intro': 1.00, 'verse': 0.82, 'chorus': 1.00,
+        'drop':  1.00, 'breakdown': 0.55, 'bridge': 0.88, 'outro': 0.90,
     }
     _VOX_GAIN = {
         'intro': 0.85, 'verse': 1.00, 'chorus': 1.08,
