@@ -66,7 +66,7 @@ _BS_ROFORMER    = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
 _MDX_VOCAL      = "Kim_Vocal_2.onnx"          # MDX-Net vocal (SDR ~9.5, ONNX fast on CPU)
 _MDX23C_VOCAL   = "MDX23C-8KFFT-InstVoc_HQ.ckpt"  # MDX23C vocal (SDR ~12+, better quality)
 _DENOISE_MODEL  = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"          # post-sep denoiser (SDR 27.99)
-_DEVERB_MODEL   = "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt"        # de-reverb vocal (SDR 19.17)
+_DEVERB_MODEL   = "deverb_bs_roformer_8_384dim_10depth.ckpt"                   # BS-Roformer de-reverb
 
 
 def _check(y: np.ndarray, label: str) -> np.ndarray:
@@ -217,10 +217,11 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
     return {
         "_rap_score": rap,  # pass-through for ADT and other downstream use
         # FET compressor: rap/trap → faster, harder
-        # Ratio cap 6:1 (was 8:1 — over-squashed vocal, LRA collapsed to 2.5 LU)
+        # Ratio cap 4.0:1 (was 6:1 — too aggressive on AI-separated stems, smears dynamics)
+        # Research: AI-separated vocal stems need 2:1-3:1; higher ratios crush micro-dynamics
         # Release min 60ms (was 40ms — too fast, caused pumping artifacts)
-        # Non-rap floor 2.2:1 (was 3.5:1 — over-squashing caused unnatural dynamics)
-        "fet_ratio":    float(np.interp(rap, [0, 1], [2.2, 6.0])),
+        # Non-rap floor 2.0:1 (was 3.5:1 → 2.2:1 — over-squashing caused unnatural dynamics)
+        "fet_ratio":    float(np.interp(rap, [0, 1], [2.0, 4.0])),
         "fet_attack":   float(np.interp(rap, [0, 1], [5.0, 3.0])),
         "fet_release":  float(np.interp(agg, [0, 1], [120.0, 60.0])),
 
@@ -1089,45 +1090,94 @@ def _run_roformer_on_stem(stem_path: Path, model_name: str, cache_dir: str,
     Run a Roformer model (denoiser or de-reverb) on an already-separated stem WAV.
     Overwrites stem_path with the cleaned output.  Returns True on success.
 
-    want_label: substring to match in output filename for the "good" stem.
-                'clean' for denoiser, 'dry' or 'vocals' for de-reverb.
+    Runs the separator in an isolated subprocess so that any segfault or OOM
+    in the heavy PyTorch model does not kill the parent fuse process.
     """
-    from audio_separator.separator import Separator
+    import subprocess
     tmp_dir = Path(tempfile.mkdtemp(dir=cache_dir))
+    result_flag = tmp_dir / "_done.flag"
+    chosen_out  = tmp_dir / "_chosen.wav"
+
+    # Build a self-contained script that runs the separator and writes the result
+    script = f"""
+import sys, shutil, logging
+from pathlib import Path
+import soundfile as sf
+import numpy as np
+sys.path.insert(0, {repr(str(Path(__file__).parent))})
+from audio_separator.separator import Separator
+
+tmp_dir   = Path({repr(str(tmp_dir))})
+stem_path = Path({repr(str(stem_path))})
+model_name = {repr(model_name)}
+cache_dir  = {repr(str(cache_dir))}
+want_label = {repr(want_label)}
+SR         = 44100
+
+# Strip parentheses from want_label to get the stem name for output_single_stem
+# e.g. "(dry)" -> "dry", "(noreverb)" -> "noreverb"
+_single_stem = want_label.strip("()") if want_label.startswith("(") else None
+
+sep = Separator(
+    log_level=logging.WARNING,
+    output_dir=str(tmp_dir),
+    output_format="WAV",
+    sample_rate=SR,
+    model_file_dir=str(Path(cache_dir) / "_models"),
+    output_single_stem=_single_stem,  # skip computing the noise/artifact stem → ~2x faster
+)
+sep.load_model(model_name)
+sep.separate(str(stem_path))
+
+all_wavs = sorted(p for p in tmp_dir.iterdir() if p.suffix.lower() == ".wav")
+print("      [Roformer] Output files:", [p.name for p in all_wavs], flush=True)
+
+# Reject stems that ARE the noise/reverb artifact side.
+# "(no dry)" must be rejected BEFORE "(dry)" is accepted since "dry" is a substring.
+# Use parenthesized labels for precision — avoids false substring matches.
+_reject = ["(noise)", "(no dry)", "(reverb)", "(residual)", "(background)", "(no vocals)"]
+_accept = [want_label, "(dry)", "(noreverb)", "(no noise)", "(no reverb)", "(clean)", "(vocals)"]
+
+chosen = None
+for p in all_wavs:
+    n = p.name.lower()
+    if any(h in n for h in _accept) and not any(r in n for r in _reject):
+        chosen = p; break
+if chosen is None:
+    # Fallback: first file that doesn't match any reject label
+    for p in all_wavs:
+        if not any(r in p.name.lower() for r in _reject):
+            chosen = p; break
+if chosen is None and all_wavs:
+    chosen = all_wavs[0]
+
+if chosen and chosen.exists():
+    y, _ = sf.read(str(chosen), always_2d=True)
+    if np.max(np.abs(y)) > 1e-4:
+        shutil.copy2(str(chosen), {repr(str(chosen_out))})
+        Path({repr(str(result_flag))}).touch()
+        print("      [Roformer] Chose:", chosen.name, flush=True)
+    else:
+        print("      [Roformer] Output was silent — skipping", flush=True)
+else:
+    print("      [Roformer] No usable output file found", flush=True)
+"""
     try:
-        sep = Separator(
-            log_level=logging.WARNING,
-            output_dir=str(tmp_dir),
-            output_format="WAV",
-            sample_rate=SR,
-            model_file_dir=str(Path(cache_dir) / "_models"),
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            timeout=2400,   # 40 min max (Mel-Roformer-Denoise needs ~17min on CPU)
+            capture_output=False,
         )
-        sep.load_model(model_name)
-        sep.separate(str(stem_path))
+        if proc.returncode != 0 and proc.returncode != -11:
+            # -11 = SIGSEGV, treat as a non-fatal failure
+            print(f"      [{model_name}] subprocess exited {proc.returncode}", flush=True)
 
-        # Find the desired output (the clean/dry side, not the noise/reverb side)
-        chosen = None
-        for p in tmp_dir.iterdir():
-            n = p.name.lower()
-            if want_label in n and "noise" not in n and "reverb" not in n:
-                chosen = p
-                break
-        if chosen is None:
-            # Fallback: pick the file that is NOT the noise/residual stem
-            wavs = sorted(tmp_dir.glob("*.wav"))
-            for p in wavs:
-                if "noise" not in p.name.lower() and "reverb" not in p.name.lower():
-                    chosen = p
-                    break
-            if chosen is None and wavs:
-                chosen = wavs[0]
-
-        if chosen and chosen.exists():
-            # Read, verify it's not silent, then overwrite
-            test, _ = sf.read(str(chosen), always_2d=True)
-            if np.max(np.abs(test)) > 1e-4:
-                shutil.copy2(str(chosen), str(stem_path))
-                return True
+        if result_flag.exists() and chosen_out.exists():
+            shutil.copy2(str(chosen_out), str(stem_path))
+            return True
+        return False
+    except subprocess.TimeoutExpired:
+        print(f"      [{model_name}] timed out after 15 min — skipping", flush=True)
         return False
     except Exception as _e:
         print(f"      [{model_name} failed: {_e}]", flush=True)
@@ -1137,7 +1187,7 @@ def _run_roformer_on_stem(stem_path: Path, model_name: str, cache_dir: str,
 
 
 def separate(audio_path: str, cache_dir: str = "vf_data/stems",
-             upgrade_vocal: bool = False) -> dict:
+             upgrade_vocal: bool = False, clean_vocal: bool = False) -> dict:
     """
     Separate vocals using the best available model:
       GPU available → BS-Roformer via audio-separator (SDR ~13, fast on GPU)
@@ -1217,31 +1267,27 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
     #         leaving a dry signal that sits cleanly in the new beat's space.
     # Both run on the already-separated vocals.wav and overwrite it in-place.
     # Sentinels prevent re-running if the file was already cleaned.
+    # clean_vocal=False for Song A (beat) — we don't need to clean its vocals.
     _voc_path = cached / "vocals.wav"
-    if _voc_path.exists():
+    if clean_vocal and _voc_path.exists():
         _denoise_sentinel = cached / "_vocal_denoised"
         if not _denoise_sentinel.exists():
             print("      [Neural Denoiser] Running Mel-Roformer-Denoise on vocal stem…",
                   flush=True)
             ok = _run_roformer_on_stem(_voc_path, _DENOISE_MODEL, cache_dir,
-                                       want_label="clean")
+                                       want_label="(dry)")  # model target_instrument=dry → outputs (Dry)/(No Dry)
             if ok:
                 _denoise_sentinel.touch()
                 print("      [Neural Denoiser] Vocal stem cleaned.", flush=True)
             else:
                 print("      [Neural Denoiser] Failed — using undenoised vocal.", flush=True)
 
-        _deverb_sentinel = cached / "_vocal_deverbed"
-        if not _deverb_sentinel.exists():
-            print("      [De-Reverb] Running BS-Roformer-De-Reverb on vocal stem…",
-                  flush=True)
-            ok = _run_roformer_on_stem(_voc_path, _DEVERB_MODEL, cache_dir,
-                                       want_label="dry")
-            if ok:
-                _deverb_sentinel.touch()
-                print("      [De-Reverb] Room reverb removed from vocal.", flush=True)
-            else:
-                print("      [De-Reverb] Failed — keeping vocal as-is.", flush=True)
+        # De-reverb DISABLED: studio-recorded vocals have intentional production reverb
+        # that is part of the performance. Removing it makes vocals sound unnatural
+        # and the model (63s/chunk × 27 chunks = 28 min) is too slow on CPU.
+        # De-reverb is only beneficial for room recordings, not studio productions.
+        # _deverb_sentinel = cached / "_vocal_deverbed"
+        # (de-reverb code removed)
 
     stems = {}
     for name in ("vocals", "no_vocals", "drums", "bass", "other"):
@@ -3655,7 +3701,7 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         # Research: +1 dB shelf at 3-5 kHz on the Mid improves mono compatibility
         # and punch-through on phone speakers / earbuds (where M/S collapses to mono).
         mid_eq = Pedalboard([
-            PeakFilter(cutoff_frequency_hz=350.0, gain_db=-0.75, q=1.2),  # reduced -1.5→-0.75: Lo-Mid
+            PeakFilter(cutoff_frequency_hz=350.0, gain_db=-1.5,  q=1.2),  # Lo-Mid mud in Mid channel
             LowShelfFilter(cutoff_frequency_hz=120.0, gain_db=0.5),  # sub warmth
             HighShelfFilter(cutoff_frequency_hz=4000.0, gain_db=0.0), # removed: was contributing to Hi-Mid excess
         ])
@@ -3679,8 +3725,9 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # A -1.5 dB cut at 3.2kHz dramatically reduces fatigue without perceived loudness loss,
     # freeing headroom for the limiter to work 0.5-1 dB harder.
     master_eq = Pedalboard([
-        PeakFilter(cutoff_frequency_hz=250.0,  gain_db=-0.5,  q=0.8),  # mud cut
-        PeakFilter(cutoff_frequency_hz=500.0,  gain_db=-1.5,  q=0.7),  # lo-mid warmth control (250-800Hz)
+        PeakFilter(cutoff_frequency_hz=250.0,  gain_db=-1.5,  q=0.8),  # mud cut
+        PeakFilter(cutoff_frequency_hz=500.0,  gain_db=-2.5,  q=0.7),  # lo-mid warmth control (250-800Hz)
+        PeakFilter(cutoff_frequency_hz=700.0,  gain_db=-1.0,  q=1.0),  # upper lo-mid cut
         PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5,  q=2.5),  # ear-fatigue notch
         PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.0,  q=1.0),  # hi-mid harshness cut
         PeakFilter(cutoff_frequency_hz=4000.0, gain_db=-1.5,  q=1.0),  # upper presence cut (2.5-6kHz)
@@ -3955,7 +4002,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     stems_a = separate(song_a, stems_cache, upgrade_vocal=False)  # beat — no vocal needed
 
     step(5, TOTAL, f"Separating stems — Song B (vocals) via {sep_model}…")
-    stems_b = separate(song_b, stems_cache, upgrade_vocal=True)   # vocal source — upgrade
+    stems_b = separate(song_b, stems_cache, upgrade_vocal=True, clean_vocal=True)   # vocal source — upgrade + neural clean
 
     inst = stems_a["no_vocals"]   # (samples, 2)
     vox  = stems_b["vocals"]      # (samples, 2)
