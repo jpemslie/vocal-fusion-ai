@@ -45,7 +45,8 @@ from pedalboard import (
 )
 from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
-from scipy.signal import butter, sosfilt
+from scipy.optimize import linear_sum_assignment
+from scipy.signal import butter, sosfilt, fftconvolve
 
 try:
     import pyrubberband as rb
@@ -332,7 +333,240 @@ def _beat_sonic_fingerprint(inst_mono: np.ndarray, bpm: float) -> dict:
     }
 
 
-def _produce_vocal_for_beat(vox: np.ndarray, fp: dict, bpm: float) -> np.ndarray:
+def _estimate_room_ir(inst_mono: np.ndarray, sr: int, n_taps: int = 8192) -> np.ndarray:
+    """
+    Extract a frequency-dependent room impulse response from the instrumental stem
+    using multi-band transient-tail analysis and Schroeder backward integration.
+
+    Returns a mono IR array (float32, length n_taps) normalised to unit peak.
+    Falls back to a synthetic frequency-dependent IR if fewer than 3 valid tails
+    are found in any band.
+    """
+    clip = inst_mono[: sr * 30].astype(np.float64)
+    hop  = 512
+
+    # ── Band-pass filters (defined outside any try-block — Python scope rule) ──
+    def _bp(lo, hi, order=4):
+        sos = butter(order, [lo / (sr / 2.0), hi / (sr / 2.0)],
+                     btype="band", output="sos")
+        return sos
+
+    sos_kick = _bp(60,   300)
+    sos_snare= _bp(300, 3000)
+    sos_hat  = _bp(3000,12000)
+    sos_sub  = _bp(20,   150)           # for contamination check
+    sos_hpf  = butter(4, 180.0 / (sr / 2.0), btype="high", output="sos")
+    sos_lpf8k= butter(4, 8000.0 / (sr / 2.0), btype="low", output="sos")
+
+    bands = [
+        ("kick",  sos_kick,  60,   300,  0.060),
+        ("snare", sos_snare, 300, 3000,  0.020),
+        ("hat",   sos_hat,  3000,12000,  0.010),
+    ]
+
+    early_ms  = int(0.080 * sr)   # 80 ms in samples
+    tail_ms   = n_taps             # max tail length = IR length
+
+    all_tails       = []           # (weight, tail_array) tuples for decay fitting
+    early_patterns  = []           # early reflection excerpts
+
+    for band_name, sos_band, _, _, _, in bands:
+        filt = sosfilt(sos_band, clip)
+
+        # Onset strength in this band
+        onset_env = librosa.onset.onset_strength(
+            y=filt.astype(np.float32), sr=sr, hop_length=hop,
+            aggregate=np.median,
+        )
+        # Peak picking — top 20 transients
+        peak_idx = np.argsort(onset_env)[-20:]
+        peak_samps = (peak_idx * hop).astype(int)
+
+        for ps in peak_samps:
+            if ps + tail_ms >= len(filt):
+                continue
+            tail = filt[ps: ps + tail_ms].copy()
+
+            # ── Contamination rejection: kick fundamental bleed ──────────────
+            # If a dominant spectral peak below 150 Hz is > 12 dB above broadband
+            # floor, this tail is likely a kick ring — skip it.
+            sub_filt  = sosfilt(sos_sub, tail)
+            sub_rms   = float(np.sqrt(np.mean(sub_filt ** 2)) + 1e-12)
+            broad_rms = float(np.sqrt(np.mean(tail ** 2)) + 1e-12)
+            sub_db_above = 20.0 * np.log10(sub_rms / broad_rms + 1e-12)
+            if sub_db_above > -12.0:          # sub is <12 dB below broadband
+                continue                       # kick ring — reject
+
+            # ── Early reflections (first 80 ms) ─────────────────────────────
+            early = tail[:early_ms].copy()
+            # Normalise by peak so averaging across transients is meaningful
+            epk = float(np.max(np.abs(early)) + 1e-12)
+            early_patterns.append(early / epk)
+
+            # ── Decay tail (80 ms onward) — weight by peak amplitude ─────────
+            decay = tail[early_ms:].copy()
+            weight = float(np.max(np.abs(tail[:early_ms]) + 1e-12))
+            if np.max(np.abs(decay)) > 1e-9:
+                all_tails.append((weight, decay))
+
+    # ── Frequency-dependent RT60 via Schroeder integration ───────────────────
+    # Measure at 250 Hz, 1 kHz, 4 kHz, 8 kHz
+    rt60_bands = [
+        (200,  350,  butter(4, [200.0/(sr/2), 350.0/(sr/2)],  btype="band", output="sos")),
+        (800, 1250,  butter(4, [800.0/(sr/2), 1250.0/(sr/2)], btype="band", output="sos")),
+        (3150,5000,  butter(4, [3150.0/(sr/2), 5000.0/(sr/2)],btype="band", output="sos")),
+        (6300,9000,  butter(4, [6300.0/(sr/2), 9000.0/(sr/2)],btype="band", output="sos")),
+    ]
+
+    rt60_values = []   # list of (centre_freq_hz, rt60_s)
+    for lo, hi, sos_rt in rt60_bands:
+        filt_b = sosfilt(sos_rt, clip)
+        # Energy decay curve (Schroeder backward integration)
+        sq = filt_b ** 2
+        edc = np.cumsum(sq[::-1])[::-1]
+        edc_db = 10.0 * np.log10(edc / (edc[0] + 1e-30) + 1e-30)
+        # Find -60 dB point (or estimate by fitting -5 to -25 dB slope)
+        try:
+            idx5  = int(np.argmax(edc_db <= -5.0))
+            idx25 = int(np.argmax(edc_db <= -25.0))
+            if idx25 > idx5 + 10:
+                slope = (edc_db[idx25] - edc_db[idx5]) / ((idx25 - idx5) / float(sr))
+                rt60  = -60.0 / slope if slope < -0.01 else 0.4
+            else:
+                rt60 = 0.4
+        except Exception:
+            rt60 = 0.4
+        rt60 = float(np.clip(rt60, 0.05, 3.0))
+        rt60_values.append(((lo + hi) / 2.0, rt60))
+
+    # ── Build composite IR ────────────────────────────────────────────────────
+    ir = np.zeros(n_taps, dtype=np.float64)
+
+    # Early reflections (0–80 ms)
+    if len(early_patterns) >= 3:
+        # Align to same length then average
+        min_ep = min(len(e) for e in early_patterns)
+        early_avg = np.mean(np.stack([e[:min_ep] for e in early_patterns], axis=0), axis=0)
+        ir[:min_ep] = early_avg
+    else:
+        # Synthetic: single direct + two early reflections
+        ir[0] = 1.0
+        r1 = min(int(0.012 * sr), n_taps - 1)
+        r2 = min(int(0.028 * sr), n_taps - 1)
+        ir[r1] += 0.35
+        ir[r2] += 0.20
+
+    # Late reverberation (80 ms onward) — frequency-dependent decay
+    # Use per-octave-band RT60 to build separate decay envelopes, then sum
+    t_late = np.arange(n_taps - early_ms) / float(sr)   # time axis for tail
+    if len(rt60_values) >= 2:
+        # Interpolate RT60 across frequency, then for each sample index build
+        # a weighted sum of per-band decays (approximates freq-dep late field).
+        freqs_rt  = np.array([v[0] for v in rt60_values])
+        rt60s     = np.array([v[1] for v in rt60_values])
+        # Frequency-weighted decay: sum of band-limited exponentials
+        late_env = np.zeros_like(t_late)
+        weights  = [1.0, 1.2, 0.9, 0.7]   # rough energy weights per band
+        for i, (fc, rt60_i) in enumerate(rt60_values):
+            decay_rate = np.log(1e-3) / rt60_i   # -60 dB in rt60 seconds
+            late_env  += weights[i] * np.exp(decay_rate * t_late)
+        late_env /= float(np.max(np.abs(late_env)) + 1e-12)
+
+        # Scale to blend smoothly from early reflections at 80 ms
+        ep_val = float(np.max(np.abs(ir[:early_ms])) + 1e-12) * 0.5
+        ir[early_ms:] = late_env * ep_val
+    elif len(all_tails) >= 3:
+        # Enough extracted tails — weighted-average the measured decay
+        max_tail = min(n_taps - early_ms, min(len(t[1]) for t in all_tails))
+        weighted_sum = np.zeros(max_tail, dtype=np.float64)
+        weight_total = 0.0
+        for w, tail in all_tails:
+            weighted_sum += w * tail[:max_tail]
+            weight_total += w
+        if weight_total > 0:
+            avg_tail = weighted_sum / weight_total
+            ep_val = float(np.max(np.abs(ir[:early_ms])) + 1e-12) * 0.5
+            norm_t  = float(np.max(np.abs(avg_tail)) + 1e-12)
+            ir[early_ms: early_ms + max_tail] = avg_tail / norm_t * ep_val
+    else:
+        # Full synthetic fallback — single exponential, RT60=0.35 s
+        rt60_fb = 0.35
+        decay_rate_fb = np.log(1e-3) / rt60_fb
+        t_all = np.arange(n_taps) / float(sr)
+        ir = np.exp(decay_rate_fb * t_all)
+        ir[0] = 1.0
+
+    # ── Post-processing ───────────────────────────────────────────────────────
+    # HPF at 180 Hz (sub-bass reverb on vocals = mud)
+    ir = sosfilt(sos_hpf, ir)
+    # Gentle HF roll-off above 8 kHz (rooms don't reflect ultra-high freqs)
+    ir = sosfilt(sos_lpf8k, ir)
+    # Normalise to unit peak
+    pk = float(np.max(np.abs(ir)) + 1e-12)
+    ir = (ir / pk).astype(np.float32)
+    return ir
+
+
+def _apply_space_match(
+    vox: np.ndarray,
+    ir_estimated: np.ndarray,
+    reverb_tail_score: float,
+    sr: int,
+) -> np.ndarray:
+    """
+    Convolve the vocal with the estimated room IR to place it in the same
+    acoustic space as the instrumental.  Uses psychoacoustic wet scaling so
+    a dry punchy beat gets less space than a roomy ambient one.
+    """
+    wet = float(np.interp(reverb_tail_score, [0.0, 1.0], [0.025, 0.065]))
+
+    # Wet return processing filters (outside try-block — Python scope rule)
+    sos_hpf_wet = butter(4, 450.0 / (sr / 2.0), btype="high", output="sos")
+
+    nyq = sr / 2.0
+    # -1.5 dB high shelf at 6 kHz
+    sos_hshelf = butter(2, 6000.0 / nyq, btype="low", output="sos")   # gentle LP proxy
+    # -2 dB peak at 500 Hz Q=1.5 — approximated as a narrow low-shelf notch
+    sos_notch  = butter(2, [350.0 / nyq, 700.0 / nyq], btype="band", output="sos")
+
+    ir = ir_estimated.astype(np.float64)
+    n_out = vox.shape[0]
+
+    if vox.ndim == 1:
+        vox = vox[:, np.newaxis]
+    n_ch = vox.shape[1]
+
+    wet_channels = []
+    for c in range(n_ch):
+        ch = vox[:, c].astype(np.float64)
+        # Per-channel convolution with mono IR (same IR on L and R)
+        conv = fftconvolve(ch, ir, mode="full")[:n_out]
+        # HPF wet return at 450 Hz
+        conv = sosfilt(sos_hpf_wet, conv)
+        # Gentle high-shelf cut at 6 kHz (-1.5 dB) — low-pass proxy blend
+        conv_lp   = sosfilt(sos_hshelf, conv)
+        shelf_gain = 10.0 ** (-1.5 / 20.0)
+        conv = conv * shelf_gain + conv_lp * (1.0 - shelf_gain)
+        # -2 dB notch at 500 Hz (removes boxiness)
+        conv_band = sosfilt(sos_notch, conv)
+        notch_gain = 10.0 ** (-2.0 / 20.0)
+        conv = conv - conv_band * (1.0 - notch_gain)
+        wet_channels.append(conv)
+
+    wet_arr  = np.stack(wet_channels, axis=1).astype(np.float32)
+    dry_arr  = vox[:n_out].astype(np.float32)
+    result   = np.clip(dry_arr * (1.0 - wet) + wet_arr * wet, -1.0, 1.0)
+    result   = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    print(f"      [Space Match] Applied room IR (wet={wet:.3f})", flush=True)
+    return result
+
+
+def _produce_vocal_for_beat(
+    vox: np.ndarray,
+    fp: dict,
+    bpm: float,
+    ir_estimated: np.ndarray = None,
+) -> np.ndarray:
     """
     Re-produce the vocal to sound like it belongs in the beat's sonic universe.
 
@@ -347,6 +581,7 @@ def _produce_vocal_for_beat(vox: np.ndarray, fp: dict, bpm: float) -> np.ndarray
       3. Beat-matched reverb   — room size and pre-delay tuned to beat's space
       4. BPM-synced delay      — 1/8-note echo locks vocal timing to beat grid
       5. Dynamic feel matching — if beat is squashed, vocal gets matching glue comp
+      6. Acoustic space match  — convolve with estimated room IR (freq-dependent)
     """
     result = vox.copy().astype(np.float32)
 
@@ -407,6 +642,14 @@ def _produce_vocal_for_beat(vox: np.ndarray, fp: dict, bpm: float) -> np.ndarray
         glue = Pedalboard([Compressor(threshold_db=-16.0, ratio=glue_ratio,
                                       attack_ms=25.0, release_ms=180.0)])
         result = glue(result.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # ── 6. Acoustic space matching ────────────────────────────────────────────
+    # After the Pedalboard reverb (which handles pre-delay and room size character),
+    # apply the frequency-dependent room IR extracted from the actual instrumental.
+    # This places the vocal in the same physical acoustic space as the beat — the
+    # #1 reason mashups sound "pasted on" vs recorded together.
+    if ir_estimated is not None and len(ir_estimated) > 100:
+        result = _apply_space_match(result, ir_estimated, fp["reverb_tail"], SR)
 
     return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
@@ -1562,7 +1805,15 @@ def _detect_all_sections(y_mono: np.ndarray, n_sections: int = 7) -> list:
 
     Uses MFCC + chroma agglomerative segmentation, then characterises each
     segment by its RMS energy, spectral brightness and onset density.
-    Returns a list of dicts: {start_s, end_s, label, energy, brightness, density}
+    Returns a list of dicts:
+      {start_s, end_s, label, energy, brightness, density,
+       chroma_density, harmonic_flux, spectral_contrast, dominant_chroma}
+
+    New fields (used by Arrangement Intelligence):
+      chroma_density     : fraction of 12 pitch classes active above their mean (0-1)
+      harmonic_flux      : mean frame-to-frame chroma change — measures harmonic movement
+      spectral_contrast  : mean spectral contrast — high = melodic, low = noise/drums
+      dominant_chroma    : index (0-11) of strongest pitch class in the section
     """
     try:
         hop = 512
@@ -1599,13 +1850,41 @@ def _detect_all_sections(y_mono: np.ndarray, n_sections: int = 7) -> list:
             f_e = min(librosa.time_to_frames(t_e, sr=SR, hop_length=hop), len(rms_f))
             if f_e <= f_s:
                 continue
+
+            # ── Richer features for Arrangement Intelligence ──────────────────
+            chroma_seg = chroma[:, f_s:f_e]
+            chroma_mean_per_class = chroma_seg.mean(axis=1)  # (12,)
+            chroma_density = float(
+                (chroma_mean_per_class > chroma_mean_per_class.mean()).sum() / 12.0
+            )
+
+            if chroma_seg.shape[1] > 1:
+                chroma_diff = np.diff(chroma_seg, axis=1)
+                harmonic_flux = float(np.abs(chroma_diff).mean())
+            else:
+                harmonic_flux = 0.0
+
+            try:
+                contrast_seg = librosa.feature.spectral_contrast(
+                    y=y_mono[int(t_s * SR):int(t_e * SR) + 1], sr=SR, hop_length=hop
+                )
+                spectral_contrast = float(contrast_seg.mean())
+            except Exception:
+                spectral_contrast = 0.0
+
+            dominant_chroma = int(chroma_mean_per_class.argmax())
+
             raw.append({
-                'start_s':   t_s,
-                'end_s':     t_e,
-                'energy':    float(rms_f[f_s:f_e].mean()),
-                'brightness':float(cen_f[f_s:f_e].mean()),
-                'density':   float(ons_f[f_s:f_e].mean()),
-                'label':     'unknown',
+                'start_s':           t_s,
+                'end_s':             t_e,
+                'energy':            float(rms_f[f_s:f_e].mean()),
+                'brightness':        float(cen_f[f_s:f_e].mean()),
+                'density':           float(ons_f[f_s:f_e].mean()),
+                'label':             'unknown',
+                'chroma_density':    chroma_density,
+                'harmonic_flux':     harmonic_flux,
+                'spectral_contrast': spectral_contrast,
+                'dominant_chroma':   dominant_chroma,
             })
 
         if not raw:
@@ -1639,6 +1918,201 @@ def _detect_all_sections(y_mono: np.ndarray, n_sections: int = 7) -> list:
     except Exception as _e:
         print(f"      [section detect failed: {_e}]", flush=True)
         return []
+
+
+def _score_section_pair(vox_sec: dict, beat_sec: dict) -> float:
+    """
+    Score compatibility between a vocal section and a beat section for arrangement.
+    Returns 0.0 (incompatible) to 1.0 (perfect match).
+
+    Features:
+      - Energy compatibility (0.30): target 0.5-0.7 vocal/beat energy ratio
+      - Density match (0.20): syllable rate should match rhythmic complexity
+      - Spectral contrast complement (0.15): high-contrast vocal + high-contrast beat = good
+      - Harmonic flux compatibility (0.15): both sections should have similar harmonic movement rate
+      - Duration ratio (0.10): penalise severe length mismatches
+      - Chroma density complement (0.10): harmonically busy vocal + harmonically busy beat
+    """
+    # Energy compatibility: score highest when vocal is 50-70% of beat energy
+    energy_ratio = (vox_sec['energy'] + 1e-9) / (beat_sec['energy'] + 1e-9)
+    energy_score = float(np.clip(1.0 - abs(energy_ratio - 0.575) / 0.35, 0.0, 1.0))
+
+    # Density match: both sparse or both dense
+    density_score = 1.0 - float(np.clip(abs(vox_sec['density'] - beat_sec['density']), 0, 1))
+
+    # Spectral contrast complement
+    contrast_score = 1.0 - float(np.clip(
+        abs(vox_sec.get('spectral_contrast', 0.5) - beat_sec.get('spectral_contrast', 0.5)) / 2.0,
+        0, 1
+    ))
+
+    # Harmonic flux: similar harmonic movement rate sounds natural together
+    flux_score = 1.0 - float(np.clip(
+        abs(vox_sec.get('harmonic_flux', 0.1) - beat_sec.get('harmonic_flux', 0.1)) * 5.0,
+        0, 1
+    ))
+
+    # Duration ratio: penalize >3x length mismatch
+    vox_dur = vox_sec['end_s'] - vox_sec['start_s']
+    beat_dur = beat_sec['end_s'] - beat_sec['start_s']
+    dur_ratio = min(vox_dur, beat_dur) / (max(vox_dur, beat_dur) + 1e-9)
+    duration_score = float(np.clip(dur_ratio, 0, 1))
+
+    # Chroma density complement
+    chroma_score = 1.0 - float(np.clip(
+        abs(vox_sec.get('chroma_density', 0.5) - beat_sec.get('chroma_density', 0.5)),
+        0, 1
+    ))
+
+    return (0.30 * energy_score + 0.20 * density_score + 0.15 * contrast_score +
+            0.15 * flux_score + 0.10 * duration_score + 0.10 * chroma_score)
+
+
+def _arrange_sections(vox_secs: list, beat_secs: list) -> list:
+    """
+    Intelligently assign vocal sections to beat section slots using:
+    1. Narrative tiering — prevents high-energy chorus vocals on low-energy intros
+    2. Energy arc — ensures the arrangement builds toward a peak then resolves
+    3. Harmonic momentum — avoids jarring chroma jumps at section boundaries
+    4. Hungarian algorithm within each tier for optimal within-tier assignment
+
+    Returns list of (vox_sec, beat_sec) pairs in beat temporal order.
+    Beat sections are NEVER reordered. Only vocal sections move.
+    Returns None if not enough sections for rearrangement.
+    """
+    if len(vox_secs) < 2 or len(beat_secs) < 2:
+        return None
+
+    # Narrative tier map (hard constraint: +-1 tier allowed)
+    _TIER = {'intro': 0, 'verse': 1, 'bridge': 1, 'chorus': 2, 'drop': 2,
+             'breakdown': 3, 'outro': 4}
+
+    n_vox  = len(vox_secs)
+    n_beat = len(beat_secs)
+
+    # Expected energy arc: rises to peak at 65% of song then resolves
+    total_dur = beat_secs[-1]['end_s'] if beat_secs else 1.0
+
+    def _ideal_energy(t_frac: float) -> float:
+        if t_frac < 0.65:
+            return 0.3 + 0.7 * (t_frac / 0.65) ** 1.5
+        else:
+            return 1.0 - 0.4 * ((t_frac - 0.65) / 0.35)
+
+    # Build (n_vox x n_beat) cost matrix
+    cost = np.zeros((n_vox, n_beat), dtype=np.float64)
+    for vi, vs in enumerate(vox_secs):
+        for bi, bs in enumerate(beat_secs):
+            score = _score_section_pair(vs, bs)
+            cost[vi, bi] = 1.0 - score
+
+            # HARD BLOCK: tier violation > +-1
+            vs_tier = _TIER.get(vs['label'], 2)
+            bs_tier = _TIER.get(bs['label'], 2)
+            if abs(vs_tier - bs_tier) > 1:
+                cost[vi, bi] = 10.0
+
+            # SOFT PENALTY: energy arc deviation
+            if cost[vi, bi] < 10.0:
+                beat_t_frac = bs['start_s'] / (total_dur + 1e-9)
+                ideal_e = _ideal_energy(beat_t_frac)
+                arc_penalty = float(np.clip(abs(vs['energy'] - ideal_e) * 0.5, 0.0, 0.4))
+                cost[vi, bi] += arc_penalty
+
+    # SOFT PENALTY: momentum — penalize consecutive low-energy vocal assignments
+    low_energy_threshold = 0.35
+    for bi in range(1, n_beat):
+        for vi in range(n_vox):
+            if cost[vi, bi] >= 10.0:
+                continue
+            if vox_secs[vi]['energy'] < low_energy_threshold:
+                prev_col_costs = cost[:, bi - 1]
+                cheapest_prev_vi = int(np.argmin(prev_col_costs))
+                if (prev_col_costs[cheapest_prev_vi] < 10.0 and
+                        vox_secs[cheapest_prev_vi]['energy'] < low_energy_threshold):
+                    cost[vi, bi] += 0.3
+
+    # Hungarian algorithm for optimal global assignment
+    row_ind, col_ind = linear_sum_assignment(cost)
+
+    # Build assignments list: (vox_sec, beat_sec) sorted by beat start time
+    assignments = []
+    for vi, bi in sorted(zip(row_ind, col_ind), key=lambda x: beat_secs[x[1]]['start_s']):
+        assignments.append((vox_secs[vi], beat_secs[bi]))
+
+    # Log assignments for debugging
+    print("      [Arrangement Intelligence] Section assignment matrix:", flush=True)
+    for vs, bs in assignments:
+        score = _score_section_pair(vs, bs)
+        vs_tier = _TIER.get(vs['label'], 2)
+        bs_tier = _TIER.get(bs['label'], 2)
+        print(f"        vox {vs['label']}(tier={vs_tier})@{vs['start_s']:.0f}s "
+              f"-> beat {bs['label']}(tier={bs_tier})@{bs['start_s']:.0f}s  "
+              f"score={score:.2f}", flush=True)
+
+    return assignments
+
+
+def _stitch_sections(vox: np.ndarray, assignments: list, sr: int = SR) -> np.ndarray:
+    """
+    Place vocal sections at beat section positions with equal-power crossfades.
+
+    Critical: operates at SECTION level (15-60s segments), NOT onset level.
+    Uses 200ms equal-power cosine fades at boundaries only.
+    Never += into the buffer (causes phase cancellation) — uses sequential placement.
+
+    Length handling:
+      - Vocal longer than beat slot: truncate at slot end, 200ms fade-out
+      - Vocal shorter than beat slot: place at slot start, silence fills remainder
+        (creates natural instrumental break — musically correct, not a bug)
+
+    Safety: if output RMS < 40% of input RMS, fall back to original vox (returns None).
+    """
+    out = np.zeros_like(vox, dtype=np.float32)
+
+    for vox_sec, beat_sec in assignments:
+        beat_start = int(beat_sec['start_s'] * sr)
+        beat_end   = min(int(beat_sec['end_s'] * sr), len(vox))
+        vox_start  = int(vox_sec['start_s'] * sr)
+        vox_end    = min(int(vox_sec['end_s'] * sr), len(vox))
+
+        seg = vox[vox_start:vox_end].copy()
+        if len(seg) == 0:
+            continue
+
+        slot_len = beat_end - beat_start
+        if slot_len <= 0:
+            continue
+
+        # Truncate if vocal is longer than the beat slot
+        if len(seg) > slot_len:
+            seg = seg[:slot_len]
+
+        # Equal-power cosine fades at head and tail
+        fade_n = min(int(0.20 * sr), len(seg) // 4)
+        if fade_n > 0:
+            t = np.linspace(0, np.pi / 2, fade_n)
+            fade_in_curve  = np.sin(t) ** 2  # 0->1 equal power
+            fade_out_curve = np.cos(t) ** 2  # 1->0 equal power
+            seg[:fade_n]  *= fade_in_curve[:, np.newaxis]
+            seg[-fade_n:] *= fade_out_curve[:, np.newaxis]
+
+        # Place segment into output buffer (sequential, no +=)
+        place_end = beat_start + len(seg)
+        if place_end > len(out):
+            seg = seg[:len(out) - beat_start]
+            place_end = len(out)
+        out[beat_start:place_end] = seg
+
+    # Safety check: if output RMS is below 40% of input RMS, return None for fallback
+    in_rms  = float(np.sqrt(np.mean(vox ** 2)) + 1e-9)
+    out_rms = float(np.sqrt(np.mean(out ** 2)) + 1e-9)
+    if out_rms < 0.40 * in_rms:
+        print("      [Arrangement Intelligence] Safety check: output RMS too low "
+              f"({out_rms:.4f} vs {in_rms:.4f}) — returning None for fallback.", flush=True)
+        return None
+
+    return np.nan_to_num(out.astype(np.float32))
 
 
 def _arrangement_gain_curves(beat_secs: list, vox_secs: list,
@@ -3666,7 +4140,19 @@ def fuse(song_a: str, song_b: str, out_path: str,
     print(f"      Fingerprint: sat={fp['saturation']:.2f}  bright={fp['brightness']:.2f}  "
           f"reverb={fp['reverb_tail']:.2f}  dynamic={fp['dynamic_feel']:.2f}  "
           f"texture={fp['texture']:.2f}  punch={fp['transient_punch']:.2f}", flush=True)
-    vox = _produce_vocal_for_beat(vox, fp, bpm_a)
+
+    # Estimate room IR from instrumental for acoustic space matching
+    print("      Estimating room IR for acoustic space matching…", flush=True)
+    try:
+        _room_ir = _estimate_room_ir(_to_mono(inst), SR)
+        print(f"      [Space Match] Room IR estimated: {len(_room_ir)/SR*1000:.0f}ms, estimated RT60 from IR",
+              flush=True)
+    except Exception as _ire:
+        print(f"      [Space Match] IR estimation failed ({_ire}), using synthetic reverb only",
+              flush=True)
+        _room_ir = None
+
+    vox = _produce_vocal_for_beat(vox, fp, bpm_a, ir_estimated=_room_ir)
     vox = _check(vox, "post-vocal-production")
 
     step(8, TOTAL, "Mixing (chorus-align + beat-snap + spectral carve + M/S + sidechain)…")
@@ -3733,6 +4219,28 @@ def fuse(song_a: str, song_b: str, out_path: str,
     if vox_secs:
         print("      Vocal: " + " | ".join(
             f"{s['label']}@{s['start_s']:.0f}s" for s in vox_secs), flush=True)
+
+    # ── Arrangement Intelligence: rearrange vocal sections for optimal compatibility ──
+    if beat_secs and vox_secs and len(beat_secs) >= 2 and len(vox_secs) >= 2:
+        print("      [Arrangement Intelligence] Scoring section compatibility…", flush=True)
+        assignments = _arrange_sections(vox_secs, beat_secs)
+        if assignments is not None:
+            print("      [Arrangement Intelligence] Assignments:", flush=True)
+            for vs, bs in assignments:
+                score = _score_section_pair(vs, bs)
+                print(f"        Vocal {vs['label']}@{vs['start_s']:.0f}s "
+                      f"→ Beat {bs['label']}@{bs['start_s']:.0f}s  "
+                      f"(score={score:.2f})", flush=True)
+            vox_arranged = _stitch_sections(vox, assignments, sr=SR)
+            if vox_arranged is not None:
+                vox = vox_arranged
+                print("      [Arrangement Intelligence] Vocal rearranged successfully.", flush=True)
+            else:
+                print("      [Arrangement Intelligence] Stitch safety check failed "
+                      "— keeping original order.", flush=True)
+        else:
+            print("      [Arrangement Intelligence] Not enough sections for rearrangement.",
+                  flush=True)
 
     if beat_secs or vox_secs:
         beat_gc, vox_gc = _arrangement_gain_curves(beat_secs, vox_secs, L)
