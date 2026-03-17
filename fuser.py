@@ -3097,8 +3097,8 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         PeakFilter(cutoff_frequency_hz=250.0,  gain_db=-0.5,  q=0.8),  # mud cut
         PeakFilter(cutoff_frequency_hz=500.0,  gain_db=-1.5,  q=0.7),  # lo-mid warmth control (250-800Hz)
         PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5,  q=2.5),  # ear-fatigue notch
-        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.5,  q=0.7),  # hi-mid harshness (broadened: was Q1.0 -2.0dB)
-        PeakFilter(cutoff_frequency_hz=4500.0, gain_db=-3.0,  q=0.7),  # broad 3-6kHz cut (target Hi-Mid ratio < -3dB)
+        PeakFilter(cutoff_frequency_hz=3500.0, gain_db=-2.5,  q=1.5),  # hi-mid harshness — Q1.5 stays 2.8-4.4kHz
+        PeakFilter(cutoff_frequency_hz=4200.0, gain_db=-2.5,  q=1.5),  # upper presence — Q1.5 stays 3.3-5.3kHz
         HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-1.5),
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
