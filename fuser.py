@@ -25,10 +25,13 @@ Mastering (v4):
 """
 
 import hashlib
+import json
 import logging
 import os
 import sys
 import tempfile
+import threading
+import time
 import shutil
 from pathlib import Path
 
@@ -930,6 +933,31 @@ def _file_id(path: str) -> str:
     return hashlib.md5(str(stat.st_size).encode() + head).hexdigest()[:12]
 
 
+# ── System 5: Song Fingerprint Database ───────────────────────────────────────
+# Cache per-song analysis (BPM, key, genre, stem quality) by SHA256 fingerprint.
+# Means analysis only runs once per song, ever — even across reboots/sessions.
+
+def _fp_path(fid: str, cache_dir: str) -> Path:
+    return Path(cache_dir) / fid / "_fingerprint.json"
+
+def _load_fp(fid: str, cache_dir: str) -> dict:
+    p = _fp_path(fid, cache_dir)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {}
+    return {}
+
+def _save_fp(fid: str, cache_dir: str, data: dict) -> None:
+    p = _fp_path(fid, cache_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    existing = _load_fp(fid, cache_dir)
+    existing.update({k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
+                     for k, v in data.items()})
+    p.write_text(json.dumps(existing, indent=2))
+
+
 def _to_mono(y: np.ndarray) -> np.ndarray:
     return y.mean(axis=1).astype(np.float32) if y.ndim == 2 else y.astype(np.float32)
 
@@ -1162,25 +1190,54 @@ if chosen and chosen.exists():
 else:
     print("      [Roformer] No usable output file found", flush=True)
 """
+    # System 4: Watchdog thread — kills subprocess if tmp_dir is stale for >3 min.
+    # Without this, audio-separator can hang mid-chunk (MPS/ONNX deadlock) and
+    # never exit, blocking the entire fuse for 40 minutes.
+    _STALE_LIMIT = 180   # seconds with no new output file activity → kill
+
+    def _watchdog(proc, watch_dir: Path, stale_s: int):
+        last_activity = time.time()
+        while proc.poll() is None:
+            time.sleep(20)
+            try:
+                # Any WAV or flag written to the tmp dir counts as activity
+                latest_mtime = max(
+                    (f.stat().st_mtime for f in watch_dir.iterdir()
+                     if f.suffix in (".wav", ".flag")),
+                    default=0.0,
+                )
+                if latest_mtime > last_activity:
+                    last_activity = latest_mtime
+                if time.time() - last_activity > stale_s and proc.poll() is None:
+                    print(f"      [{model_name}] watchdog: no activity for {stale_s}s"
+                          " — killing stalled subprocess", flush=True)
+                    proc.kill()
+                    return
+            except Exception:
+                pass
+
     try:
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            timeout=2400,   # 40 min max (Mel-Roformer-Denoise needs ~17min on CPU)
-            capture_output=False,
-        )
-        if proc.returncode != 0 and proc.returncode != -11:
-            # -11 = SIGSEGV, treat as a non-fatal failure
+        import subprocess as _sp
+        proc = _sp.Popen([sys.executable, "-c", script])
+        wd = threading.Thread(target=_watchdog,
+                              args=(proc, tmp_dir, _STALE_LIMIT), daemon=True)
+        wd.start()
+        try:
+            proc.wait(timeout=2400)   # hard ceiling: 40 min
+        except _sp.TimeoutExpired:
+            proc.kill()
+            print(f"      [{model_name}] hard timeout (40 min) — skipping", flush=True)
+            return False
+
+        if proc.returncode not in (0, -11, -9):
             print(f"      [{model_name}] subprocess exited {proc.returncode}", flush=True)
 
         if result_flag.exists() and chosen_out.exists():
             shutil.copy2(str(chosen_out), str(stem_path))
             return True
         return False
-    except subprocess.TimeoutExpired:
-        print(f"      [{model_name}] timed out after 15 min — skipping", flush=True)
-        return False
     except Exception as _e:
-        print(f"      [{model_name} failed: {_e}]", flush=True)
+        print(f"      [{model_name}] failed: {_e}", flush=True)
         return False
     finally:
         shutil.rmtree(str(tmp_dir), ignore_errors=True)
@@ -2517,6 +2574,72 @@ def _analyze_vocal_stem(vox: np.ndarray) -> dict:
         "comp_thresh_db":   comp_thresh,
         "dynamic_range_db": dyn_range,
         "noise_floor_db":   noise_floor_db,
+    }
+
+
+# ── System 2: Stem Quality Adaptive Processing ────────────────────────────────
+# Measure actual separation quality and right-size every processing parameter
+# to match the stem — high-bleed stems get aggressive cleanup; clean stems get
+# lighter touch to preserve natural dynamics.
+
+def _assess_stem_quality(vox: np.ndarray, inst: np.ndarray) -> dict:
+    """
+    Measure bleed, SNR, and vocal confidence of the separated vocal stem.
+    Returns a dict with raw metrics + recommended _bleed_params adjustments.
+    """
+    vox_m = _to_mono(vox)
+
+    def _band_rms(y, lo, hi):
+        nyq = SR / 2.0
+        lo_c = max(lo / nyq, 1e-4)
+        hi_c = min(hi / nyq, 1.0 - 1e-4)
+        sos = butter(4, [lo_c, hi_c], btype="band", output="sos")
+        return float(np.sqrt(np.mean(sosfilt(sos, y) ** 2) + 1e-12))
+
+    vox_mid_rms   = _band_rms(vox_m, 300, 5000)
+    hihat_rms     = _band_rms(vox_m, 6000, 14000)
+    bleed_ratio   = hihat_rms / (vox_mid_rms + 1e-9)
+
+    # SNR: ratio of 75th-percentile frame RMS to 10th-percentile (noise floor)
+    win        = int(SR * 0.04)
+    frames     = librosa.util.frame(vox_m, frame_length=win, hop_length=win // 2)
+    frms       = np.sqrt(np.mean(frames ** 2, axis=0) + 1e-12)
+    noise_flr  = float(np.percentile(frms, 10))
+    signal_lvl = float(np.percentile(frms, 75))
+    snr_db     = float(20 * np.log10(signal_lvl / (noise_flr + 1e-12)))
+
+    # Vocal confidence: spectral crest of the vocal stem (higher = more tonal/harmonic)
+    S     = np.abs(librosa.stft(vox_m[:SR * 30], n_fft=2048))
+    crest = float(S.max(axis=0).mean() / (S.mean(axis=0).mean() + 1e-9))
+
+    # Map metrics → recommended processing parameters
+    if bleed_ratio > 0.25:     # heavy bleed (e.g. Demucs on complex EDM)
+        wiener_floor   = 0.08
+        nr_strength    = 0.40
+        bleed_level    = "high"
+    elif bleed_ratio > 0.12:   # medium bleed
+        wiener_floor   = 0.14
+        nr_strength    = 0.25
+        bleed_level    = "medium"
+    else:                       # clean stem (MDX-Net upgrade successful)
+        wiener_floor   = 0.20
+        nr_strength    = 0.15
+        bleed_level    = "low"
+
+    # Low vocal confidence → cap FET ratio to avoid crushing already-thin vocal
+    max_fet_ratio = 2.5 if crest < 6 else 4.0
+
+    return {
+        "bleed_ratio":      round(bleed_ratio, 4),
+        "snr_db":           round(snr_db, 1),
+        "vocal_confidence": round(crest, 2),
+        "bleed_level":      bleed_level,
+        "needs_denoiser":   snr_db < 20,
+        "recommended": {
+            "wiener_mask_floor":    wiener_floor,
+            "noisereduce_strength": nr_strength,
+            "max_fet_ratio":        max_fet_ratio,
+        },
     }
 
 
@@ -3966,6 +4089,157 @@ def _fade(y: np.ndarray, fade_s: float = 2.0) -> np.ndarray:
     return y
 
 
+# ── System 1: Pre-Flight Compatibility Scorer ─────────────────────────────────
+# Runs before any heavy processing. Flags incompatible pairs early so we don't
+# waste 45 minutes producing a bad result. Returns a structured report with
+# pass/warn/fail per dimension and recommended adjustments.
+
+_NOTES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+
+def _preflight_check(full_a: np.ndarray, full_b: np.ndarray,
+                     bpm_a: float, bpm_b: float,
+                     key_a_root: int, key_a_mode: str,
+                     key_b_root: int, key_b_mode: str) -> dict:
+    """
+    Compatibility check before fusing. Returns dict with:
+      pass        : bool — False only for fatal mismatches (file silent, etc.)
+      warnings    : [str] — non-fatal issues to log
+      info        : [str] — all-clear confirmations
+      bpm_gap_pct : float
+      key_semitones: int
+      genre_sim   : float  (0–1, MFCC cosine similarity)
+    """
+    report: dict = {"pass": True, "warnings": [], "info": []}
+
+    # ── BPM gap ───────────────────────────────────────────────────────────────
+    bpm_gap_pct = abs(bpm_a - bpm_b) / max(bpm_a, 1.0) * 100
+    bpm_ratio   = max(bpm_a, bpm_b) / max(min(bpm_a, bpm_b), 1.0)
+    if bpm_ratio > 2.1:
+        report["pass"] = False
+        report["warnings"].append(
+            f"FATAL: BPM gap {bpm_gap_pct:.0f}% ({bpm_a:.0f} vs {bpm_b:.0f}) — "
+            ">2× stretch will make vocal unrecognisable. Aborting.")
+    elif bpm_gap_pct > 25:
+        report["warnings"].append(
+            f"Large BPM gap {bpm_gap_pct:.0f}%: beat will be time-stretched "
+            ">25%. Expect some vowel smearing on sustained notes.")
+    else:
+        report["info"].append(f"BPM gap {bpm_gap_pct:.0f}% — OK")
+
+    # ── Key distance ──────────────────────────────────────────────────────────
+    n_semi = abs(semitones_to_shift(key_b_root, key_b_mode, key_a_root, key_a_mode))
+    if n_semi > 6:
+        report["warnings"].append(
+            f"Key distance {n_semi} semitones "
+            f"({_NOTES[key_b_root]} {key_b_mode} → {_NOTES[key_a_root]} {key_a_mode}): "
+            "smart key-shift will find nearest harmonic alternative.")
+    elif n_semi > 3:
+        report["warnings"].append(
+            f"Key shift {n_semi} semitones — small formant-artifact risk on pitched vocals.")
+    else:
+        report["info"].append(f"Key distance {n_semi} semitones — compatible")
+
+    # ── Vocal presence (Song B) ───────────────────────────────────────────────
+    rms_b_db = float(20 * np.log10(_rms(full_b) + 1e-9))
+    if rms_b_db < -40:
+        report["pass"] = False
+        report["warnings"].append(
+            f"FATAL: Song B RMS {rms_b_db:.0f} dBFS — file may be silent or corrupt.")
+    else:
+        report["info"].append(f"Song B RMS {rms_b_db:.0f} dBFS — OK")
+
+    # ── Genre/tonal similarity (MFCC cosine) ──────────────────────────────────
+    try:
+        seg = SR * 30   # use first 30 s for speed
+        m_a = librosa.feature.mfcc(y=full_a[:seg], sr=SR, n_mfcc=12).mean(axis=1)
+        m_b = librosa.feature.mfcc(y=full_b[:seg], sr=SR, n_mfcc=12).mean(axis=1)
+        m_a /= np.linalg.norm(m_a) + 1e-9
+        m_b /= np.linalg.norm(m_b) + 1e-9
+        genre_sim = float(np.dot(m_a, m_b))
+    except Exception:
+        genre_sim = 0.5   # assume OK if analysis fails
+    report["genre_sim"] = genre_sim
+    if genre_sim < 0.30:
+        report["warnings"].append(
+            f"Low genre similarity ({genre_sim:.2f}): songs may be tonally incompatible. "
+            "Proceeding — result may require manual EQ.")
+    else:
+        report["info"].append(f"Genre similarity {genre_sim:.2f} — compatible")
+
+    report["bpm_gap_pct"]   = bpm_gap_pct
+    report["key_semitones"] = n_semi
+    return report
+
+
+# ── System 3: Multi-Attempt Parameter Grid Search ─────────────────────────────
+# On QC fail, run 5 quick re-mixes with systematically varied parameters and
+# keep the highest-scoring one.  Each re-mix is ~25 s (stems already in RAM).
+# This escapes the single-correction-path trap of the existing 3-attempt loop.
+
+_MIX_PARAM_GRID = [
+    # (vocal_level_delta, carve_db_delta, presence_db_delta, nr_strength_delta)
+    ( 0.0,  0.0,  0.0,  0.00),   # baseline — already tried, keeps best
+    (+0.4,  0.0, +0.5,  0.00),   # louder vocal + more presence
+    (-0.4, +1.5,  0.0,  0.05),   # quieter vocal + deeper carve + more cleanup
+    ( 0.0, +2.0, +0.5,  0.00),   # big carve, more presence
+    (+0.4, +1.0, -0.5,  0.05),   # louder vocal, moderate carve, slight de-noise
+]
+
+def _param_grid_search(inst_remix: np.ndarray, vox_remix: np.ndarray,
+                       style: dict, sidechain_depth: float, bpm_a: float,
+                       out_path: str, current_score: int) -> tuple:
+    """
+    Try _MIX_PARAM_GRID parameter variations. Returns (best_mix, best_score, best_style).
+    Only improves on current_score — never degrades.
+    """
+    try:
+        from listen import auto_score as _auto_score
+    except ImportError:
+        return None, current_score, style
+
+    best_mix   = None
+    best_score = current_score
+    best_style = style.copy()
+
+    print(f"\n  [Grid Search] Trying {len(_MIX_PARAM_GRID)} parameter sets…", flush=True)
+
+    for i, (dvl, dcarve, dpres, dnr) in enumerate(_MIX_PARAM_GRID):
+        if i == 0:
+            continue   # skip baseline — already scored
+
+        trial_style = style.copy()
+        trial_style["vocal_level"] = float(np.clip(
+            style["vocal_level"] + dvl, 1.0, 4.0))
+        trial_style["carve_db"]    = float(np.clip(
+            style["carve_db"] + dcarve, 3.0, 14.0))
+        trial_style["presence_db"] = float(np.clip(
+            style.get("presence_db", 2.0) + dpres, 0.0, 5.0))
+
+        try:
+            trial_mix = _iterative_mix(inst_remix, vox_remix,
+                                       trial_style, sidechain_depth, bpm_a)
+            trial_mix = _fade(trial_mix, fade_s=2.0)
+            trial_mix = _master(trial_mix, bpm=bpm_a)
+            sf.write(out_path, trial_mix, SR, subtype="PCM_24")
+            _passed, _score, _summary, _ = _auto_score(out_path)
+            print(f"    Grid {i+1}/{len(_MIX_PARAM_GRID)}: {_score}/100"
+                  f"  vl={trial_style['vocal_level']:.1f}"
+                  f"  carve={trial_style['carve_db']:.1f}"
+                  f"  pres={trial_style['presence_db']:.1f}"
+                  f"  {'✓' if _passed else '✗'}", flush=True)
+            if _score > best_score:
+                best_score = _score
+                best_mix   = trial_mix.copy()
+                best_style = trial_style.copy()
+                if _passed:
+                    print(f"    → Found passing config at grid {i+1}!", flush=True)
+                    break
+        except Exception as _ge:
+            print(f"    Grid {i+1} failed: {_ge}", flush=True)
+
+    return best_mix, best_score, best_style
+
+
 # ── Main Entry Point ──────────────────────────────────────────────────────────
 
 def fuse(song_a: str, song_b: str, out_path: str,
@@ -3986,16 +4260,54 @@ def fuse(song_a: str, song_b: str, out_path: str,
     full_a = librosa.load(song_a, sr=SR, mono=True)[0].astype(np.float32)
     full_b = librosa.load(song_b, sr=SR, mono=True)[0].astype(np.float32)
 
+    # ── System 5: Fingerprint DB — load cached analysis, skip re-detection ────
+    fid_a = _file_id(song_a)
+    fid_b = _file_id(song_b)
+    fp_a  = _load_fp(fid_a, stems_cache)
+    fp_b  = _load_fp(fid_b, stems_cache)
+
     step(2, TOTAL, "Detecting BPM…")
-    bpm_a = detect_bpm(full_a)
-    bpm_b = detect_bpm(full_b)
+    if "bpm" in fp_a:
+        bpm_a = float(fp_a["bpm"])
+        print(f"      A: {bpm_a:.1f} BPM (cached)", flush=True)
+    else:
+        bpm_a = detect_bpm(full_a)
+        _save_fp(fid_a, stems_cache, {"bpm": bpm_a})
+    if "bpm" in fp_b:
+        bpm_b = float(fp_b["bpm"])
+        print(f"      B: {bpm_b:.1f} BPM (cached)", flush=True)
+    else:
+        bpm_b = detect_bpm(full_b)
+        _save_fp(fid_b, stems_cache, {"bpm": bpm_b})
     print(f"      A: {bpm_a:.1f} BPM   B: {bpm_b:.1f} BPM", flush=True)
 
     step(3, TOTAL, "Detecting keys…")
-    key_a_root, key_a_mode = detect_key(full_a)
-    key_b_root, key_b_mode = detect_key(full_b)
+    if "key_root" in fp_a and "key_mode" in fp_a:
+        key_a_root, key_a_mode = int(fp_a["key_root"]), fp_a["key_mode"]
+        print(f"      A: {_NOTES[key_a_root]} {key_a_mode} (cached)", flush=True)
+    else:
+        key_a_root, key_a_mode = detect_key(full_a)
+        _save_fp(fid_a, stems_cache, {"key_root": key_a_root, "key_mode": key_a_mode})
+    if "key_root" in fp_b and "key_mode" in fp_b:
+        key_b_root, key_b_mode = int(fp_b["key_root"]), fp_b["key_mode"]
+        print(f"      B: {_NOTES[key_b_root]} {key_b_mode} (cached)", flush=True)
+    else:
+        key_b_root, key_b_mode = detect_key(full_b)
+        _save_fp(fid_b, stems_cache, {"key_root": key_b_root, "key_mode": key_b_mode})
     print(f"      A: {_NOTES[key_a_root]} {key_a_mode}   "
           f"B: {_NOTES[key_b_root]} {key_b_mode}", flush=True)
+
+    # ── System 1: Pre-Flight Compatibility Check ──────────────────────────────
+    pf = _preflight_check(full_a, full_b, bpm_a, bpm_b,
+                          key_a_root, key_a_mode, key_b_root, key_b_mode)
+    for msg in pf["info"]:
+        print(f"      ✓ {msg}", flush=True)
+    for msg in pf["warnings"]:
+        print(f"      ⚠ {msg}", flush=True)
+    # Save genre similarity to fingerprint DB for future use
+    _save_fp(fid_a, stems_cache, {"genre_sim_with_last_b": pf.get("genre_sim", 0.5)})
+    if not pf["pass"]:
+        raise RuntimeError("Pre-flight check failed: " + " | ".join(pf["warnings"]))
 
     sep_model = "BS-Roformer" if _has_gpu() else "MDX-Net Kim Vocal 2→Demucs fallback"
     step(4, TOTAL, f"Separating stems — Song A (instrumental) via {sep_model}…")
@@ -4007,11 +4319,24 @@ def fuse(song_a: str, song_b: str, out_path: str,
     inst = stems_a["no_vocals"]   # (samples, 2)
     vox  = stems_b["vocals"]      # (samples, 2)
 
+    # ── System 2: Assess stem quality BEFORE bleed removal to set adaptive params ──
+    _sq = _assess_stem_quality(vox, inst)
+    print(f"      Stem quality — bleed: {_sq['bleed_level']} ({_sq['bleed_ratio']:.3f})"
+          f"  SNR: {_sq['snr_db']:.0f} dB"
+          f"  confidence: {_sq['vocal_confidence']:.1f}"
+          f"  {'[NEEDS DENOISER]' if _sq['needs_denoiser'] else ''}", flush=True)
+    _save_fp(fid_b, stems_cache, {
+        "stem_bleed_ratio": _sq["bleed_ratio"],
+        "stem_snr_db":      _sq["snr_db"],
+        "vocal_confidence": _sq["vocal_confidence"],
+    })
+
     # ── AI-tunable bleed removal parameters (adjusted by director on correction passes) ──
+    # Initialised from stem quality assessment — right-sized per song, not hardcoded.
     _bleed_params = {
-        "drum_weight_hh":       2.0,   # oracle Wiener drum weight in hi-hat band (gentle)
-        "wiener_mask_floor":    0.20,  # oracle Wiener minimum mask floor (avoids musical noise)
-        "noisereduce_strength": 0.15,  # reference noisereduce prop_decrease
+        "drum_weight_hh":       2.0,
+        "wiener_mask_floor":    _sq["recommended"]["wiener_mask_floor"],
+        "noisereduce_strength": _sq["recommended"]["noisereduce_strength"],
     }
 
     # ── Vocal bleed removal ──────────────────────────────────────────────────
@@ -4483,7 +4808,16 @@ def fuse(song_a: str, song_b: str, out_path: str,
                 break
 
             if _attempt == 2:
-                print("  Max correction attempts reached — using best result.", flush=True)
+                print("  Max correction attempts reached — running grid search.", flush=True)
+                # System 3: try parameter grid before giving up
+                _gm, _gs, _gstyle = _param_grid_search(
+                    inst_remix, vox_remix, style, sidechain_depth, bpm_a,
+                    out_path, best_score)
+                if _gm is not None and _gs > best_score:
+                    best_score = _gs
+                    best_mix   = _gm.copy()
+                    style      = _gstyle
+                    print(f"  Grid search improved score to {best_score}/100", flush=True)
                 break
 
             # Record this attempt in history for the director's context
