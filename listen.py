@@ -508,9 +508,10 @@ def _measure(audio_path: str) -> dict:
     # ── Groove score (NEW) ────────────────────────────────────────────────────
     # Measure what fraction of vocal onsets land within ±40ms of a beat position.
     # A well-grooved mashup has the rapper/singer "locking" to the kick/snare grid.
-    # Uses the beat grid detected from the beat-heavy band (60-200 Hz).
+    # Beat grid is detected from mono (full-range); narrow bass band gives too few
+    # transients for beat_track to work reliably.
     try:
-        _, beat_frames_grid = librosa.beat.beat_track(y=beat_zone, sr=SR, hop_length=512)
+        _, beat_frames_grid = librosa.beat.beat_track(y=mono, sr=SR, hop_length=512)
         beat_times_grid = librosa.frames_to_time(beat_frames_grid, sr=SR, hop_length=512)
 
         # Detect vocal onsets in the presence band
