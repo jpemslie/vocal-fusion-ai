@@ -128,7 +128,7 @@ REF_STRICT = {**REF,
     "lufs_integrated":       (-13.0, -8.0),
     "lra_lu":                (4.5, 22.0),    # rap acapella has natural silence gaps; mashups skew high
     "crest_factor_db":       (7.0, 20.0),
-    "transient_clarity":     (0.10, 0.50),
+    "transient_clarity":     (10.0, 25.0),   # dB crest — matches REF units (was 0.10-0.50: wrong units)
     "kick_headroom_db":      (5.0, 45.0),    # EDM kicks are punchy by design; 30-40 dB is normal
     "mud_index":             (1.2, 4.5),
     "section_consistency_lu":(0.0, 8.0),     # mashups have inherent section variation
@@ -145,7 +145,7 @@ PENALTIES = {
     "ratio_sub_to_mid":        5,
     "ratio_bass_to_mid":       6,
     "ratio_lowmid_to_mid":    10,   # mud is very noticeable
-    "ratio_himid_to_mid":     10,   # harshness is very noticeable
+    "ratio_himid_to_mid":     13,   # harshness causes ear fatigue — penalise harder than mud
     "ratio_high_to_mid":       8,
     "lowmid_over_himid":      10,
     "high_over_himid":         5,

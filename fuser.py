@@ -877,12 +877,15 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         vox_env = np.abs(_to_mono(vox_scaled))
         hop_d = 512
         env_frames = librosa.feature.rms(y=vox_env, frame_length=2048, hop_length=hop_d)[0]
-        env_thresh = float(np.percentile(env_frames, 80))  # fires on top 20% of frames (true peaks only)
+        # Adaptive threshold: rap has consistent energy (fire on more frames);
+        # singing needs tighter threshold (fire only on peaks).
+        _sc_pct = float(np.interp(style.get("_rap_score", 0.5), [0, 1], [80, 55]))
+        env_thresh = float(np.percentile(env_frames, _sc_pct))
         # Smooth the gain curve (100ms attack, 200ms release)
         duck_gain = np.zeros(len(env_frames), dtype=np.float32)
         for fi in range(len(env_frames)):
             if env_frames[fi] > env_thresh:
-                duck_gain[fi] = 10**(-4.0/20.0)  # -4 dB when vocal is at peak (was -8 dB — too aggressive)
+                duck_gain[fi] = 10**(-6.0/20.0)  # -6 dB when vocal is at peak (was -4 dB — too weak)
             else:
                 duck_gain[fi] = 1.0
         # Smooth: simple one-pole IIR
@@ -955,6 +958,10 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
     vox_mono_ref = _to_mono(vox_scaled)
     width_gain = _sidechain_envelope(vox_mono_ref, len(inst_c), depth=0.20,
                                      window_ms=80, attack_ms=30.0, release_ms=300.0)
+    # Floor at 0.6: prevents stereo field from collapsing entirely during loud vocals.
+    # On wide stacks with out-of-phase hi-hats, unconstrained narrowing can push
+    # stereo correlation below 0.5 and cause mono-sum cancellation.
+    width_gain = np.maximum(width_gain, 0.60).astype(np.float32)
     inst_M, inst_S = _ms_encode(inst_c)
     vox_M, _       = _ms_encode(vox_scaled)
     inst_S_dynamic = (inst_S * width_gain).astype(np.float32)
@@ -2258,7 +2265,7 @@ def _score_section_pair(vox_sec: dict, beat_sec: dict) -> float:
 
     # Harmonic flux: similar harmonic movement rate sounds natural together
     flux_score = 1.0 - float(np.clip(
-        abs(vox_sec.get('harmonic_flux', 0.1) - beat_sec.get('harmonic_flux', 0.1)) * 5.0,
+        abs(vox_sec.get('harmonic_flux', 0.1) - beat_sec.get('harmonic_flux', 0.1)) * 3.0,
         0, 1
     ))
 
@@ -2450,7 +2457,7 @@ def _arrangement_gain_curves(beat_secs: list, vox_secs: list,
     """
     _BEAT_GAIN = {
         'intro': 1.00, 'verse': 0.82, 'chorus': 1.00,
-        'drop':  1.00, 'breakdown': 0.55, 'bridge': 0.88, 'outro': 0.90,
+        'drop':  1.00, 'breakdown': 0.65, 'bridge': 0.88, 'outro': 0.90,
     }
     _VOX_GAIN = {
         'intro': 0.85, 'verse': 1.00, 'chorus': 1.08,
@@ -2686,11 +2693,12 @@ def _build_mashup_arrangement(vox: np.ndarray, vox_secs: list,
                   f"{beat_sec['start_s']:.0f}s → silence (beat-only intro)", flush=True)
             continue
 
-        # Snap beat section start to the nearest bar boundary
+        # Snap beat section start to the nearest bar boundary.
+        # Reject snap if it overshoots more than half a bar (relative threshold,
+        # replaces the old hardcoded 0.5s which broke on fast BPMs).
         bars = round(beat_sec['start_s'] / bar_s)
         snapped_s = bars * bar_s
-        # Sanity: don't snap past the section's own end
-        if snapped_s >= beat_sec['end_s'] - 0.5:
+        if snapped_s >= beat_sec['end_s'] - bar_s * 0.5:
             snapped_s = beat_sec['start_s']
 
         beat_start = int(snapped_s * sr)
@@ -2713,7 +2721,8 @@ def _build_mashup_arrangement(vox: np.ndarray, vox_secs: list,
         seg_len = len(seg)
         mismatch = abs(seg_len - slot_len) / (slot_len + 1e-9)
         if mismatch > 0.10 and HAS_PYRUBBERBAND:
-            ratio_s = float(np.clip(seg_len / (slot_len + 1e-9), 0.5, 2.0))
+            # ratio = target_len / source_len: >1 stretches (longer), <1 compresses (shorter)
+            ratio_s = float(np.clip((slot_len + 1e-9) / seg_len, 0.5, 2.0))
             try:
                 stretched = []
                 for c in range(seg.shape[1]):
@@ -3485,9 +3494,11 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     except Exception as _hpss_e:
         print(f"      [Stage 0.5 HPSS failed: {_hpss_e}]", flush=True)
 
-    # Stage 0b — CREPE global tuning correction (only if library installed)
-    for c in range(vox.shape[1]):
-        vox[:, c] = _crepe_pitch_correct(vox[:, c])
+    # Stage 0b — CREPE global tuning correction.
+    # Runs AFTER HPSS + noisereduce so CREPE's F0 detector operates on clean audio.
+    # Bleed in the raw stem skews F0 confidence and produces false tuning offsets.
+    for c in range(vox_ch.shape[0]):
+        vox_ch[c] = _crepe_pitch_correct(vox_ch[c])
 
     # Stage 1: HPF 80 Hz + subtractive EQ + hi-hat bleed roll-off
     # The 8kHz shelf always rolls off the hi-hat zone regardless of pitch shift.
@@ -3527,8 +3538,25 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
             pitch_shift_in_semitones=float(n_semitones),
         ).astype(np.float32)
 
-    # Stage 3: de-esser (before compression — prevents sibilance pumping)
-    vox_ch = _deess(vox_ch.T, threshold_db=-22.0).T.astype(np.float32)
+    # Stage 2.5: dynamic EQ — reduce 2.5-4.5kHz harshness only when loud.
+    # Placed BEFORE the compressor so harshness doesn't key the compressor.
+    # Only meaningful on non-rap vocals (rap compression handles density differently).
+    if style.get("_rap_score", 0.5) < 0.65:
+        vox_ch = _dynamic_eq_vocal(vox_ch)
+
+    # Stage 3: de-esser (before compression — prevents sibilance pumping).
+    # Adaptive threshold: loud vocals (high p95) need less attenuation;
+    # quiet breathy vocals would be over-dulled by the old fixed -22 dB.
+    _vox_peak_lin = float(np.percentile(np.abs(vox_ch), 95))
+    _vox_peak_db  = 20.0 * np.log10(_vox_peak_lin + 1e-9)
+    _deess_thresh = float(np.clip(np.interp(_vox_peak_db, [-20, -6, 0], [-26, -22, -19]), -28, -18))
+    vox_ch = _deess(vox_ch.T, threshold_db=_deess_thresh).T.astype(np.float32)
+
+    # Stage 3.5: consonant transient enhancement for rap/dense vocals.
+    # Restores "t", "d", "k" attack clarity in the 4-9kHz band that gets
+    # smeared by compression. Only applied when rap_score > 0.6.
+    if style.get("_rap_score", 0.0) > 0.60:
+        vox_ch = _consonant_enhance(vox_ch, boost_db=2.5)
 
     # Stage 4 + 5: ONE compressor + noise gate
     dyn_board = Pedalboard([
@@ -3574,7 +3602,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     ])
     reverb_wet = reverb_board(vox_ch, SR).astype(np.float32)
     reverb_wet = _hpf_signal(reverb_wet, cutoff_hz=500.0, order=4)
-    wet = float(np.clip(style["reverb_wet"], 0.04, 0.09))
+    wet = float(np.clip(style["reverb_wet"], 0.01, 0.09))
     vox_ch = (vox_ch + reverb_wet * wet).astype(np.float32)
 
     return vox_ch.T  # (samples, 2)
@@ -4185,9 +4213,20 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     mix_sub   = sosfilt(sos_sub_hp, sosfilt(sos_sub_lp, mix, axis=0), axis=0).astype(np.float32)
     mix_above = (mix - mix_sub).astype(np.float32)
     mix_sub_lim = sub_limiter(mix_sub.T.astype(np.float32), SR).T.astype(np.float32)
-    # Additional sub-bass attenuation: high-energy EDM/house beats can have
-    # sub energy 20+ dB above mids. Attenuate by extra 6 dB after limiting.
-    mix_sub_lim = (mix_sub_lim * 0.5).astype(np.float32)  # -6 dB on sub band
+    # Additional sub-bass attenuation: scales with how much sub energy is
+    # present in this mix relative to mids.  EDM/house: heavy sub → -6dB.
+    # Hip-hop/pop: modest sub → -1.5dB. Prevents kick from eating headroom
+    # without killing the punch of a properly mixed hip-hop track.
+    _mix_mono_sub = _to_mono(mix_sub_lim)
+    _mix_mono_mid = sosfilt(butter(4, [500.0/(SR/2), 4000.0/(SR/2)],
+                                   btype="band", output="sos"), _to_mono(mix))
+    _sub_rms = float(np.sqrt(np.mean(_mix_mono_sub**2)) + 1e-9)
+    _mid_rms = float(np.sqrt(np.mean(_mix_mono_mid**2)) + 1e-9)
+    _sub_excess = float(np.clip(_sub_rms / (_mid_rms + 1e-9) - 0.5, 0.0, 2.0))
+    _sub_atten_lin = float(np.interp(_sub_excess, [0.0, 2.0], [0.84, 0.50]))
+    mix_sub_lim = (mix_sub_lim * _sub_atten_lin).astype(np.float32)
+    print(f"      Sub attenuation: sub/mid={_sub_rms/_mid_rms:.2f} → "
+          f"{20*np.log10(_sub_atten_lin):.1f} dB", flush=True)
     mix = (mix_above + mix_sub_lim).astype(np.float32)
 
     # LUFS normalize BEFORE the brick-wall limiter.
@@ -4217,13 +4256,22 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     limiter = Pedalboard([Limiter(threshold_db=-2.0, release_ms=50.0)])
     mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
     # Hard safety clip: numpy failsafe in case pedalboard limiter lets peaks through
-    # (observed: on dense EDM material peak can reach 0 dBFS post-limiter).
-    # -2 dBFS = amplitude 0.7943. Clip then re-normalize to -2 dBFS to prevent
-    # inter-sample spikes pushing true peak above 0 dBTP.
     clip_ceil = 10 ** (-2.0 / 20.0)   # 0.7943
     peak_post = float(np.max(np.abs(mix)))
     if peak_post > clip_ceil:
         mix = np.clip(mix, -clip_ceil, clip_ceil).astype(np.float32)
+
+    # Re-normalize to enforce exact -12 LUFS target.
+    # The limiter + post-norm EQ + glue comp can drift the final LUFS by ±2 LU.
+    # A second LUFS pass locks it in before return.
+    try:
+        mix = _lufs_normalize(mix, -12.0)
+        # Safety: re-clip after second normalize in case it boosted into ceiling
+        peak_final = float(np.max(np.abs(mix)))
+        if peak_final > clip_ceil:
+            mix = np.clip(mix, -clip_ceil, clip_ceil).astype(np.float32)
+    except Exception:
+        pass  # if loudnorm fails for any reason, keep existing mix
     return mix
 
 
