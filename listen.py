@@ -1,28 +1,27 @@
 """
-VocalFusion — Audio Quality Scorer + Auto-Correction Engine
-============================================================
+VocalFusion — Audio Quality Scorer + Auto-Correction Engine  v3
+================================================================
 Two jobs:
   1. SCORE: measure the output against professional reference ranges and
      detect specific problems (mud, harshness, smashed transients, buried
-     vocals, clipping, phase, etc.)
+     vocals, clipping, phase, timing, groove, energy arc, etc.)
   2. CORRECT: return concrete DSP parameter deltas so fuse() can re-mix
      automatically without the user needing to listen and give feedback.
 
-The scoring uses scale-invariant spectral RATIOS (all bands vs the mid band),
-so it works correctly at any loudness level.
+Metrics are grouped into four tiers:
+  TECHNICAL  — loudness, clipping, dynamics, stereo phase
+  SPECTRAL   — frequency balance ratios, mud, harshness, slope
+  PERCEPTUAL — beat sync, vocal clarity, tempo stability, artifacts
+  MUSICAL    — groove, energy arc, harmonic coherence, vocal flow
 
-New metrics vs v1:
-  - transient_clarity   — how much kick/snare stand out from sustained content
-  - mud_index           — 200-600 Hz vs 1000-3000 Hz (more sensitive than ratio)
-  - kick_headroom_db    — kick transients vs sustained bass floor
-  - section_consistency — LUFS variance across 15-second windows
-  - spectral_slope      — per-octave energy dropoff vs professional reference
-
-New perceptual quality metrics:
-  - beat_sync_score     — cross-correlation of L/R onset envelopes (beat vs vocal sync)
-  - vocal_clarity_index — speech intelligibility zone energy minus bass masking
-  - tempo_stability     — IBI coefficient of variation (rubberband drift detection)
-  - click_artifact_score— % samples with |diff| > 10x diff RMS (click/pop detector)
+v3 additions / fixes:
+  - beat_sync_score  FIXED: now uses bass-band vs vocal-band onset xcorr
+    (old L/R channel xcorr was meaningless in M/S mixed content)
+  - groove_score     NEW: vocal onsets landing on beat grid → "locked-in" feel
+  - dynamic_arc_score NEW: energy builds to climax at 60-70%, then resolves
+  - vocal_harmony_score NEW: chroma coherence between beat and vocal zones
+  - vocal_presence_ratio NEW: direct measure of vocal over beat in 1-4kHz zone
+  - All new metrics have calibrated ranges + penalties + correction entries
 
 Usage:
   python listen.py output.wav                  # score
@@ -48,119 +47,132 @@ SR = 44100
 # All ratio values are (band_X - mid_band) in dB — scale-invariant.
 
 REF = {
-    # Global loudness & dynamics
+    # ── TIER 1: Technical ────────────────────────────────────────────────────
     "lufs_integrated":    (-14.0, -7.0),
     "true_peak_dbfs":     (-40.0, -0.5),   # 0.0 = clipping → CRITICAL
-    "lra_lu":             (2.0, 22.0),    # rap acapella has natural silence gaps; mashups skew high
+    "lra_lu":             (2.0, 22.0),
     "crest_factor_db":    (6.0, 22.0),
     "stereo_correlation": (0.4, 0.99),
 
-    # Frequency balance ratios (vs mid band)
+    # ── TIER 2: Spectral balance (ratios vs mid band) ─────────────────────
     "ratio_sub_to_mid":    (+4.0, +18.0),
     "ratio_bass_to_mid":   (+2.0, +20.0),
-    "ratio_lowmid_to_mid": (-3.0, +10.0),   # > +10 = MUDDY (EDM/hip-hop naturally warm)
-    "ratio_himid_to_mid":  (-20.0, -1.0),  # > -1 = HARSH. Rap/EDM vocal mixes naturally sit at -1 to -2 dB
-    "ratio_high_to_mid":   (-32.0, -8.0),  # > -8 = BRIGHT, < -32 = DARK
-
-    # Derived ratios
-    "lowmid_over_himid":   (+3.0, +20.0),  # > +20 = extreme mud
+    "ratio_lowmid_to_mid": (-3.0, +10.0),
+    "ratio_himid_to_mid":  (-20.0, -1.0),
+    "ratio_high_to_mid":   (-32.0, -8.0),
+    "lowmid_over_himid":   (+3.0, +20.0),
     "high_over_himid":     (-20.0, -4.0),
 
     # transient_clarity: dB crest of onset strength envelope (p95/p10 in dB).
-    # Measures how much kick/snare transients stand above the sustained floor.
-    # Trap/hip-hop: 10-25 dB. Over-compressed: < 8 dB. Distorted: > 28 dB.
-    # (Old metric 0.08-0.55 was wrong — always clipped to cap for our genre.)
     "transient_clarity":   (8.0, 28.0),
 
     # kick_headroom_db: p95-p10 dynamic range of 60-150 Hz sub-bass band (dB).
-    # Trap 808s naturally swing 18-28 dB between hit peaks and silence.
-    # Below 8 dB: bass is smashed/over-compressed. Above 32 dB: distorted.
-    # (Old threshold 3-20 dB caused false fails on normal trap dynamics.)
-    "kick_headroom_db":    (8.0, 45.0),    # EDM kicks are punchy by design; 30-40 dB is normal
+    "kick_headroom_db":    (8.0, 45.0),
 
     # mud_index: 200-600 Hz mean energy / 1000-3000 Hz mean energy (linear).
-    # Professional: 1.5–4.0. Too muddy: > 5.5. Too scooped: < 1.0.
     "mud_index":           (1.0, 5.5),
 
     # section_consistency_lu: std dev of per-15s LUFS values (LU).
-    # Professional: < 4.0 LU. Inconsistent mix: > 6.0 LU.
-    "section_consistency_lu": (0.0, 8.0),    # mashups have inherent section variation
+    "section_consistency_lu": (0.0, 8.0),
 
-    # spectral_slope_db_oct: mean dB/octave energy dropoff from 200 Hz to 10 kHz.
-    # Pink noise = -3 dB/oct. Professional mixes: -3 to -8 dB/oct.
-    # Flat slope (< -2) = harsh/bright. Steep slope (< -12) = muffled.
+    # spectral_slope_db_oct: mean dB/octave energy dropoff 200 Hz → 10 kHz.
     "spectral_slope_db_oct": (-12.0, -2.0),
 
-    # Perceptual quality metrics
-    # beat_sync_score: max normalized xcorr of L/R onset envelopes in ±50ms window.
-    # Low = beat and vocal are out of time (no groove). Target: > 0.35.
-    "beat_sync_score":      (0.35, 1.0),
+    # ── TIER 3: Perceptual quality ────────────────────────────────────────
+    # beat_sync_score: xcorr of bass-band vs vocal-band onset envelopes.
+    # Measures whether vocal rhythm locks to the beat groove.
+    # High = vocal feels "locked in". Low = floating / out of time.
+    # (v2 used L/R channel xcorr — meaningless in M/S mixed content.)
+    "beat_sync_score":      (0.30, 1.0),
 
-    # vocal_clarity_index: mid_db (1-4kHz) minus bass masking pressure (20-300Hz).
-    # Below -5 = bass is masking vocal intelligibility zone.
+    # vocal_clarity_index: mid_db (1-4kHz) minus bass masking pressure.
     "vocal_clarity_index":  (-5.0, 20.0),
 
-    # tempo_stability: 1 - CV of inter-beat intervals. Low = rubberband drift.
+    # tempo_stability: 1 - CV of inter-beat intervals.
     "tempo_stability":      (0.6, 1.0),
 
     # click_artifact_score: % samples where |diff| > 10x diff RMS.
-    # Above 0.005 = audible clicks/pops.
     "click_artifact_score": (0.0, 0.005),
 
-    # vocal_bleed_score: voiced-frame hi-hat cross-modulation.
-    # Roughness of 6-16kHz during voiced frames: 0=smooth (clean), 1=choppy (bleed).
-    # Above 0.40 = audible scratchiness (empirically calibrated: v11=0.23, v8=0.48).
+    # vocal_bleed_score: roughness of 6-16kHz during voiced frames.
     "vocal_bleed_score":    (0.0, 0.40),
 
     # vocal_spectral_crest: median spectral crest of 300-3000Hz in voiced frames.
-    # High = harmonic peaks dominate (clean, tonal vocal after resynth).
-    # Low = flat spectrum (noise/bleed dominates — poor separation quality).
-    # Calibrated: clean professional vocal ~8-20. Blendy/noisy ~2-4.
     "vocal_spectral_crest": (4.0, 30.0),
 
     # vocal_modulation_index: fraction of envelope energy at syllable rate (3-8 Hz).
-    # Intelligible vocal: 0.25-0.65 of slow-modulation energy is at syllable rate.
-    # Below 0.25: muffled/buried/monotone. Above 0.65: choppy/over-gated.
     "vocal_modulation_index": (0.20, 0.65),
+
+    # vocal_presence_ratio: vocal zone (1-4kHz) energy / beat zone (200-1kHz) energy
+    # during voiced frames. > 0.55 = vocal sits above beat. < 0.30 = buried.
+    "vocal_presence_ratio": (0.30, 1.20),
+
+    # ── TIER 4: Musical intelligence ─────────────────────────────────────
+    # groove_score: fraction of vocal onsets that land within ±40ms of a beat
+    # grid position. 0=floating, 1=locked. Target: > 0.35 for natural groove.
+    "groove_score":         (0.25, 1.0),
+
+    # dynamic_arc_score: does the mix have a proper energy build + release?
+    # Computed as correlation between actual per-section loudness and an ideal
+    # arc (builds to peak at 65% then resolves). 1.0 = perfect arc.
+    "dynamic_arc_score":    (0.20, 1.0),
+
+    # vocal_harmony_score: chroma correlation between beat-dominated frames
+    # and vocal-dominated frames in the mix. High = harmonically coherent.
+    # Low = key mismatch / harmonic clash between sources.
+    "vocal_harmony_score":  (0.30, 1.0),
 }
 
 REF_STRICT = {**REF,
     "lufs_integrated":       (-13.0, -8.0),
-    "lra_lu":                (4.5, 22.0),    # rap acapella has natural silence gaps; mashups skew high
+    "lra_lu":                (4.5, 22.0),
     "crest_factor_db":       (7.0, 20.0),
-    "transient_clarity":     (10.0, 25.0),   # dB crest — matches REF units (was 0.10-0.50: wrong units)
-    "kick_headroom_db":      (5.0, 45.0),    # EDM kicks are punchy by design; 30-40 dB is normal
+    "transient_clarity":     (10.0, 25.0),   # dB crest — matches REF units
+    "kick_headroom_db":      (5.0, 45.0),
     "mud_index":             (1.2, 4.5),
-    "section_consistency_lu":(0.0, 8.0),     # mashups have inherent section variation
+    "section_consistency_lu":(0.0, 8.0),
     "ratio_lowmid_to_mid":   (-3.0, +6.0),
-    "ratio_himid_to_mid":    (-18.0, -1.5),  # rap/EDM vocal mixes sit at -1 to -2 dB naturally
+    "ratio_himid_to_mid":    (-18.0, -1.5),
+    "beat_sync_score":       (0.35, 1.0),
+    "groove_score":          (0.30, 1.0),
+    "dynamic_arc_score":     (0.30, 1.0),
+    "vocal_harmony_score":   (0.35, 1.0),
+    "vocal_presence_ratio":  (0.40, 1.20),
 }
 
 PENALTIES = {
+    # TIER 1: Technical
     "lufs_integrated":        12,
     "true_peak_dbfs":         25,   # clipping = catastrophic
     "lra_lu":                  8,
     "crest_factor_db":        10,
     "stereo_correlation":      8,
+    # TIER 2: Spectral
     "ratio_sub_to_mid":        5,
     "ratio_bass_to_mid":       6,
-    "ratio_lowmid_to_mid":    10,   # mud is very noticeable
-    "ratio_himid_to_mid":     13,   # harshness causes ear fatigue — penalise harder than mud
+    "ratio_lowmid_to_mid":    10,
+    "ratio_himid_to_mid":     13,   # ear fatigue > mud
     "ratio_high_to_mid":       8,
     "lowmid_over_himid":      10,
     "high_over_himid":         5,
-    "transient_clarity":      12,   # smashed beat = sounds awful loud
+    "transient_clarity":      12,
     "kick_headroom_db":        8,
     "mud_index":               8,
     "section_consistency_lu":  6,
     "spectral_slope_db_oct":   6,
-    "beat_sync_score":        15,
+    # TIER 3: Perceptual
+    "beat_sync_score":        18,   # out of time = fundamental failure
     "vocal_clarity_index":    12,
     "tempo_stability":        10,
     "click_artifact_score":   15,
-    "vocal_bleed_score":      20,   # severe bleed = unacceptable → big penalty
-    "vocal_spectral_crest":   15,   # flat vocal spectrum = no harmonic structure
-    "vocal_modulation_index": 12,   # no syllable rate = unintelligible vocal
+    "vocal_bleed_score":      20,
+    "vocal_spectral_crest":   15,
+    "vocal_modulation_index": 12,
+    "vocal_presence_ratio":   15,   # buried vocal = unusable
+    # TIER 4: Musical
+    "groove_score":           20,   # no groove = doesn't sound like a song
+    "dynamic_arc_score":      10,
+    "vocal_harmony_score":    15,   # key clash = unlistenable
 }
 
 PROBLEM_NAMES = {
@@ -197,7 +209,7 @@ PROBLEM_NAMES = {
                                "INCONSISTENT LEVELS — mix gets louder/quieter across sections"),
     "spectral_slope_db_oct": ("MUFFLED — spectrum too steep, highs dead",
                                "HARSH / BRIGHT — spectrum too flat, no natural rolloff"),
-    "beat_sync_score":      ("NO BEAT SYNC — beat and vocal are out of time, no groove",
+    "beat_sync_score":      ("NO GROOVE — vocal and beat are out of time, feels broken",
                              "perfect sync (N/A)"),
     "vocal_clarity_index":  ("VOCALS BURIED — bass masking the vocal intelligibility zone",
                              "vocals too thin — not enough low-mid warmth"),
@@ -211,39 +223,50 @@ PROBLEM_NAMES = {
                              "vocal too peaky — possible distortion or tuning artifacts"),
     "vocal_modulation_index":("VOCAL BURIED — no intelligible syllable dynamics, sounds muffled",
                               "CHOPPY VOCAL — over-gated or clipping modulation artifacts"),
+    "vocal_presence_ratio": ("VOCAL BURIED — beat energy overwhelming vocal in presence zone",
+                             "beat too quiet vs vocal — no foundation"),
+    "groove_score":         ("NO GROOVE — vocal phrases float off the beat, sounds amateur",
+                             "perfect grid (N/A)"),
+    "dynamic_arc_score":    ("FLAT ENERGY — no build/release, sounds like a loop not a song",
+                             "too dramatic (N/A)"),
+    "vocal_harmony_score":  ("KEY CLASH — vocal and beat are in different keys, sounds dissonant",
+                             "harmonic match (N/A)"),
 }
 
-# ── Correction map: issue key → which DSP parameter to adjust and by how much ─
-# Used by fuse() auto-correction loop: detected issues → parameter adjustments
-# → re-run mix+master → score again. Up to 3 iterations.
+# ── Correction map ─────────────────────────────────────────────────────────────
 CORRECTIONS = {
-    # key: (param_name, delta_if_below_range, delta_if_above_range)
-    "ratio_lowmid_to_mid":  ("carve_db",       0.0,  +2.0),  # muddy → deeper carve
-    "lowmid_over_himid":    ("carve_db",       0.0,  +1.5),  # muddy → deeper carve
-    "mud_index":            ("carve_db",       0.0,  +1.5),  # muddy → deeper carve
-    "ratio_himid_to_mid":   ("presence_db",   +0.5, -0.5),   # dull → more presence; harsh → less
-    "ratio_high_to_mid":    ("air_db",        +1.0, -1.0),   # dark → more air; bright → less
-    "ratio_bass_to_mid":    ("vocal_level",   -0.05, +0.05), # bass too heavy → lower vocal to balance
-    "transient_clarity":    ("lufs_delta",      0.0, -1.0),   # smashed → reduce LUFS target
-    "crest_factor_db":      ("lufs_delta",      0.0, -1.0),   # smashed → reduce LUFS target
-    "kick_headroom_db":     ("carve_db",        0.0, +1.0),   # kick buried → carve more space
-    "section_consistency_lu":("vocal_level",   -0.05, +0.05), # inconsistent → adjust vocal level
-    "beat_sync_score":      ("vocal_level",    +0.05,  0.0),  # low sync → slightly boost vocal
-    # Bleed: carve deeper (reduces hi-freq mask energy) + pull air shelf back
-    "vocal_bleed_score":    ("carve_db",        0.0, +1.5),   # bleed → more spectral carve
-    # Flat vocal spectrum: boost presence or vocal level
-    "vocal_spectral_crest": ("presence_db",    +1.0, -0.5),   # noisy→boost presence; peaky→cut
-    # Vocal unintelligible: raise level slightly for better articulation
-    "vocal_modulation_index":("vocal_level",   +0.08, -0.05), # muffled→up level; choppy→down
+    "ratio_lowmid_to_mid":   ("carve_db",        0.0,  +2.0),
+    "lowmid_over_himid":     ("carve_db",         0.0,  +1.5),
+    "mud_index":             ("carve_db",          0.0,  +1.5),
+    "ratio_himid_to_mid":    ("presence_db",      +0.5, -0.5),
+    "ratio_high_to_mid":     ("air_db",           +1.0, -1.0),
+    "transient_clarity":     ("lufs_delta",         0.0, -1.0),
+    "crest_factor_db":       ("lufs_delta",         0.0, -1.0),
+    "kick_headroom_db":      ("carve_db",           0.0, +1.0),
+    "beat_sync_score":       ("vocal_level",       +0.10, 0.0),  # raise vocal so it leads more
+    "vocal_bleed_score":     ("carve_db",           0.0, +1.5),
+    "vocal_spectral_crest":  ("presence_db",       +1.0, -0.5),
+    "vocal_modulation_index":("vocal_level",       +0.08, -0.05),
+    "vocal_presence_ratio":  ("vocal_level",       +0.15, -0.10),  # bury → boost vocal
+    "groove_score":          ("vocal_level",       +0.05,  0.0),  # slight presence boost helps groove
+    "vocal_harmony_score":   ("carve_db",           0.0, +1.0),  # clash → deeper carve reduces beat in vocal zone
 }
 
+
+# ── Band helpers ───────────────────────────────────────────────────────────────
 
 def _band_db(S: np.ndarray, freqs: np.ndarray, lo: float, hi: float) -> float:
     mask = (freqs >= lo) & (freqs < hi)
     if not mask.any():
         return -60.0
-    # Use manual dB conversion to avoid librosa scalar/array type issues across versions
     return float(20.0 * np.log10(float(S[mask].mean()) + 1e-9))
+
+
+def _band_rms(y: np.ndarray, lo_hz: float, hi_hz: float, sr: int = SR) -> np.ndarray:
+    """Return mono RMS timeseries for a bandpass-filtered signal."""
+    nyq = sr / 2.0
+    sos = butter(4, [lo_hz / nyq, min(hi_hz / nyq, 0.999)], btype="band", output="sos")
+    return sosfilt(sos, y)
 
 
 def _load(audio_path: str):
@@ -258,13 +281,15 @@ def _load(audio_path: str):
     return y.astype(np.float32)
 
 
+# ── Core measurement ───────────────────────────────────────────────────────────
+
 def _measure(audio_path: str) -> dict:
     """Compute all quality metrics for an audio file."""
     y = _load(audio_path)
     L, R = y[:, 0], y[:, 1]
     mono = (L + R) / 2.0
 
-    # ── Loudness ────────────────────────────────────────────────────────────
+    # ── Loudness ──────────────────────────────────────────────────────────────
     meter = pyln.Meter(SR)
     lufs = float(meter.integrated_loudness(mono))
     try:
@@ -272,16 +297,16 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         lra = 0.0
 
-    # ── True peak & crest factor ────────────────────────────────────────────
+    # ── True peak & crest factor ──────────────────────────────────────────────
     true_peak_dbfs = float(20 * np.log10(np.abs(y).max() + 1e-9))
     rms  = float(np.sqrt(np.mean(mono ** 2) + 1e-9))
     peak = float(np.abs(mono).max() + 1e-9)
     crest_db = float(20 * np.log10(peak / rms))
 
-    # ── Stereo correlation ──────────────────────────────────────────────────
+    # ── Stereo correlation ────────────────────────────────────────────────────
     corr = float(np.corrcoef(L, R)[0, 1]) if (L.std() > 1e-9 and R.std() > 1e-9) else 1.0
 
-    # ── Spectral bands ──────────────────────────────────────────────────────
+    # ── Spectral bands ────────────────────────────────────────────────────────
     S = np.abs(librosa.stft(mono, n_fft=2048))
     freqs = librosa.fft_frequencies(sr=SR, n_fft=2048)
 
@@ -292,33 +317,20 @@ def _measure(audio_path: str) -> dict:
     himid_db  = _band_db(S, freqs, 2500, 6000)
     high_db   = _band_db(S, freqs, 6000, 20000)
 
-    # ── Transient clarity (spectral flux dynamic range) ─────────────────────
-    # Measure the crest factor of the onset strength envelope in dB.
-    # Strong transients (kicks, snares) lift p95 far above the median floor.
-    # Over-compressed mix: transients barely poke out → low crest → low score.
-    # Good hip-hop/trap: p95/p10 ratio of 4-15x (12-24 dB) in onset strength.
-    # Previously this clipped to 2.0 always because the formula produced 9-12
-    # for typical trap mixes (target was 0.08-0.55 — completely wrong range).
+    # ── Transient clarity ─────────────────────────────────────────────────────
     try:
         flux = librosa.onset.onset_strength(y=mono, sr=SR, hop_length=512)
         p95 = float(np.percentile(flux, 95))
         p10 = float(np.percentile(flux, 10))
-        # dB crest of onset envelope: 0 = fully compressed, 20 = very punchy
-        transient_clarity = float(20 * np.log10((p95 + 1e-6) / (p10 + 1e-6)))
-        transient_clarity = float(np.clip(transient_clarity, 0.0, 30.0))
+        transient_clarity = float(np.clip(20 * np.log10((p95 + 1e-6) / (p10 + 1e-6)), 0.0, 30.0))
     except Exception:
         transient_clarity = 10.0
 
-    # ── Kick dynamic range: peak vs floor in 60-150 Hz sub-bass band ─────────
-    # Measures how much the 808/kick hits stand above the sustained bass floor.
-    # Low = over-compressed sub-bass. High = punchy, dynamic kick hits.
-    # Trap/hip-hop naturally has 18-28 dB range here (heavy 808 hits vs silence
-    # between hits). Old threshold (3-20 dB) was too tight — caused false fails.
+    # ── Kick dynamic range ────────────────────────────────────────────────────
     try:
         nyq = SR / 2.0
-        sos_kick_lp = butter(4, 150.0 / nyq, btype="low",  output="sos")
-        sos_kick_hp = butter(4,  60.0 / nyq, btype="high", output="sos")
-        kick_band = sosfilt(sos_kick_hp, sosfilt(sos_kick_lp, mono, axis=0))
+        kick_band = sosfilt(butter(4, 60.0/nyq, btype="high", output="sos"),
+                     sosfilt(butter(4, 150.0/nyq, btype="low", output="sos"), mono))
         hop = 512
         frames = librosa.util.frame(kick_band, frame_length=1024, hop_length=hop)
         frame_rms_db = 20 * np.log10(np.sqrt((frames ** 2).mean(axis=0) + 1e-12))
@@ -327,18 +339,14 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         kick_headroom_db = 15.0
 
-    # ── Mud index: 200-600 Hz energy / 1000-3000 Hz energy (linear ratio) ───
-    # Above 5.5 = muddy. Below 1.0 = scooped/harsh.
+    # ── Mud index ─────────────────────────────────────────────────────────────
     try:
-        low_energy  = float(S[(freqs >= 200) & (freqs < 600)].mean()  + 1e-9)
-        mid_energy  = float(S[(freqs >= 1000) & (freqs < 3000)].mean() + 1e-9)
-        mud_index   = float(low_energy / mid_energy)
+        mud_index = float(S[(freqs >= 200) & (freqs < 600)].mean() /
+                          (S[(freqs >= 1000) & (freqs < 3000)].mean() + 1e-9))
     except Exception:
         mud_index = 2.5
 
-    # ── Section consistency: LUFS std dev across 15-second windows ──────────
-    # A professional mix has consistent loudness across intro/verse/chorus.
-    # Variance > 5 LU = something's wrong (dropout, level imbalance, clipping burst).
+    # ── Section consistency ───────────────────────────────────────────────────
     try:
         win = SR * 15
         n_windows = len(mono) // win
@@ -358,61 +366,53 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         section_consistency_lu = 0.0
 
-    # ── Spectral slope: dB/octave from 200 Hz to 10 kHz ────────────────────
-    # Professional mixes follow a roughly pink-noise-like slope: -3 to -8 dB/oct.
-    # Measure mean energy in each octave and fit a linear slope.
+    # ── Spectral slope ────────────────────────────────────────────────────────
     try:
-        octave_bands = [(200, 400), (400, 800), (800, 1600), (1600, 3200), (3200, 6400), (6400, 12800)]
-        octave_db = [_band_db(S, freqs, lo, hi) for lo, hi in octave_bands]
-        # Linear regression of dB vs octave number
-        x = np.arange(len(octave_db), dtype=float)
-        coeffs = np.polyfit(x, octave_db, 1)
-        spectral_slope_db_oct = float(coeffs[0])  # dB per octave step
+        octave_db = [_band_db(S, freqs, lo, hi)
+                     for lo, hi in [(200,400),(400,800),(800,1600),(1600,3200),(3200,6400),(6400,12800)]]
+        coeffs = np.polyfit(np.arange(len(octave_db), dtype=float), octave_db, 1)
+        spectral_slope_db_oct = float(coeffs[0])
     except Exception:
         spectral_slope_db_oct = -5.0
 
-    # ── Beat sync score: cross-correlation of L/R onset envelopes ───────────
-    # In M/S mixed content, L is beat-heavy and R is vocal-heavy.
-    # High xcorr in a ±50ms window = beat and vocal are locked in groove.
-    # Low xcorr = they're drifting / out of time.
+    # ── Beat sync score (v3: bass-band vs vocal-band onset xcorr) ─────────────
+    # The old L/R channel xcorr was meaningless in M/S mixed content because
+    # the vocal (summed into Mid) appears equally in both L and R channels.
+    # This version correlates the BEAT's groove (kick/bass band, 60-200 Hz) with
+    # the VOCAL's rhythm (presence band, 800-3000 Hz).
+    # High correlation = vocal rhythm locks to the beat's rhythmic pattern.
     try:
-        onset_L = librosa.onset.onset_strength(y=L, sr=SR, hop_length=512)
-        onset_R = librosa.onset.onset_strength(y=R, sr=SR, hop_length=512)
-        # Normalize each envelope to zero mean, unit variance
-        onset_L = (onset_L - onset_L.mean()) / (onset_L.std() + 1e-9)
-        onset_R = (onset_R - onset_R.mean()) / (onset_R.std() + 1e-9)
-        # Full cross-correlation
-        xcorr = np.correlate(onset_L, onset_R, mode="full")
-        # Normalize by the max possible value (N * 1 * 1)
-        xcorr_norm = xcorr / (len(onset_L) + 1e-9)
-        # ±50ms window in frames: hop_length=512 → frame_rate = SR/512
-        frame_rate = SR / 512
-        max_lag_frames = int(round(0.050 * frame_rate))  # 50ms
+        beat_zone  = _band_rms(mono, 60.0,  200.0)   # bass/kick band = beat rhythm
+        vocal_zone = _band_rms(mono, 800.0, 3000.0)  # presence band = vocal rhythm
+        hop_bs = 512
+        onset_beat  = librosa.onset.onset_strength(y=beat_zone,  sr=SR, hop_length=hop_bs)
+        onset_vocal = librosa.onset.onset_strength(y=vocal_zone, sr=SR, hop_length=hop_bs)
+        # Normalise
+        onset_beat  = (onset_beat  - onset_beat.mean())  / (onset_beat.std()  + 1e-9)
+        onset_vocal = (onset_vocal - onset_vocal.mean()) / (onset_vocal.std() + 1e-9)
+        xcorr = np.correlate(onset_beat, onset_vocal, mode="full")
+        xcorr_norm = xcorr / (len(onset_beat) + 1e-9)
+        frame_rate = SR / hop_bs
+        max_lag = int(round(0.075 * frame_rate))  # ±75ms window
         center = len(xcorr_norm) // 2
-        lo_idx = max(0, center - max_lag_frames)
-        hi_idx = min(len(xcorr_norm), center + max_lag_frames + 1)
-        beat_sync_score = float(np.max(xcorr_norm[lo_idx:hi_idx]))
-        beat_sync_score = float(np.clip(beat_sync_score, 0.0, 1.0))
+        beat_sync_score = float(np.clip(
+            np.max(xcorr_norm[max(0, center - max_lag): center + max_lag + 1]),
+            0.0, 1.0))
     except Exception:
         beat_sync_score = 0.5
 
-    # ── Vocal clarity index: speech zone energy minus bass masking ───────────
-    # vocal_clarity = mid_db (1-4kHz) - max(0, (bass_db (20-300Hz) - mid_db - 10))
-    # Below -5 = bass is swamping the intelligibility zone.
+    # ── Vocal clarity index ───────────────────────────────────────────────────
     try:
         S_full = np.abs(librosa.stft(mono, n_fft=2048))
         freqs_full = librosa.fft_frequencies(sr=SR, n_fft=2048)
-        bass_db_vc  = _band_db(S_full, freqs_full,   20,  300)
-        mid_db_vc   = _band_db(S_full, freqs_full, 1000, 4000)
+        bass_db_vc = _band_db(S_full, freqs_full,   20,  300)
+        mid_db_vc  = _band_db(S_full, freqs_full, 1000, 4000)
         masking_pressure = max(0.0, bass_db_vc - mid_db_vc - 10.0)
         vocal_clarity_index = float(mid_db_vc - masking_pressure)
     except Exception:
         vocal_clarity_index = 5.0
 
-    # ── Tempo stability: IBI coefficient of variation ────────────────────────
-    # Detect beats with librosa, measure CV of inter-beat intervals (IBIs).
-    # High CV = tempo drift, often from rubberband time-stretch artifacts.
-    # tempo_stability = 1.0 - min(CV, 1.0). Target: > 0.6.
+    # ── Tempo stability ───────────────────────────────────────────────────────
     try:
         _, beat_frames = librosa.beat.beat_track(y=mono, sr=SR, hop_length=512)
         if len(beat_frames) >= 3:
@@ -421,122 +421,69 @@ def _measure(audio_path: str) -> dict:
             cv = float(ibis.std() / (ibis.mean() + 1e-9))
             tempo_stability = float(1.0 - min(cv, 1.0))
         else:
-            tempo_stability = 1.0  # too short to measure, assume stable
+            tempo_stability = 1.0
     except Exception:
         tempo_stability = 0.8
 
-    # ── Click artifact score: percentage of samples with large discontinuities ─
-    # Compute 1st derivative of signal. Score = % samples where |diff| > 10x
-    # the RMS of the diff signal. Above 0.005 = audible clicks/pops.
+    # ── Click artifact score ──────────────────────────────────────────────────
     try:
         diff_signal = np.diff(mono)
         diff_rms = float(np.sqrt(np.mean(diff_signal ** 2) + 1e-12))
-        threshold = 10.0 * diff_rms
-        n_clicks = int(np.sum(np.abs(diff_signal) > threshold))
+        n_clicks = int(np.sum(np.abs(diff_signal) > 10.0 * diff_rms))
         click_artifact_score = float(n_clicks / (len(diff_signal) + 1e-9))
     except Exception:
         click_artifact_score = 0.0
 
-    # ── Vocal bleed score: detects beat artifacts (hi-hats, drums) bleeding ──
-    # into the vocal stem, causing the characteristic "scratchy" sound.
-    #
-    # Method: ROUGHNESS OF HI-HAT BAND DURING VOICED FRAMES
-    #
-    # The key insight: bleed creates IRREGULAR, choppy hi-hat energy during
-    # vocal sections (Song B's hi-hats don't sync with Song A's beat pattern).
-    # Clean vocals + intentional HF processing (reverb, air shelf, sibilants)
-    # create SMOOTH, consistently-textured hi-hat energy during those frames.
-    #
-    # Measurement: temporal roughness (std/mean of RMS envelope) of the
-    # 6-16kHz band specifically during voiced frames (when vocal is active).
-    #
-    # Clean mix: sibilants + reverb = smooth HF → low roughness → low score
-    # Bleed mix: Song B's hi-hat pattern leaks in → choppy HF → high score
-    #
-    # Calibrated from empirical data:
-    #   v8 (MDX-Net, user reported scratchy):       rough_voiced = 0.983 → score 0.483
-    #   v11 (oracle Wiener+subtraction, clean):     rough_voiced = 0.732 → score 0.232
-    #   Raw Demucs stem (unprocessed bleed):        rough_voiced = 1.530 → score 1.000
-    # Threshold 0.40 correctly passes v11 and fails v8.
-    #
-    # Note: roughness during UNVOICED frames is typically HIGHER than voiced
-    # (percussive beat hi-hats are more impulsive than vocal sibilants).
-    # This is why the old ratio hh_rough/vp_rough was backwards.
+    # ── Shared vocal/beat band signals ────────────────────────────────────────
+    nyq = SR / 2.0
+    hop_v = 512
+    vp_band = sosfilt(butter(4, [1000.0/nyq, min(4000.0/nyq, 0.999)], btype="band", output="sos"),
+                      mono)
+    hh_band = sosfilt(butter(4, [6000.0/nyq, min(16000.0/nyq, 0.999)], btype="band", output="sos"),
+                      mono)
+    beat_band = sosfilt(butter(4, [200.0/nyq, min(1000.0/nyq, 0.999)], btype="band", output="sos"),
+                        mono)
+
+    vp_frames   = librosa.feature.rms(y=vp_band,   frame_length=1024, hop_length=hop_v)[0]
+    hh_frames   = librosa.feature.rms(y=hh_band,   frame_length=1024, hop_length=hop_v)[0]
+    beat_frames_rms = librosa.feature.rms(y=beat_band, frame_length=1024, hop_length=hop_v)[0]
+
+    vp_med    = float(np.median(vp_frames))
+    voiced_mask = vp_frames > vp_med
+
+    # ── Vocal bleed score ─────────────────────────────────────────────────────
     try:
-        nyq = SR / 2.0
-        hop_b = 512
-        sos_hh_hp = butter(4,  6000.0 / nyq, btype="high", output="sos")
-        sos_hh_lp = butter(4, 16000.0 / nyq, btype="low",  output="sos")
-        sos_vp_hp = butter(4,  1000.0 / nyq, btype="high", output="sos")
-        sos_vp_lp = butter(4,  4000.0 / nyq, btype="low",  output="sos")
-
-        hh_band = sosfilt(sos_hh_lp, sosfilt(sos_hh_hp, mono, axis=0))
-        vp_band = sosfilt(sos_vp_lp, sosfilt(sos_vp_hp, mono, axis=0))
-
-        hh_frames = librosa.feature.rms(y=hh_band, frame_length=1024, hop_length=hop_b)[0]
-        vp_frames = librosa.feature.rms(y=vp_band, frame_length=1024, hop_length=hop_b)[0]
-
-        # Voiced frames: 1-4kHz RMS above its own median → vocal is active.
-        vp_med = float(np.median(vp_frames))
-        voiced_mask = vp_frames > vp_med
-
         if voiced_mask.sum() > 20:
-            hh_voiced_frames = hh_frames[voiced_mask]
-            # Roughness = normalised std: irregular hi-hat pattern → high
-            rough_voiced = float(
-                hh_voiced_frames.std() / (hh_voiced_frames.mean() + 1e-9))
-            # Normalize: 0.0 at rough=0.5 (very smooth), 1.0 at rough=1.5 (very choppy)
+            hh_voiced = hh_frames[voiced_mask]
+            rough_voiced = float(hh_voiced.std() / (hh_voiced.mean() + 1e-9))
             vocal_bleed_score = float(np.clip((rough_voiced - 0.5) / 1.0, 0.0, 1.0))
         else:
-            # Fallback: absolute roughness over whole track
             hh_rough = float(hh_frames.std() / (hh_frames.mean() + 1e-9))
             vocal_bleed_score = float(np.clip((hh_rough - 0.5) / 1.0, 0.0, 1.0))
     except Exception:
         vocal_bleed_score = 0.0
 
-    # ── Vocal spectral crest: measures harmonic structure of vocal ───────────
-    # In voiced frames (1-4kHz active), the 300-3000 Hz STFT should show clear
-    # harmonic peaks well above the noise floor.
-    #
-    # spectral_crest = mean(peak / mean of spectrum) across voiced frames.
-    # High crest (>5) = harmonic peaks dominate = clean vocal.
-    # Low crest (<3) = flat spectrum = noisy, blendy, artifact-heavy vocal.
-    #
-    # This directly measures the quality of the harmonic resynthesis stage —
-    # if the vocal is rebuilt from harmonics, the spectral peaks are sharp.
-    # If bleed/noise dominates, the spectrum is flat → low crest.
+    # ── Vocal spectral crest ──────────────────────────────────────────────────
     try:
-        S_voiced = np.abs(librosa.stft(mono, n_fft=2048, hop_length=512))
+        S_voiced = np.abs(librosa.stft(mono, n_fft=2048, hop_length=hop_v))
         freqs_v  = librosa.fft_frequencies(sr=SR, n_fft=2048)
-        vp_rms   = librosa.feature.rms(y=vp_band, frame_length=1024,
-                                        hop_length=512)[0]
-        v_med    = float(np.median(vp_rms))
-        v_mask   = vp_rms > v_med                    # voiced frame mask
+        vp_rms_short = librosa.feature.rms(y=vp_band, frame_length=1024, hop_length=hop_v)[0]
+        v_med    = float(np.median(vp_rms_short))
+        v_mask   = vp_rms_short > v_med
         if v_mask.sum() > 20:
             mid_mask = (freqs_v >= 300) & (freqs_v < 3000)
-            S_mid_voiced = S_voiced[np.ix_(mid_mask, v_mask)]  # (freq_bins, voiced_frames)
-            # Spectral crest per frame: max / mean
+            S_mid_voiced = S_voiced[np.ix_(mid_mask, v_mask)]
             frame_max  = S_mid_voiced.max(axis=0)
             frame_mean = S_mid_voiced.mean(axis=0) + 1e-12
             vocal_spectral_crest = float(np.median(frame_max / frame_mean))
         else:
-            vocal_spectral_crest = 5.0   # neutral default
+            vocal_spectral_crest = 5.0
     except Exception:
         vocal_spectral_crest = 5.0
 
-    # ── Vocal modulation index: measures intelligibility via syllable rate ───
-    # Speech intelligibility depends on amplitude modulation at 3-8 Hz
-    # (syllable rate).  An intelligible vocal has clear peaks in its envelope
-    # modulation spectrum at those rates.  A muffled/over-processed vocal has
-    # a flat modulation spectrum.
-    #
-    # Score = fraction of envelope energy at 3-8 Hz vs 1-20 Hz total.
-    # Target: 0.25-0.65 (25-65% of slow modulation energy is syllable-rate).
-    # Below 0.25: monotone / over-compressed / buried.
-    # Above 0.65: too choppy / distorted / clipping artefacts in modulation.
+    # ── Vocal modulation index ────────────────────────────────────────────────
     try:
-        vp_env   = librosa.feature.rms(y=vp_band, frame_length=512, hop_length=256)[0]
-        vp_env   = vp_env.astype(np.float64)
+        vp_env   = librosa.feature.rms(y=vp_band, frame_length=512, hop_length=256)[0].astype(np.float64)
         env_fft  = np.abs(np.fft.rfft(vp_env - vp_env.mean()))
         mod_freqs = np.fft.rfftfreq(len(vp_env), d=256.0 / SR)
         total_e  = float(env_fft[(mod_freqs >= 1.0) & (mod_freqs <= 20.0)].sum() + 1e-12)
@@ -544,6 +491,105 @@ def _measure(audio_path: str) -> dict:
         vocal_modulation_index = float(np.clip(syl_e / total_e, 0.0, 1.0))
     except Exception:
         vocal_modulation_index = 0.40
+
+    # ── Vocal presence ratio (NEW) ─────────────────────────────────────────────
+    # During voiced frames, how much does the vocal zone (1-4kHz) dominate
+    # the beat zone (200-1kHz)?  High = vocal cuts through. Low = beat buries vocal.
+    try:
+        if voiced_mask.sum() > 20:
+            vp_voiced   = float(vp_frames[voiced_mask].mean() + 1e-9)
+            beat_voiced = float(beat_frames_rms[voiced_mask].mean() + 1e-9)
+            vocal_presence_ratio = float(np.clip(vp_voiced / beat_voiced, 0.0, 2.0))
+        else:
+            vocal_presence_ratio = 0.60
+    except Exception:
+        vocal_presence_ratio = 0.60
+
+    # ── Groove score (NEW) ────────────────────────────────────────────────────
+    # Measure what fraction of vocal onsets land within ±40ms of a beat position.
+    # A well-grooved mashup has the rapper/singer "locking" to the kick/snare grid.
+    # Uses the beat grid detected from the beat-heavy band (60-200 Hz).
+    try:
+        _, beat_frames_grid = librosa.beat.beat_track(y=beat_zone, sr=SR, hop_length=512)
+        beat_times_grid = librosa.frames_to_time(beat_frames_grid, sr=SR, hop_length=512)
+
+        # Detect vocal onsets in the presence band
+        vocal_onset_env = librosa.onset.onset_strength(y=vp_band, sr=SR, hop_length=512)
+        vocal_onset_frames = librosa.onset.onset_detect(
+            onset_envelope=vocal_onset_env, sr=SR, hop_length=512)
+        vocal_onset_times = librosa.frames_to_time(vocal_onset_frames, sr=SR, hop_length=512)
+
+        if len(beat_times_grid) >= 2 and len(vocal_onset_times) >= 3:
+            window_s = 0.040  # ±40ms
+            on_beat = 0
+            for vt in vocal_onset_times:
+                dists = np.abs(beat_times_grid - vt)
+                if dists.min() <= window_s:
+                    on_beat += 1
+            groove_score = float(np.clip(on_beat / (len(vocal_onset_times) + 1e-9), 0.0, 1.0))
+        else:
+            groove_score = 0.50  # neutral default
+    except Exception:
+        groove_score = 0.50
+
+    # ── Dynamic arc score (NEW) ───────────────────────────────────────────────
+    # A professional song has an energy arc: builds toward a climax around
+    # 60-70% through the track, then resolves.  Flat energy = loop, not song.
+    # Score = Pearson correlation between actual per-section loudness and ideal arc.
+    try:
+        arc_win = SR * 10  # 10-second windows
+        n_wins = len(mono) // arc_win
+        if n_wins >= 4:
+            win_rms = np.array([
+                float(np.sqrt(np.mean(mono[i * arc_win:(i + 1) * arc_win] ** 2) + 1e-12))
+                for i in range(n_wins)
+            ])
+            # Ideal arc: rises to peak at 65% of track, then resolves
+            t_frac = np.linspace(0, 1, n_wins)
+            ideal = np.where(t_frac < 0.65,
+                             0.3 + 0.7 * (t_frac / 0.65) ** 1.2,
+                             1.0 - 0.5 * ((t_frac - 0.65) / 0.35))
+            # Pearson correlation between actual and ideal
+            corr_arc = float(np.corrcoef(win_rms, ideal)[0, 1])
+            dynamic_arc_score = float(np.clip((corr_arc + 1.0) / 2.0, 0.0, 1.0))  # 0-1
+        else:
+            dynamic_arc_score = 0.50
+    except Exception:
+        dynamic_arc_score = 0.50
+
+    # ── Vocal harmony score (NEW) ─────────────────────────────────────────────
+    # Measures chroma coherence between beat-dominated and vocal-dominated frames.
+    # Key clash = the beat and vocal are in completely unrelated keys → dissonant.
+    # High score = harmonic consonance between sources.
+    try:
+        chroma = librosa.feature.chroma_cqt(y=mono, sr=SR, hop_length=512, bins_per_octave=36)
+        hop_h = 512
+        beat_rms_ch  = librosa.feature.rms(y=beat_band,  frame_length=1024, hop_length=hop_h)[0]
+        vocal_rms_ch = librosa.feature.rms(y=vp_band,    frame_length=1024, hop_length=hop_h)[0]
+
+        n_frames = min(chroma.shape[1], len(beat_rms_ch), len(vocal_rms_ch))
+        if n_frames > 20:
+            beat_rms_t  = beat_rms_ch[:n_frames]
+            vocal_rms_t = vocal_rms_ch[:n_frames]
+            beat_thresh  = float(np.percentile(beat_rms_t, 70))
+            vocal_thresh = float(np.percentile(vocal_rms_t, 70))
+
+            beat_dom  = beat_rms_t  > beat_thresh
+            vocal_dom = vocal_rms_t > vocal_thresh
+
+            if beat_dom.sum() > 10 and vocal_dom.sum() > 10:
+                chroma_beat  = chroma[:, beat_dom].mean(axis=1)
+                chroma_vocal = chroma[:, vocal_dom].mean(axis=1)
+                # Cosine similarity between mean chroma vectors
+                dot = float(np.dot(chroma_beat, chroma_vocal))
+                norm = float(np.linalg.norm(chroma_beat) * np.linalg.norm(chroma_vocal) + 1e-9)
+                vocal_harmony_score = float(np.clip(dot / norm, 0.0, 1.0))
+            else:
+                vocal_harmony_score = 0.60
+        else:
+            vocal_harmony_score = 0.60
+    except Exception:
+        vocal_harmony_score = 0.60
 
     return {
         # Global
@@ -559,7 +605,7 @@ def _measure(audio_path: str) -> dict:
         "_mid_db":    mid_db,
         "_himid_db":  himid_db,
         "_high_db":   high_db,
-        # Ratios (scored)
+        # Spectral ratios
         "ratio_sub_to_mid":      sub_db    - mid_db,
         "ratio_bass_to_mid":     bass_db   - mid_db,
         "ratio_lowmid_to_mid":   lowmid_db - mid_db,
@@ -573,7 +619,7 @@ def _measure(audio_path: str) -> dict:
         "mud_index":             mud_index,
         "section_consistency_lu":section_consistency_lu,
         "spectral_slope_db_oct": spectral_slope_db_oct,
-        # Perceptual quality
+        # Perceptual
         "beat_sync_score":       beat_sync_score,
         "vocal_clarity_index":   vocal_clarity_index,
         "tempo_stability":       tempo_stability,
@@ -581,6 +627,11 @@ def _measure(audio_path: str) -> dict:
         "vocal_bleed_score":     vocal_bleed_score,
         "vocal_spectral_crest":  vocal_spectral_crest,
         "vocal_modulation_index":vocal_modulation_index,
+        "vocal_presence_ratio":  vocal_presence_ratio,
+        # Musical
+        "groove_score":          groove_score,
+        "dynamic_arc_score":     dynamic_arc_score,
+        "vocal_harmony_score":   vocal_harmony_score,
     }
 
 
@@ -596,14 +647,14 @@ def _score(metrics: dict, ref: dict) -> tuple:
         if val < lo:
             delta = lo - val
             if delta > (hi - lo):
-                penalty = min(penalty * 2, 25)
+                penalty = min(penalty * 2, 30)
             score -= penalty
             sev = "CRITICAL" if penalty >= 20 else ("HIGH" if penalty >= 10 else "MEDIUM")
             issues.append((sev, key, val, lo, hi, p_lo))
         elif val > hi:
             delta = val - hi
             if delta > (hi - lo):
-                penalty = min(penalty * 2, 25)
+                penalty = min(penalty * 2, 30)
             score -= penalty
             sev = "CRITICAL" if penalty >= 20 else ("HIGH" if penalty >= 10 else "MEDIUM")
             issues.append((sev, key, val, lo, hi, p_hi))
@@ -611,30 +662,69 @@ def _score(metrics: dict, ref: dict) -> tuple:
 
 
 def _grade(score: int) -> str:
-    if score >= 88:   return "A — Professional quality"
-    elif score >= 75: return "B — Good, minor issues"
-    elif score >= 60: return "C — Acceptable, noticeable problems"
-    elif score >= 45: return "D — Amateurish, needs work"
+    if score >= 90:   return "S — Chart-ready"
+    elif score >= 82: return "A — Professional quality"
+    elif score >= 70: return "B — Good, minor issues"
+    elif score >= 55: return "C — Acceptable, noticeable problems"
+    elif score >= 40: return "D — Amateurish, needs work"
     else:             return "F — Unacceptable output"
+
+
+def _musical_diagnosis(metrics: dict) -> list:
+    """
+    Return a list of plain-English musical diagnoses based on metric patterns.
+    These go beyond individual metric failures to describe the overall sound.
+    """
+    diags = []
+    gs  = metrics.get("groove_score", 0.5)
+    arc = metrics.get("dynamic_arc_score", 0.5)
+    har = metrics.get("vocal_harmony_score", 0.5)
+    pre = metrics.get("vocal_presence_ratio", 0.6)
+    syn = metrics.get("beat_sync_score", 0.5)
+    bli = metrics.get("vocal_bleed_score", 0.2)
+    mod = metrics.get("vocal_modulation_index", 0.4)
+
+    if gs < 0.30 and syn < 0.35:
+        diags.append("⚠ FUNDAMENTAL: vocal and beat are out of time — won't feel like a song regardless of mix quality")
+    elif gs < 0.35:
+        diags.append("△ Vocal phrases are floating off the beat — listeners will notice the lack of pocket")
+    elif gs > 0.55:
+        diags.append("✓ Groove is locked in — vocal sits in the pocket")
+
+    if har < 0.35:
+        diags.append("⚠ KEY CLASH: vocal and beat are in incompatible keys — sounds dissonant")
+    elif har > 0.65:
+        diags.append("✓ Harmonic coherence is strong — keys feel compatible")
+
+    if pre < 0.30:
+        diags.append("⚠ VOCAL BURIED: beat is overwhelming the vocal in the 1-4kHz zone — can't hear the lyrics")
+    elif pre > 0.80:
+        diags.append("✓ Vocal presence is strong — cuts through the mix clearly")
+
+    if arc < 0.25:
+        diags.append("△ FLAT ENERGY: no build/release structure — sounds like a loop, not a finished song")
+    elif arc > 0.50:
+        diags.append("✓ Good energy arc — mix builds and releases like a proper song")
+
+    if bli > 0.45:
+        diags.append("⚠ SCRATCHY: hi-hat/drum bleed in vocal stem is audible — sounds amateurish")
+
+    if mod < 0.20:
+        diags.append("△ MUFFLED: vocal syllables aren't intelligible — phrasing feels buried")
+    elif mod > 0.55:
+        diags.append("✓ Vocal intelligibility is strong — syllables are clear")
+
+    return diags
 
 
 def corrections(issues: list) -> dict:
     """
     Map detected issues to concrete DSP parameter adjustments for auto-correction.
-    Returns a dict of {param_name: delta} to apply before re-mixing.
-    Called by fuse() after each score — if score < 82, apply deltas and re-run mix.
     """
-    adj = {}
-    for sev, key, val, lo, hi, desc in issues:
-        if key not in CORRECTIONS:
-            continue
-        param, delta_lo, delta_hi = CORRECTIONS[key]
-        delta = delta_lo if val < lo else delta_hi
-        if delta != 0.0:
-            adj[param] = adj.get(param, 0.0) + delta
-    # Scale corrections by severity: CRITICAL gets 1.5×, MEDIUM gets 0.7×
     scaled = {}
-    for sev, key, val, lo, hi, desc in issues:
+    sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
+    # Process highest-severity first
+    for sev, key, val, lo, hi, desc in sorted(issues, key=lambda x: sev_order.get(x[0], 3)):
         if key not in CORRECTIONS:
             continue
         param, delta_lo, delta_hi = CORRECTIONS[key]
@@ -661,43 +751,58 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
                   ref_path: str = None, ref: dict = None):
     if ref is None:
         ref = REF
-    width = 64
+    width = 70
     print("\n" + "═" * width)
     print(f"  VocalFusion Quality Report — {Path(path).name}")
     print("═" * width)
     print(f"\n  SCORE: {score}/100   GRADE: {grade}")
 
+    # Musical diagnosis first — most actionable for the user
+    diags = _musical_diagnosis(m)
+    if diags:
+        print("\n  MUSICAL DIAGNOSIS:")
+        for d in diags:
+            print(f"  {d}")
+
     if not issues:
         print("\n  ✓ All metrics within professional range.")
     else:
+        print("\n  ISSUES:")
         sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
         for sev, key, val, lo, hi, desc in sorted(issues, key=lambda x: sev_order.get(x[0], 3)):
             marker = "✗✗" if sev == "CRITICAL" else ("✗ " if sev == "HIGH" else "△ ")
             print(f"\n  {marker} [{sev}] {desc}")
-            print(f"       Measured: {val:.2f}  |  Target: {lo:.1f} → {hi:.1f}")
+            print(f"       Measured: {val:.3f}  |  Target: {lo:.2f} → {hi:.2f}")
 
-    print(f"\n  GLOBAL:")
+    print(f"\n  ── TECHNICAL ─────────────────────────────────────────────────────")
     print(f"  {'LUFS':<28} {m['lufs_integrated']:>+7.1f} dB    (target -14 to -7)")
     print(f"  {'True peak':<28} {m['true_peak_dbfs']:>+7.1f} dBFS  (must be < -0.5)")
-    print(f"  {'LRA':<28} {m['lra_lu']:>+7.1f} LU    (target 3.5-14)")
+    print(f"  {'LRA':<28} {m['lra_lu']:>+7.1f} LU    (target 2-22)")
     print(f"  {'Crest factor':<28} {m['crest_factor_db']:>+7.1f} dB    (>8 = punchy)")
     print(f"  {'Stereo correlation':<28} {m['stereo_correlation']:>+7.3f}      (0.4-0.99)")
-    print(f"\n  DYNAMICS QUALITY:")
-    print(f"  {'Transient clarity':<28} {m['transient_clarity']:>+7.1f} dB    (target 8-28 dB crest)")
-    print(f"  {'Kick headroom':<28} {m['kick_headroom_db']:>+7.1f} dB    (target 8-32 dB range)")
-    print(f"  {'Section consistency':<28} {m['section_consistency_lu']:>+7.1f} LU    (target <5 LU)")
-    print(f"  {'Spectral slope':<28} {m['spectral_slope_db_oct']:>+7.1f} dB/oct (target -12 to -2)")
-    print(f"\n  PERCEPTUAL QUALITY:")
-    print(f"  {'Beat sync score':<28} {m['beat_sync_score']:>+7.3f}      (target 0.35-1.0)")
-    print(f"  {'Vocal clarity index':<28} {m['vocal_clarity_index']:>+7.1f} dB    (target -5 to +20)")
-    print(f"  {'Tempo stability':<28} {m['tempo_stability']:>+7.3f}      (target 0.6-1.0)")
-    print(f"  {'Click artifact score':<28} {m['click_artifact_score']:>+7.5f}     (target <0.005)")
-    print(f"\n  VOCAL QUALITY:")
-    print(f"  {'Vocal bleed score':<28} {m['vocal_bleed_score']:>+7.3f}      (target <0.40 = clean)")
-    print(f"  {'Vocal spectral crest':<28} {m['vocal_spectral_crest']:>+7.2f}      (target 4-30 = harmonic)")
-    print(f"  {'Vocal modulation index':<28} {m['vocal_modulation_index']:>+7.3f}      (target 0.20-0.65 = intelligible)")
 
-    print(f"\n  FREQUENCY (absolute):")
+    print(f"\n  ── DYNAMICS ──────────────────────────────────────────────────────")
+    print(f"  {'Transient clarity':<28} {m['transient_clarity']:>+7.1f} dB    (target 8-28 dB)")
+    print(f"  {'Kick headroom':<28} {m['kick_headroom_db']:>+7.1f} dB    (target 8-45 dB)")
+    print(f"  {'Section consistency':<28} {m['section_consistency_lu']:>+7.1f} LU    (<8 LU)")
+    print(f"  {'Spectral slope':<28} {m['spectral_slope_db_oct']:>+7.1f} dB/oct (-12 to -2)")
+
+    print(f"\n  ── PERCEPTUAL ────────────────────────────────────────────────────")
+    print(f"  {'Beat sync (bass↔vocal)':<28} {m['beat_sync_score']:>7.3f}      (target >0.30)")
+    print(f"  {'Vocal clarity index':<28} {m['vocal_clarity_index']:>+7.1f} dB    (target >-5)")
+    print(f"  {'Tempo stability':<28} {m['tempo_stability']:>7.3f}      (target >0.6)")
+    print(f"  {'Click artifact score':<28} {m['click_artifact_score']:>7.5f}     (<0.005)")
+    print(f"  {'Vocal bleed':<28} {m['vocal_bleed_score']:>7.3f}      (<0.40 = clean)")
+    print(f"  {'Vocal spectral crest':<28} {m['vocal_spectral_crest']:>7.2f}      (>4 = harmonic)")
+    print(f"  {'Vocal modulation':<28} {m['vocal_modulation_index']:>7.3f}      (0.20-0.65)")
+    print(f"  {'Vocal presence ratio':<28} {m['vocal_presence_ratio']:>7.3f}      (>0.30)")
+
+    print(f"\n  ── MUSICAL ───────────────────────────────────────────────────────")
+    print(f"  {'Groove (on-beat fraction)':<28} {m['groove_score']:>7.3f}      (>0.25 = locked)")
+    print(f"  {'Dynamic arc':<28} {m['dynamic_arc_score']:>7.3f}      (>0.20 = builds)")
+    print(f"  {'Harmonic coherence':<28} {m['vocal_harmony_score']:>7.3f}      (>0.30 = key match)")
+
+    print(f"\n  ── FREQUENCY BALANCE ─────────────────────────────────────────────")
     for label, key in [("Sub 20-80",  "_sub_db"), ("Bass 80-250", "_bass_db"),
                         ("Lo-Mid 250-800","_lowmid_db"), ("Mid 800-2.5k","_mid_db"),
                         ("Hi-Mid 2.5-6k","_himid_db"), ("High 6-20k","_high_db")]:
@@ -710,9 +815,9 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
     print(f"\n  SPECTRAL RATIOS (vs mid at {mid:+.1f} dB):")
     for label, key, target in [
         ("Sub vs Mid",    "ratio_sub_to_mid",    "+4 → +18"),
-        ("Bass vs Mid",   "ratio_bass_to_mid",   "+2 → +15"),
-        ("Lo-Mid vs Mid", "ratio_lowmid_to_mid", "-3 → +8"),
-        ("Hi-Mid vs Mid", "ratio_himid_to_mid",  "-20 → -3"),
+        ("Bass vs Mid",   "ratio_bass_to_mid",   "+2 → +20"),
+        ("Lo-Mid vs Mid", "ratio_lowmid_to_mid", "-3 → +10"),
+        ("Hi-Mid vs Mid", "ratio_himid_to_mid",  "-20 → -1"),
         ("High vs Mid",   "ratio_high_to_mid",   "-32 → -8"),
         ("Mud Index",     "mud_index",            "1.0 → 5.5"),
     ]:
@@ -740,21 +845,24 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
 def auto_score(audio_path: str, strict: bool = False) -> tuple:
     """
     Called from fuse() after every mix.
-    Returns (passed, score, summary, issues) — issues used by corrections().
+    Returns (passed, score, summary, issues).
     """
     score, issues, metrics = score_file(audio_path, strict=strict, print_report=True)
     critical = [i for i in issues if i[0] == "CRITICAL"]
-    passed = score >= 82 and not critical   # B+ grade threshold
 
-    # Additional check: if beat_sync_score is too low, force a correction pass
-    beat_sync = metrics.get("beat_sync_score", 1.0)
-    if passed and beat_sync < 0.35:
-        passed = False
+    # Pass requires: score ≥ 82, no CRITICAL issues, and groove is not broken
+    groove = metrics.get("groove_score", 0.5)
+    harmony = metrics.get("vocal_harmony_score", 0.5)
+    passed = score >= 82 and not critical and groove >= 0.25 and harmony >= 0.25
 
     if passed:
         summary = f"PASS ({score}/100) — {_grade(score)}"
     elif critical:
         summary = f"FAIL ({score}/100) — CRITICAL: {critical[0][5]}"
+    elif groove < 0.25:
+        summary = f"FAIL ({score}/100) — no groove (vocal off-beat)"
+    elif harmony < 0.25:
+        summary = f"FAIL ({score}/100) — key clash"
     else:
         summary = f"FAIL ({score}/100) — {len(issues)} issues"
 
@@ -762,7 +870,7 @@ def auto_score(audio_path: str, strict: bool = False) -> tuple:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="VocalFusion Quality Scorer")
+    parser = argparse.ArgumentParser(description="VocalFusion Quality Scorer v3")
     parser.add_argument("audio")
     parser.add_argument("reference", nargs="?")
     parser.add_argument("--strict", action="store_true")
