@@ -208,14 +208,46 @@ def _analyze_vocal_character(vox_mono: np.ndarray) -> dict:
     }
 
 
-def _style_params(beat_char: dict, vox_char: dict) -> dict:
+def _style_params(beat_char: dict, vox_char: dict, beat_fp: dict = None) -> dict:
     """
     Map continuous style scores → concrete DSP parameter values.
     All parameters derived from audio content — nothing hardcoded.
+
+    beat_fp: optional beat sonic fingerprint (from _beat_sonic_fingerprint).
+             When provided, reverb is matched to the beat's acoustic space and
+             the spectral carve range is extended to cover the vocal's actual F0.
     """
     agg  = beat_char["aggressiveness"]   # 0–1
     bass = beat_char["bass_weight"]      # 0–1
     rap  = vox_char["rap_score"]         # 0–1
+
+    # ── Reverb: match beat's acoustic space ───────────────────────────────────
+    # Base: very dry (AI stems already have original reverb baked in).
+    # Scale: if the beat lives in a roomy space (reverb_tail high), give the
+    # vocal more space to match — otherwise it sounds pasted on top.
+    base_room = float(np.interp(rap, [0, 1], [0.15, 0.06]))
+    base_wet  = float(np.interp(rap, [0, 1], [0.04, 0.02]))
+    if beat_fp is not None:
+        reverb_tail = float(beat_fp.get("reverb_tail", 0.3))
+        # room_scale: 0.7× for punchy/dry beats, 1.4× for roomy/spacious beats
+        room_scale  = float(np.interp(reverb_tail, [0.10, 0.60], [0.70, 1.40]))
+        reverb_room = float(np.clip(base_room * room_scale, 0.04, 0.35))
+        reverb_wet  = float(np.clip(base_wet  * room_scale, 0.01, 0.09))
+    else:
+        reverb_room = base_room
+        reverb_wet  = base_wet
+
+    # ── Spectral carve frequency range ────────────────────────────────────────
+    # Default 200-5000 Hz covers most voices. Extend dynamically:
+    #   Bass vocalists (F0 < 150 Hz):  carve down to ~80 Hz to cover fundamentals
+    #   Sopranos / high falsetto (F0 > 350 Hz or pitch_range > 22 st): up to 9 kHz
+    median_f0     = float(vox_char.get("median_f0",  150.0))
+    pitch_range_s = float(vox_char.get("pitch_range", 12.0))
+    carve_lo_hz   = float(np.clip(median_f0 * 0.65, 80.0, 200.0))
+    if median_f0 > 350 or pitch_range_s > 22:
+        carve_hi_hz = float(np.clip(median_f0 * 7.0, 5000.0, 9000.0))
+    else:
+        carve_hi_hz = 5000.0
 
     return {
         "_rap_score": rap,  # pass-through for ADT and other downstream use
@@ -242,15 +274,16 @@ def _style_params(beat_char: dict, vox_char: dict) -> dict:
         # Air shelf: compensate for HF stripped by Demucs mask + de-esser.
         "air_db":       float(np.interp(rap, [0, 1], [2.5, 2.0])),
 
-        # Reverb: very dry. AI-separated stems already have the original recording's
-        # reverb baked in. Adding more reverb = double-reverb = wash/blur.
-        # Max 4% wet for singing, max 2% for rap. Just enough for space, not blur.
-        "reverb_room":  float(np.interp(rap, [0, 1], [0.15, 0.06])),
+        # Reverb: matched to beat's acoustic space (see computation above)
+        "reverb_room":  reverb_room,
         "reverb_damp":  float(np.interp(rap, [0, 1], [0.70, 0.90])),
-        "reverb_wet":   float(np.interp(rap, [0, 1], [0.04, 0.02])),
+        "reverb_wet":   reverb_wet,
 
         # Spectral carve: more bass-heavy → carve deeper. 8-10 dB for house/EDM.
         "carve_db":     float(np.interp(bass, [0, 1], [6.0, 10.0])),
+        # Carve frequency range: content-adaptive (see computation above)
+        "carve_lo_hz":  carve_lo_hz,
+        "carve_hi_hz":  carve_hi_hz,
 
         # Sidechain: aggressive beat → more sidechain duck
         "sidechain_mult": float(np.interp(agg, [0, 1], [0.9, 1.2])),
@@ -817,8 +850,13 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         # with flat energy envelopes, local tracking kills vocal LRA (was 2.5 LU).
         # The static mid-RMS scalar above handles presence; iterative loop handles targeting.
 
-        # Process instrumental
-        inst_c = _adaptive_spectral_carve(inst, vox_scaled, carve_db=carve_db)
+        # Process instrumental — pass content-adaptive carve range from style
+        inst_c = _adaptive_spectral_carve(
+            inst, vox_scaled,
+            carve_db=carve_db,
+            carve_lo_hz=style.get("carve_lo_hz", 200.0),
+            carve_hi_hz=style.get("carve_hi_hz", 5000.0),
+        )
         inst_c = _check(inst_c, f"iter{iteration+1}/spectral-carve")
         # Complementary EQ: two cuts carve a clear vocal pocket in the beat.
         # 1. Fundamental zone cut (gender-adaptive): clears body/low-mid masking
@@ -1825,62 +1863,94 @@ def _harmonic_vocal_process(vox: np.ndarray, mix_dry: float = 0.50) -> np.ndarra
 
 def detect_bpm(y_mono: np.ndarray) -> float:
     """
-    Robust BPM detection for hip-hop/trap (typically 70-200 BPM actual).
+    Genre-agnostic BPM detection using multi-prior consensus + spectral fingerprint.
 
-    Uses two-stage approach to handle half-tempo detection:
-    1. Primary: librosa.beat.beat_track (most robust for musical content)
-    2. Fallback: onset-envelope tempo if beat_track gives unreasonable result
-    3. Half-tempo correction: if detected BPM suggests half-tempo, try doubling
-
-    Hip-hop half-tempo problem: 140 BPM trap often detected as 70 BPM because
-    the hi-hat pattern runs at 140 but the kick/snare pattern matches 70 BPM
-    equally well. We resolve this by checking which is closer to 90-160 BPM range.
+    Covers the full musical tempo range: 55-220 BPM.
+    Spectral content (centroid, sub ratio, onset density) is used to weight
+    tempo priors toward the likely zone without hard-coding a genre assumption.
+    Consensus voting across all priors picks the most-agreed-upon candidate.
+    Half/double tempo correction is onset-rate driven (not genre-hardcoded).
     """
-    hop = 512
+    from scipy.stats import lognorm as _lognorm
+    hop    = 512
+    clip30 = y_mono[:SR * 30]
     onset_env = librosa.onset.onset_strength(y=y_mono, sr=SR, hop_length=hop)
 
-    # Method 1: beat_track (robust, uses beat autocorrelation)
-    bpm_bt, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=SR,
-                                         hop_length=hop)
-    bpm_bt = float(bpm_bt)
+    # ── Spectral fingerprint → tempo zone ─────────────────────────────────────
+    S      = np.abs(librosa.stft(clip30, n_fft=2048, hop_length=hop))
+    freqs  = librosa.fft_frequencies(sr=SR)
+    total_e  = float(S.mean()) + 1e-9
+    sub_e    = float(S[(freqs >= 20)  & (freqs < 80)].mean())
+    sub_ratio = sub_e / total_e
+    centroid  = float(librosa.feature.spectral_centroid(S=S, sr=SR).mean())
+    onset_rate = len(librosa.onset.onset_detect(
+        onset_envelope=onset_env, sr=SR, hop_length=hop)) / (len(clip30) / SR + 1e-9)
 
-    # Method 2: prior-informed tempo — lognormal prior centered at 130 BPM
-    # covers 80-200 BPM with high probability, much more reliable for hip-hop
-    try:
-        from scipy.stats import lognorm as _lognorm
-        hip_hop_prior = _lognorm(s=0.35, scale=130)
-        bpm_oe = float(librosa.feature.rhythm.tempo(
-            onset_envelope=onset_env, sr=SR, hop_length=hop,
-            prior=hip_hop_prior)[0])
+    # Content-adaptive prior centers — ordered by confidence (most likely first)
+    if centroid > 4000 and onset_rate > 6.5:
+        prior_centers = [170, 145, 120]    # drum & bass / breakbeat / fast EDM
+    elif sub_ratio > 0.25 and centroid > 2500:
+        prior_centers = [130, 150, 110]    # trap / EDM / hip-hop
+    elif centroid < 1800 and onset_rate < 2.5:
+        prior_centers = [75, 90, 60]       # ballad / slow R&B / soul
+    elif centroid < 2500 and onset_rate < 3.5:
+        prior_centers = [95, 110, 80]      # mid-tempo hip-hop / reggaeton / R&B
+    else:
+        prior_centers = [110, 128, 95]     # pop / dance / default
+
+    # ── Method 1: beat_track (autocorrelation — no genre prior) ───────────────
+    bpm_bt = float(librosa.beat.beat_track(
+        onset_envelope=onset_env, sr=SR, hop_length=hop)[0])
+
+    # ── Method 2: multiple lognormal priors across the tempo spectrum ──────────
+    candidates = [bpm_bt]
+    for center in prior_centers:
+        try:
+            t = float(librosa.feature.rhythm.tempo(
+                onset_envelope=onset_env, sr=SR, hop_length=hop,
+                prior=_lognorm(s=0.25, scale=center))[0])
+            candidates.append(t)
+        except Exception:
+            pass
+    try:    # also add a completely prior-free estimate
+        candidates.append(float(librosa.feature.rhythm.tempo(
+            onset_envelope=onset_env, sr=SR, hop_length=hop)[0]))
     except Exception:
-        bpm_oe = float(librosa.feature.rhythm.tempo(
-            onset_envelope=onset_env, sr=SR, hop_length=hop)[0])
+        pass
 
-    # Pick the one closer to the hip-hop range (90-170 BPM)
-    def distance_to_hiphop(bpm):
-        bpm = float(bpm)
-        return min(abs(bpm - 90), abs(bpm - 140), abs(bpm - 170))
+    # ── Octave-normalise all candidates to 55-220 BPM ─────────────────────────
+    def _norm(b):
+        while b > 220: b /= 2
+        while b < 55:  b *= 2
+        return float(b)
 
-    bpm = bpm_bt if distance_to_hiphop(bpm_bt) <= distance_to_hiphop(bpm_oe) else bpm_oe
+    normed = [_norm(c) for c in candidates]
 
-    # Normalize range (handle half/double tempo detection)
-    while bpm > 200.0:
-        bpm /= 2
-    while bpm < 70.0:
+    # ── Consensus vote: most agreement within ±6% at any octave ──────────────
+    def _octave_agree(a, b):
+        for m in (0.5, 1.0, 2.0):
+            if abs(a * m - b) / (b + 1e-9) < 0.06:
+                return True
+        return False
+
+    votes = [sum(_octave_agree(c, o) for o in normed) for c in normed]
+    # Tiebreak: prefer the estimate closest to the top content-adaptive center
+    best_idx = max(range(len(normed)),
+                   key=lambda i: (votes[i], -abs(normed[i] - prior_centers[0])))
+    bpm = normed[best_idx]
+
+    # ── Genre-agnostic half/double tempo correction ────────────────────────────
+    # High onset rate (>5.5/s) + low BPM → half-tempo was detected, double it
+    # Low onset rate (<1.5/s)  + high BPM → double-tempo detected, halve it
+    if onset_rate > 5.5 and bpm < 95:
+        print(f"      BPM ×2 (onset_rate={onset_rate:.1f}/s): {bpm:.0f}→{bpm*2:.0f}", flush=True)
         bpm *= 2
+    elif onset_rate < 1.5 and bpm > 145:
+        print(f"      BPM ÷2 (onset_rate={onset_rate:.1f}/s): {bpm:.0f}→{bpm/2:.0f}", flush=True)
+        bpm /= 2
 
-    # Half-tempo check: if 70-89 BPM, check if 2× is more plausible for hip-hop
-    # Hip-hop BPM range: most trap is 130-170, most hip-hop 85-115
-    # If detected is 70-84: likely half of 140-168 (trap) — if onset density suggests
-    # high onset rate (many hi-hats), double it
-    if 70.0 <= bpm < 88.0:
-        onset_rate = len(librosa.onset.onset_detect(
-            onset_envelope=onset_env, sr=SR, hop_length=hop)) / (len(y_mono) / SR)
-        # Trap has >4 onsets/second due to hi-hats; regular hip-hop has 2-4
-        if onset_rate > 4.5:
-            bpm *= 2.0
-            print(f"      BPM half-tempo corrected: ×2 (onset_rate={onset_rate:.1f}/s)",
-                  flush=True)
+    while bpm > 220: bpm /= 2
+    while bpm < 55:  bpm *= 2
 
     return float(bpm)
 
@@ -1910,17 +1980,64 @@ def _best_ratio(bpm_a: float, bpm_b: float) -> float:
 
 
 def detect_key(y_mono: np.ndarray) -> tuple:
-    chroma = librosa.feature.chroma_cens(y=y_mono, sr=SR)
-    mean_ch = chroma.mean(axis=1)
-    mean_ch /= mean_ch.sum() + 1e-9
-    best_score, best_root, best_mode = -np.inf, 0, "major"
-    for root in range(12):
-        rot = np.roll(mean_ch, -root)
-        for profile, mode in ((_KS_MAJOR, "major"), (_KS_MINOR, "minor")):
-            score = np.dot(rot, profile / profile.sum())
-            if score > best_score:
-                best_score, best_root, best_mode = score, root, mode
-    return best_root, best_mode
+    """
+    Multi-window energy-weighted key detection.
+
+    Analyzes the full track plus 3 temporal segments (start / middle / end),
+    weights each window by its RMS energy, then votes across all windows.
+
+    Why this matters:
+    - Intros often have drums-only or sparse harmonic content → misleading key
+    - Choruses (usually in the middle/end) have the clearest chord voicings
+    - Energy weighting ensures loud, chord-dense sections dominate the vote
+    - chroma_cqt handles overtones better than chroma_cens for dense mixes
+    """
+    def _ks_vote(chroma_mean):
+        chroma_mean = chroma_mean / (chroma_mean.sum() + 1e-9)
+        best_s, best_r, best_m = -np.inf, 0, "major"
+        for root in range(12):
+            rot = np.roll(chroma_mean, -root)
+            for profile, mode in ((_KS_MAJOR, "major"), (_KS_MINOR, "minor")):
+                s = float(np.dot(rot, profile / profile.sum()))
+                if s > best_s:
+                    best_s, best_r, best_m = s, root, mode
+        return best_r, best_m, best_s
+
+    duration = len(y_mono)
+    seg_len  = min(duration, SR * 40)
+
+    windows = [y_mono]  # full track always included
+    if duration > SR * 30:
+        mid = duration // 2
+        windows += [
+            y_mono[:seg_len],              # start (intro / verse)
+            y_mono[mid:mid + seg_len],     # middle (typically chorus-heavy)
+            y_mono[max(0, duration - seg_len):],  # end
+        ]
+
+    votes = {}  # (root, mode) → accumulated weighted confidence
+    for seg in windows:
+        rms_w = float(np.sqrt(np.mean(seg ** 2)) + 1e-9)
+        try:
+            chroma  = librosa.feature.chroma_cqt(
+                y=seg.astype(np.float32), sr=SR, bins_per_octave=36)
+            root, mode, conf = _ks_vote(chroma.mean(axis=1))
+            k = (root, mode)
+            votes[k] = votes.get(k, 0.0) + rms_w * conf
+        except Exception:
+            try:    # fallback to chroma_cens if CQT fails
+                chroma  = librosa.feature.chroma_cens(
+                    y=seg.astype(np.float32), sr=SR)
+                root, mode, conf = _ks_vote(chroma.mean(axis=1))
+                k = (root, mode)
+                votes[k] = votes.get(k, 0.0) + rms_w * conf * 0.8
+            except Exception:
+                pass
+
+    if not votes:
+        return 0, "major"
+    best = max(votes, key=votes.get)
+    return best
 
 
 def semitones_to_shift(src_root, src_mode, dst_root, dst_mode) -> int:
@@ -3374,7 +3491,9 @@ def _transient_shape(inst: np.ndarray,
 
 def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
                               carve_db: float = 5.0,
-                              smooth_sigma: float = 2.5) -> np.ndarray:
+                              smooth_sigma: float = 2.5,
+                              carve_lo_hz: float = 200.0,
+                              carve_hi_hz: float = 5000.0) -> np.ndarray:
     """
     Content-aware spectral carving using a Wiener soft-mask.
 
@@ -3383,8 +3502,10 @@ def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
     This replaces the old fixed-frequency EQ cut with a dynamic carve that
     adapts to whatever frequencies the vocal actually uses.
 
-    carve_db: max cut in beat where vocal is loudest (5 dB = perceptually clean)
+    carve_db:     max cut in beat where vocal is loudest (5 dB = perceptually clean)
     smooth_sigma: temporal smoothing to prevent pumping/zipper artifacts
+    carve_lo_hz:  lower frequency boundary (default 200 Hz; extend to ~80 Hz for bass vocalists)
+    carve_hi_hz:  upper frequency boundary (default 5000 Hz; extend to ~9kHz for sopranos)
     """
     n_fft, hop = 2048, 512
     inst_mono = _to_mono(inst)
@@ -3407,28 +3528,38 @@ def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
     vocal_mask = gaussian_filter1d(vocal_mask.astype(np.float64),
                                     sigma=smooth_sigma, axis=1).astype(np.float32)
 
-    # Frequency weighting: carve ONLY the vocal intelligibility zone (300 Hz–5 kHz).
-    # Research: 2-4 kHz is the ear canal resonance peak (3.3 kHz) and the
-    # single most important band for vocal intelligibility in a dense mix.
-    # STOP AT 5 kHz: above 5 kHz is air/cymbals from the beat. Spectral analysis
-    # showed the mix was -5 dB dark in 6-20kHz band partly because this carve
-    # was extending to 8kHz and cutting beat HF content during vocal sections.
+    # Frequency weighting: carve the vocal intelligibility zone.
+    # Range is content-adaptive (carve_lo_hz / carve_hi_hz) so:
+    #   - Bass vocalists (F0 ~80-130 Hz): carve extends down to ~80 Hz
+    #   - Standard voices: default 200-5000 Hz
+    #   - Sopranos / high falsetto: extends up to ~9 kHz
+    # Peak weight 2.0× at 3 kHz — ear-canal resonance + presence zone.
     freqs = librosa.fft_frequencies(sr=SR, n_fft=n_fft)
     freq_w = np.zeros(len(freqs), dtype=np.float32)
+    _lo = carve_lo_hz
+    _hi = carve_hi_hz
+    _lo_ramp_end = min(max(_lo * 2.0, 300.0), 400.0)   # ramp from _lo to this freq
     for i, f in enumerate(freqs):
-        if f < 200 or f > 5000:
-            freq_w[i] = 0.0                             # no carve outside 200-5kHz
-        elif f < 300:
-            freq_w[i] = (f - 200) / 100 * 0.4         # gentle ramp 200-300 Hz (mud zone)
+        if f < _lo or f > _hi:
+            freq_w[i] = 0.0                             # no carve outside the active range
+        elif f < _lo_ramp_end:
+            # Gentle low-end ramp: avoids mud artifacts when carve extends below 200 Hz
+            freq_w[i] = float((f - _lo) / max(_lo_ramp_end - _lo, 1.0) * 0.4)
         elif f < 600:
-            freq_w[i] = 0.4 + (f - 300) / 300 * 0.4   # ramp to 0.8 at 600 Hz
+            t = float((f - _lo_ramp_end) / max(600.0 - _lo_ramp_end, 1.0))
+            freq_w[i] = 0.4 + t * 0.4                  # ramp to 0.8 at 600 Hz
         elif f < 1000:
-            freq_w[i] = 0.8 + (f - 600) / 400 * 0.2   # ramp to 1.0 at 1kHz
+            freq_w[i] = 0.8 + (f - 600) / 400 * 0.2   # ramp to 1.0 at 1 kHz
         else:
-            # 2-4kHz: peak weight 2.0× at 3kHz — vocal presence / cut-through zone.
+            # 2-4 kHz: peak weight 2.0× at 3 kHz — vocal presence / cut-through zone.
             # Fletcher-Munson: at high volume bass masks this zone → carve deeper.
-            freq_w[i] = 1.0 + 1.0 * float(np.clip(
-                1.0 - abs(np.log2(f / 3000)) * 1.5, 0, 1))  # peak 2.0× at 3kHz
+            w_peak = 1.0 + 1.0 * float(np.clip(
+                1.0 - abs(np.log2(f / 3000)) * 1.5, 0, 1))  # peak 2.0× at 3 kHz
+            # Taper toward 0 in the top 25% of the carve range (prevents harsh cut-off)
+            if f > _hi * 0.75:
+                taper = float(np.clip((_hi - f) / (_hi * 0.25), 0.0, 1.0))
+                w_peak *= taper
+            freq_w[i] = w_peak
 
     # Effective gain: 1.0 where vocal is absent, (1 - max_cut) where vocal is loud
     max_cut = 1.0 - 10 ** (-carve_db / 20.0)   # carve_db=5 → max_cut≈0.44
@@ -4579,7 +4710,16 @@ def fuse(song_a: str, song_b: str, out_path: str,
     # AI content analysis: derive all DSP parameters from actual audio
     beat_char  = _analyze_beat_character(full_a, bpm_a)
     vox_char   = _analyze_vocal_character(_to_mono(stems_b["vocals"]))
-    style      = _style_params(beat_char, vox_char)
+    # Beat sonic fingerprint: computed BEFORE _style_params so reverb can match
+    # the beat's acoustic space and carve range can extend to cover the vocal F0.
+    # Uses full_a (original song A pre-stem-separation) for the most representative
+    # fingerprint of the beat's natural sound character.
+    print("      Pre-computing beat sonic fingerprint for adaptive parameters…", flush=True)
+    beat_fp_early = _beat_sonic_fingerprint(full_a, bpm_a)
+    print(f"      Beat fingerprint: reverb_tail={beat_fp_early['reverb_tail']:.2f}  "
+          f"saturation={beat_fp_early['saturation']:.2f}  "
+          f"dynamic={beat_fp_early['dynamic_feel']:.2f}", flush=True)
+    style      = _style_params(beat_char, vox_char, beat_fp=beat_fp_early)
     vox_params = _analyze_vocal_stem(vox)
     overlap    = _spectral_overlap(_to_mono(vox), _to_mono(inst))
     # Sidechain depth: depth=0.37 → beat ducks -4 dB when vocal is at peak.
@@ -4596,7 +4736,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     print(f"      Style → FET {style['fet_ratio']:.1f}:1  "
           f"reverb_room={style['reverb_room']:.2f}  "
           f"reverb_wet={style['reverb_wet']:.2f}  "
-          f"carve={style['carve_db']:.1f}dB  "
+          f"carve={style['carve_db']:.1f}dB [{style['carve_lo_hz']:.0f}-{style['carve_hi_hz']:.0f}Hz]  "
           f"vocal_level={style['vocal_level']:.2f}  "
           f"comp_eq={style['comp_eq_hz']:.0f}Hz", flush=True)
     print(f"      Gate thresh: {vox_params['gate_thresh_db']:.1f} dB  "
@@ -4969,4 +5109,5 @@ def fuse(song_a: str, song_b: str, out_path: str,
         "radio":    out_path,
         "club":     out_club,
         "intimate": out_intimate,
+        "score":    int(best_score) if best_score > 0 else None,
     }
