@@ -34,7 +34,13 @@ v4 additions:
   - crest_factor REF tightened from 22 to 16 dB (commercial masters cap at ~16 dB)
   - groove_score window: 40ms → 60ms (appropriate for computer-generated mashups)
   - vocal_harmony_score now uses CENS (robust to timbre/dynamics) with circular
-    rotation to properly detect key compatibility between beat and vocal harmonics"""
+    rotation to properly detect key compatibility between beat and vocal harmonics
+
+v4.1 additions (ISMIR / AES / mastering research):
+  - PLR lower bound raised 5→6 dB (AES TD1004 reject threshold)
+  - vocal_bleed_score: sibilance band ratio method (5-10kHz vs broadband, >6 dB trigger)
+  - key_distance: HPSS before CENS — removes kick/snare from chroma (Mauch & Dixon 2010)
+  - low_freq_stereo_corr NEW: sub-bass mono check below 80 Hz, target >=0.85
 
 Usage:
   python listen.py output.wav                  # score
@@ -73,9 +79,15 @@ REF = {
     # >16 dB means mastered too quietly / not limited at all.
     "crest_factor_db":    (6.0, 16.0),
     # plr_db: Peak-to-Loudness Ratio = true_peak_dBTP - integrated_LUFS.
-    # Research: hip-hop PLR 6-12 dB, R&B 8-14 dB. <5 = over-limited (smashed).
-    "plr_db":             (5.0, 14.0),
+    # Research: hip-hop PLR 6-12 dB, R&B 8-14 dB.
+    # <6 dB = over-limited (AES TD1004 / mastering community reject threshold).
+    # >14 dB = mastered too quietly.
+    "plr_db":             (6.0, 14.0),
     "stereo_correlation": (0.4, 0.99),
+    # low_freq_stereo_corr: stereo correlation of the sub-bass band (< 80 Hz).
+    # Research: bass and kick must be mono below 80 Hz — decorrelated sub-bass
+    # causes phase cancellation on club subwoofers. Target ≥ 0.85.
+    "low_freq_stereo_corr": (0.85, 1.0),
 
     # ── TIER 2: Spectral balance (ratios vs mid band) ─────────────────────
     "ratio_sub_to_mid":    (+4.0, +18.0),
@@ -117,8 +129,10 @@ REF = {
     # click_artifact_score: % samples where |diff| > 10x diff RMS.
     "click_artifact_score": (0.0, 0.005),
 
-    # vocal_bleed_score: roughness of 6-16kHz during voiced frames.
-    "vocal_bleed_score":    (0.0, 0.40),
+    # vocal_bleed_score: fraction of voiced frames where sibilance band (5-10kHz)
+    # exceeds broadband (500Hz-10kHz) by >6 dB — the industry de-essing trigger threshold.
+    # Research: >5% frames = de-essing needed; >15% = clearly audible hi-hat bleed.
+    "vocal_bleed_score":    (0.0, 0.15),
 
     # vocal_spectral_crest: median spectral crest of 300-3000Hz in voiced frames.
     "vocal_spectral_crest": (4.0, 30.0),
@@ -164,6 +178,7 @@ REF_STRICT = {**REF,
     "lra_lu":                  (4.5, 16.0),
     "crest_factor_db":         (7.0, 14.0),
     "plr_db":                  (6.0, 12.0),
+    "low_freq_stereo_corr":    (0.90, 1.0),
     "transient_clarity":       (10.0, 25.0),
     "kick_headroom_db":        (5.0, 45.0),
     "mud_index":               (1.2, 4.5),
@@ -171,6 +186,7 @@ REF_STRICT = {**REF,
     "ratio_lowmid_to_mid":     (-3.0, +6.0),
     "ratio_himid_to_mid":      (-18.0, -1.5),
     "beat_sync_score":         (0.35, 1.0),
+    "vocal_bleed_score":       (0.0, 0.08),
     "groove_score":            (0.30, 1.0),
     "dynamic_arc_score":       (0.30, 1.0),
     "vocal_harmony_score":     (0.40, 1.0),
@@ -187,6 +203,7 @@ PENALTIES = {
     "crest_factor_db":        10,
     "plr_db":                 10,   # over-compressed (PLR<5) or mastered too quiet (PLR>14)
     "stereo_correlation":      8,
+    "low_freq_stereo_corr":    8,   # sub-bass phase cancel = bad on club systems
     # TIER 2: Spectral
     "ratio_sub_to_mid":        5,
     "ratio_bass_to_mid":       6,
@@ -230,6 +247,8 @@ PROBLEM_NAMES = {
                             "too spiky — needs glue"),
     "stereo_correlation":  ("phase cancellation — bad in mono",
                             "stereo too wide / phasey"),
+    "low_freq_stereo_corr": ("(perfect mono bass — N/A)",
+                             "SUB-BASS STEREO: phase cancellation on club subwoofers below 80 Hz"),
     "ratio_sub_to_mid":    ("sub-bass missing — sounds thin",
                             "BOOMINESS — sub-bass drowning mix"),
     "ratio_bass_to_mid":   ("bass missing — thin sounding",
@@ -363,6 +382,22 @@ def _measure(audio_path: str) -> dict:
 
     # ── Stereo correlation ────────────────────────────────────────────────────
     corr = float(np.corrcoef(L, R)[0, 1]) if (L.std() > 1e-9 and R.std() > 1e-9) else 1.0
+
+    # ── Low-frequency stereo correlation (< 80 Hz) ────────────────────────────
+    # Research: bass and kick MUST be mono below 80 Hz. Decorrelated sub-bass
+    # causes phase cancellation on club subwoofers. Target ρ ≥ 0.85.
+    # (EBU R68, club PA engineering: bass below 80Hz should approach mono.)
+    try:
+        nyq_lf = SR / 2.0
+        lf_sos = butter(4, 80.0 / nyq_lf, btype="low", output="sos")
+        L_lf = sosfilt(lf_sos, L)
+        R_lf = sosfilt(lf_sos, R)
+        low_freq_stereo_corr = (
+            float(np.corrcoef(L_lf, R_lf)[0, 1])
+            if (L_lf.std() > 1e-9 and R_lf.std() > 1e-9) else 1.0
+        )
+    except Exception:
+        low_freq_stereo_corr = 1.0
 
     # ── Spectral bands ────────────────────────────────────────────────────────
     S = np.abs(librosa.stft(mono, n_fft=2048))
@@ -509,15 +544,33 @@ def _measure(audio_path: str) -> dict:
     vp_med    = float(np.median(vp_frames))
     voiced_mask = vp_frames > vp_med
 
-    # ── Vocal bleed score ─────────────────────────────────────────────────────
+    # ── Vocal bleed score (sibilance band ratio method) ───────────────────────
+    # Research-backed: hi-hat/cymbal bleed shows as elevated 5-10kHz energy
+    # during voiced frames. De-essing trigger = sibilance >6 dB above broadband
+    # (500Hz-10kHz). Score = fraction of voiced frames that exceed this threshold.
+    # Research: >5% frames = de-essing needed; >15% = audible bleed (our limit).
     try:
-        if voiced_mask.sum() > 20:
-            hh_voiced = hh_frames[voiced_mask]
-            rough_voiced = float(hh_voiced.std() / (hh_voiced.mean() + 1e-9))
-            vocal_bleed_score = float(np.clip((rough_voiced - 0.5) / 1.0, 0.0, 1.0))
+        nyq_bl = SR / 2.0
+        sib_sos = butter(4, [5000./nyq_bl, min(10000./nyq_bl, 0.999)],
+                         btype="band", output="sos")
+        broad_sos = butter(4, [500./nyq_bl, min(10000./nyq_bl, 0.999)],
+                           btype="band", output="sos")
+        sib_sig  = sosfilt(sib_sos,   mono)
+        broad_sig = sosfilt(broad_sos, mono)
+
+        sib_frames_rms   = librosa.feature.rms(y=sib_sig,   frame_length=1024, hop_length=512)[0]
+        broad_frames_rms = librosa.feature.rms(y=broad_sig, frame_length=1024, hop_length=512)[0]
+
+        n_bl = min(len(sib_frames_rms), len(voiced_mask))
+        if voiced_mask[:n_bl].sum() > 20:
+            sib_v   = sib_frames_rms[:n_bl][voiced_mask[:n_bl]]
+            broad_v = broad_frames_rms[:n_bl][voiced_mask[:n_bl]]
+            ratio_db_vals = 20.0 * np.log10(sib_v / (broad_v + 1e-9) + 1e-9)
+            SIBILANCE_TRIGGER_DB = 6.0  # industry de-essing standard
+            vocal_bleed_score = float(np.clip(
+                np.mean(ratio_db_vals > SIBILANCE_TRIGGER_DB), 0.0, 1.0))
         else:
-            hh_rough = float(hh_frames.std() / (hh_frames.mean() + 1e-9))
-            vocal_bleed_score = float(np.clip((hh_rough - 0.5) / 1.0, 0.0, 1.0))
+            vocal_bleed_score = 0.0
     except Exception:
         vocal_bleed_score = 0.0
 
@@ -682,14 +735,18 @@ def _measure(audio_path: str) -> dict:
     # Rotate beat CENS over 12 semitones, find shift that maximises similarity.
     # Distance = argmax shift (= semitone offset between keys).
     # Camelot Wheel research: ≤2 semitones = compatible, 6 = tritone clash.
+    # Research improvement: HPSS before CENS removes kick/snare from chroma —
+    # hip-hop percussion strongly pollutes chroma vectors without this step.
     try:
+        # Harmonic-percussive separation strips drums before chroma computation
+        y_harmonic_kd, _ = librosa.effects.hpss(mono, margin=3.0)
         nyq_k = SR / 2.0
         bass_rng = sosfilt(
             butter(4, [80.0 / nyq_k, min(500.0 / nyq_k, 0.999)], btype="band", output="sos"),
-            mono)
+            y_harmonic_kd)
         voc_rng = sosfilt(
             butter(4, [800.0 / nyq_k, min(3000.0 / nyq_k, 0.999)], btype="band", output="sos"),
-            mono)
+            y_harmonic_kd)
 
         # CENS: chroma_cqt with L1-norm quantisation (approximation without essentia)
         def _cens(sig):
@@ -727,6 +784,7 @@ def _measure(audio_path: str) -> dict:
         "crest_factor_db":       crest_db,
         "plr_db":                plr_db,
         "stereo_correlation":    corr,
+        "low_freq_stereo_corr":  low_freq_stereo_corr,
         # Raw bands (display only)
         "_sub_db":    sub_db,
         "_bass_db":   bass_db,
@@ -818,6 +876,7 @@ def _musical_diagnosis(metrics: dict) -> list:
     dc  = metrics.get("dynamic_complexity_db", 6.0)
     kd  = metrics.get("key_distance_semitones", 2.0)
     plr = metrics.get("plr_db", 9.0)
+    lfc = metrics.get("low_freq_stereo_corr", 1.0)
 
     if gs < 0.30 and syn < 0.35:
         diags.append("⚠ FUNDAMENTAL: vocal and beat are out of time — won't feel like a song regardless of mix quality")
@@ -848,6 +907,11 @@ def _musical_diagnosis(metrics: dict) -> list:
         diags.append("△ MUFFLED: vocal syllables aren't intelligible — phrasing feels buried")
     elif mod > 0.55:
         diags.append("✓ Vocal intelligibility is strong — syllables are clear")
+
+    if lfc < 0.85:
+        diags.append(f"⚠ SUB-BASS STEREO: correlation {lfc:.2f} below 80Hz — will cancel on club subwoofers")
+    elif lfc >= 0.95:
+        diags.append(f"✓ Sub-bass is mono-compatible (ρ={lfc:.2f} below 80Hz)")
 
     if kd >= 6:
         diags.append("⚠ TRITONE CLASH: beat and vocal are 6 semitones apart — maximum dissonance")
@@ -937,6 +1001,7 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
     print(f"  {'LRA':<28} {m['lra_lu']:>+7.1f} LU    (target 2-18)")
     print(f"  {'Crest factor':<28} {m['crest_factor_db']:>+7.1f} dB    (target 6-16 dB)")
     print(f"  {'Stereo correlation':<28} {m['stereo_correlation']:>+7.3f}      (0.4-0.99)")
+    print(f"  {'Sub-bass mono (<80Hz)':<28} {m.get('low_freq_stereo_corr', 1.0):>+7.3f}      (>0.85 = mono bass)")
 
     print(f"\n  ── DYNAMICS ──────────────────────────────────────────────────────")
     print(f"  {'Transient clarity':<28} {m['transient_clarity']:>+7.1f} dB    (target 8-28 dB)")
