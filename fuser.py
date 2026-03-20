@@ -3255,7 +3255,7 @@ def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     return nr.reduce_noise(
         y=vox_mono, sr=SR,
         stationary=False,
-        prop_decrease=0.15,   # light touch — oracle Wiener+harmonic already removed bleed; avoid artifacts
+        prop_decrease=0.40,   # increased from 0.15 — deephouse/EDM bleed (hi-hat artifacts) needs stronger reduction
         n_fft=2048,
     ).astype(np.float32)
 
@@ -3476,11 +3476,12 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # Stage 0.5: HPSS harmonic masking — removes hi-hat/percussive bleed.
     # Hi-hats are percussive (vertical in spectrogram); vocals are harmonic (horizontal).
     # margin=(1.0, 5.0): a bin must be 5x more percussive to be assigned to P mask.
-    # Blend: 80% HPSS-cleaned + 20% original — preserves vocal consonants (t, k, f).
-    # Community-validated (UVR): most effective hi-hat bleed removal on separated stems.
+    # Blend: 90% HPSS-cleaned + 10% original — increased from 80% to better handle
+    # deephouse/EDM hi-hat bleed (observed vocal_bleed_score 0.589 on deephouse stems).
+    # 10% dry signal still preserves vocal consonant transients (t, k, f).
     try:
         n_fft_hpss = 2048
-        hpss_blend = 0.80
+        hpss_blend = 0.90
         cleaned_ch = np.zeros_like(vox_ch)
         for c in range(vox_ch.shape[0]):
             D = librosa.stft(vox_ch[c].astype(np.float64), n_fft=n_fft_hpss)
@@ -4223,7 +4224,7 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     _sub_rms = float(np.sqrt(np.mean(_mix_mono_sub**2)) + 1e-9)
     _mid_rms = float(np.sqrt(np.mean(_mix_mono_mid**2)) + 1e-9)
     _sub_excess = float(np.clip(_sub_rms / (_mid_rms + 1e-9) - 0.5, 0.0, 2.0))
-    _sub_atten_lin = float(np.interp(_sub_excess, [0.0, 2.0], [0.84, 0.50]))
+    _sub_atten_lin = float(np.interp(_sub_excess, [0.0, 2.0], [0.84, 0.35]))
     mix_sub_lim = (mix_sub_lim * _sub_atten_lin).astype(np.float32)
     print(f"      Sub attenuation: sub/mid={_sub_rms/_mid_rms:.2f} → "
           f"{20*np.log10(_sub_atten_lin):.1f} dB", flush=True)
@@ -4264,12 +4265,12 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # Re-normalize to enforce exact -12 LUFS target.
     # The limiter + post-norm EQ + glue comp can drift the final LUFS by ±2 LU.
     # A second LUFS pass locks it in before return.
+    # Safety: run a final limiter instead of hard-clip — hard-clip removes transient
+    # energy which reduces LUFS back below -12 (observed: -15.3 instead of -12).
     try:
         mix = _lufs_normalize(mix, -12.0)
-        # Safety: re-clip after second normalize in case it boosted into ceiling
-        peak_final = float(np.max(np.abs(mix)))
-        if peak_final > clip_ceil:
-            mix = np.clip(mix, -clip_ceil, clip_ceil).astype(np.float32)
+        final_lim = Pedalboard([Limiter(threshold_db=-0.5, release_ms=30.0)])
+        mix = final_lim(mix.T.astype(np.float32), SR).T.astype(np.float32)
     except Exception:
         pass  # if loudnorm fails for any reason, keep existing mix
     return mix
@@ -4338,9 +4339,9 @@ def _master_club(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     post_eq = Pedalboard([HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-2.5)])
     mix = post_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
-    limiter = Pedalboard([Limiter(threshold_db=-0.5, release_ms=40.0)])
+    limiter = Pedalboard([Limiter(threshold_db=-1.0, release_ms=40.0)])
     mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
-    clip_ceil = 10 ** (-0.5 / 20.0)
+    clip_ceil = 10 ** (-1.0 / 20.0)
     if float(np.max(np.abs(mix))) > clip_ceil:
         mix = np.clip(mix, -clip_ceil, clip_ceil).astype(np.float32)
     return mix
