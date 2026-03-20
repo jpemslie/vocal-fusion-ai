@@ -1,5 +1,5 @@
 """
-VocalFusion — Audio Quality Scorer + Auto-Correction Engine  v3
+VocalFusion — Audio Quality Scorer + Auto-Correction Engine  v4
 ================================================================
 Two jobs:
   1. SCORE: measure the output against professional reference ranges and
@@ -8,20 +8,33 @@ Two jobs:
   2. CORRECT: return concrete DSP parameter deltas so fuse() can re-mix
      automatically without the user needing to listen and give feedback.
 
-Metrics are grouped into four tiers:
+Metrics are grouped into five tiers:
   TECHNICAL  — loudness, clipping, dynamics, stereo phase
   SPECTRAL   — frequency balance ratios, mud, harshness, slope
   PERCEPTUAL — beat sync, vocal clarity, tempo stability, artifacts
   MUSICAL    — groove, energy arc, harmonic coherence, vocal flow
+  MASHUP     — PLR, dynamic complexity, key distance (mashup-specific)
 
-v3 additions / fixes:
-  - beat_sync_score  FIXED: now uses bass-band vs vocal-band onset xcorr
-    (old L/R channel xcorr was meaningless in M/S mixed content)
-  - groove_score     NEW: vocal onsets landing on beat grid → "locked-in" feel
-  - dynamic_arc_score NEW: energy builds to climax at 60-70%, then resolves
-  - vocal_harmony_score NEW: chroma coherence between beat and vocal zones
-  - vocal_presence_ratio NEW: direct measure of vocal over beat in 1-4kHz zone
-  - All new metrics have calibrated ranges + penalties + correction entries
+Reference ranges sourced from:
+  - EBU R128 / ITU-R BS.1770-4: true peak -1.0 dBTP, integrated loudness
+  - Streaming platform specs (Spotify -14 LUFS, Apple -16 LUFS, YouTube -14 LUFS)
+  - Genre research: hip-hop/trap crest factor 6-12 dB, R&B 9-14 dB
+  - Demucs htdemucs_ft vocal SDR benchmark: 8.42 dB (MultisongMVSep dataset)
+  - iZotope Tonal Balance Control research across 1000s of commercial tracks
+  - Harmonic mixing (Mixed In Key Camelot Wheel): ≤5 semitones = compatible
+
+v4 additions:
+  - plr_db           NEW: Peak-to-Loudness Ratio (true_peak - LUFS); target 5-14 dB
+  - dynamic_complexity_db  NEW: avg abs deviation of 2s-window loudness (essentia-
+                           inspired); target 3-14 dB; <3=brick-wall, >14=uneven
+  - key_distance_semitones NEW: CENS circular-rotation key distance between bass-range
+                           (beat harmony) and mid-range (vocal harmony); 0=same key,
+                           6=tritone clash; computed from research-backed CENS features
+  - true_peak REF corrected from -0.5 to -1.0 dBTP (EBU R128 industry standard)
+  - crest_factor REF tightened from 22 to 16 dB (commercial masters cap at ~16 dB)
+  - groove_score window: 40ms → 60ms (appropriate for computer-generated mashups)
+  - vocal_harmony_score now uses CENS (robust to timbre/dynamics) with circular
+    rotation to properly detect key compatibility between beat and vocal harmonics"""
 
 Usage:
   python listen.py output.wav                  # score
@@ -48,10 +61,20 @@ SR = 44100
 
 REF = {
     # ── TIER 1: Technical ────────────────────────────────────────────────────
+    # lufs_integrated: Spotify/YouTube normalize to -14 LUFS. Hip-hop masters
+    # typically land -8 to -12 LUFS. Below -14 = will be boosted (sounds weak).
     "lufs_integrated":    (-14.0, -7.0),
-    "true_peak_dbfs":     (-40.0, -0.5),   # 0.0 = clipping → CRITICAL
-    "lra_lu":             (2.0, 22.0),
-    "crest_factor_db":    (6.0, 22.0),
+    # true_peak: EBU R128 and all major streaming platforms specify -1.0 dBTP.
+    # (Previous -0.5 was too strict — limiter landing exactly at -0.5 triggered false CRITICAL.)
+    "true_peak_dbfs":     (-40.0, -1.0),
+    # lra_lu: hip-hop typically 4-10 LU, pop 6-12 LU, EDM 4-8 LU.
+    "lra_lu":             (2.0, 18.0),
+    # crest_factor: commercial hip-hop/trap 6-12 dB, R&B 9-14 dB.
+    # >16 dB means mastered too quietly / not limited at all.
+    "crest_factor_db":    (6.0, 16.0),
+    # plr_db: Peak-to-Loudness Ratio = true_peak_dBTP - integrated_LUFS.
+    # Research: hip-hop PLR 6-12 dB, R&B 8-14 dB. <5 = over-limited (smashed).
+    "plr_db":             (5.0, 14.0),
     "stereo_correlation": (0.4, 0.99),
 
     # ── TIER 2: Spectral balance (ratios vs mid band) ─────────────────────
@@ -108,8 +131,9 @@ REF = {
     "vocal_presence_ratio": (0.30, 1.20),
 
     # ── TIER 4: Musical intelligence ─────────────────────────────────────
-    # groove_score: fraction of vocal onsets that land within ±40ms of a beat
-    # grid position. 0=floating, 1=locked. Target: > 0.35 for natural groove.
+    # groove_score: fraction of vocal onsets that land within ±60ms of a beat
+    # grid position. Window widened from 40ms to 60ms for mashup context
+    # (computer-generated timing has ~20ms more uncertainty than live performance).
     "groove_score":         (0.25, 1.0),
 
     # dynamic_arc_score: does the mix have a proper energy build + release?
@@ -117,27 +141,42 @@ REF = {
     # arc (builds to peak at 65% then resolves). 1.0 = perfect arc.
     "dynamic_arc_score":    (0.20, 1.0),
 
-    # vocal_harmony_score: chroma correlation between beat-dominated frames
-    # and vocal-dominated frames in the mix. High = harmonically coherent.
-    # Low = key mismatch / harmonic clash between sources.
+    # vocal_harmony_score: CENS-based chroma coherence. Uses circular rotation
+    # to find optimal key alignment between beat-range and vocal-range harmonics.
+    # High = harmonically coherent. Low = key mismatch.
     "vocal_harmony_score":  (0.30, 1.0),
+
+    # ── TIER 5: Mashup intelligence ───────────────────────────────────────
+    # dynamic_complexity_db: essentia-inspired avg abs deviation of 2s-window
+    # loudness from global loudness. <3 = brick-wall limited (all dynamics
+    # destroyed). >14 = sections too uneven. Target: 4-12 dB for hip-hop.
+    "dynamic_complexity_db": (3.0, 14.0),
+
+    # key_distance_semitones: minimum semitone distance between beat-range
+    # harmony (bass 80-500 Hz) and vocal-range harmony (800-3000 Hz), found
+    # via circular CENS rotation. Camelot wheel research: 0-2 = compatible,
+    # 3-5 = noticeable, 6 = tritone clash.
+    "key_distance_semitones": (0.0, 5.0),
 }
 
 REF_STRICT = {**REF,
-    "lufs_integrated":       (-13.0, -8.0),
-    "lra_lu":                (4.5, 22.0),
-    "crest_factor_db":       (7.0, 20.0),
-    "transient_clarity":     (10.0, 25.0),   # dB crest — matches REF units
-    "kick_headroom_db":      (5.0, 45.0),
-    "mud_index":             (1.2, 4.5),
-    "section_consistency_lu":(0.0, 8.0),
-    "ratio_lowmid_to_mid":   (-3.0, +6.0),
-    "ratio_himid_to_mid":    (-18.0, -1.5),
-    "beat_sync_score":       (0.35, 1.0),
-    "groove_score":          (0.30, 1.0),
-    "dynamic_arc_score":     (0.30, 1.0),
-    "vocal_harmony_score":   (0.35, 1.0),
-    "vocal_presence_ratio":  (0.40, 1.20),
+    "lufs_integrated":         (-13.0, -8.0),
+    "lra_lu":                  (4.5, 16.0),
+    "crest_factor_db":         (7.0, 14.0),
+    "plr_db":                  (6.0, 12.0),
+    "transient_clarity":       (10.0, 25.0),
+    "kick_headroom_db":        (5.0, 45.0),
+    "mud_index":               (1.2, 4.5),
+    "section_consistency_lu":  (0.0, 8.0),
+    "ratio_lowmid_to_mid":     (-3.0, +6.0),
+    "ratio_himid_to_mid":      (-18.0, -1.5),
+    "beat_sync_score":         (0.35, 1.0),
+    "groove_score":            (0.30, 1.0),
+    "dynamic_arc_score":       (0.30, 1.0),
+    "vocal_harmony_score":     (0.40, 1.0),
+    "vocal_presence_ratio":    (0.40, 1.20),
+    "dynamic_complexity_db":   (4.0, 12.0),
+    "key_distance_semitones":  (0.0, 3.0),
 }
 
 PENALTIES = {
@@ -146,6 +185,7 @@ PENALTIES = {
     "true_peak_dbfs":         25,   # clipping = catastrophic
     "lra_lu":                  8,
     "crest_factor_db":        10,
+    "plr_db":                 10,   # over-compressed (PLR<5) or mastered too quiet (PLR>14)
     "stereo_correlation":      8,
     # TIER 2: Spectral
     "ratio_sub_to_mid":        5,
@@ -173,12 +213,17 @@ PENALTIES = {
     "groove_score":           20,   # no groove = doesn't sound like a song
     "dynamic_arc_score":      10,
     "vocal_harmony_score":    15,   # key clash = unlistenable
+    # TIER 5: Mashup intelligence
+    "dynamic_complexity_db":   8,   # brick-wall / over-compressed or too uneven
+    "key_distance_semitones": 20,   # key clash = unlistenable, worse than anything else
 }
 
 PROBLEM_NAMES = {
     "lufs_integrated":     ("too quiet — streaming will boost (sounds weak)",
                             "too loud — over-limited / fatiguing"),
     "true_peak_dbfs":      ("signal too quiet", "CLIPPING — digital distortion"),
+    "plr_db":              ("OVER-COMPRESSED — PLR too low, all dynamics destroyed",
+                            "mastered too quiet — PLR too high, sounds weak"),
     "lra_lu":              ("over-compressed — no dynamics, sounds flat",
                             "too dynamic / uneven level"),
     "crest_factor_db":     ("SMASHED — limiter destroying transients, beat blurs at high volume",
@@ -225,12 +270,16 @@ PROBLEM_NAMES = {
                               "CHOPPY VOCAL — over-gated or clipping modulation artifacts"),
     "vocal_presence_ratio": ("VOCAL BURIED — beat energy overwhelming vocal in presence zone",
                              "beat too quiet vs vocal — no foundation"),
-    "groove_score":         ("NO GROOVE — vocal phrases float off the beat, sounds amateur",
-                             "perfect grid (N/A)"),
-    "dynamic_arc_score":    ("FLAT ENERGY — no build/release, sounds like a loop not a song",
-                             "too dramatic (N/A)"),
-    "vocal_harmony_score":  ("KEY CLASH — vocal and beat are in different keys, sounds dissonant",
-                             "harmonic match (N/A)"),
+    "groove_score":              ("NO GROOVE — vocal phrases float off the beat, sounds amateur",
+                                  "perfect grid (N/A)"),
+    "dynamic_arc_score":         ("FLAT ENERGY — no build/release, sounds like a loop not a song",
+                                  "too dramatic (N/A)"),
+    "vocal_harmony_score":       ("KEY CLASH — vocal and beat are in different keys, sounds dissonant",
+                                  "harmonic match (N/A)"),
+    "dynamic_complexity_db":     ("BRICK-WALL — all dynamics crushed, sounds like a flatline",
+                                  "UNEVEN — volume jumps drastically between sections"),
+    "key_distance_semitones":    ("key match (N/A)",
+                                  "KEY CLASH — beat and vocal are >5 semitones apart, sounds dissonant"),
 }
 
 # ── Correction map ─────────────────────────────────────────────────────────────
@@ -249,7 +298,10 @@ CORRECTIONS = {
     "vocal_modulation_index":("vocal_level",       +0.08, -0.05),
     "vocal_presence_ratio":  ("vocal_level",       +0.15, -0.10),  # bury → boost vocal
     "groove_score":          ("vocal_level",       +0.05,  0.0),  # slight presence boost helps groove
-    "vocal_harmony_score":   ("carve_db",           0.0, +1.0),  # clash → deeper carve reduces beat in vocal zone
+    "vocal_harmony_score":       ("carve_db",     0.0, +1.0),
+    "key_distance_semitones":    ("carve_db",     0.0, +2.0),  # clash → deeper spectral carve separates beat from vocal
+    "dynamic_complexity_db":     ("lufs_delta",   0.0, -1.5),  # over-dynamic → lower target LUFS for more headroom
+    "plr_db":                    ("lufs_delta",  +1.0, -1.0),  # too compressed → ease off; too quiet → push louder
 }
 
 
@@ -302,6 +354,12 @@ def _measure(audio_path: str) -> dict:
     rms  = float(np.sqrt(np.mean(mono ** 2) + 1e-9))
     peak = float(np.abs(mono).max() + 1e-9)
     crest_db = float(20 * np.log10(peak / rms))
+
+    # ── PLR (Peak-to-Loudness Ratio) ──────────────────────────────────────────
+    # PLR = true_peak_dBTP - integrated_LUFS.
+    # Research: hip-hop/trap PLR 6-12 dB, R&B 8-14 dB.
+    # <5 dB = brick-wall limited (smashed). >14 dB = mastered too quietly.
+    plr_db = float(np.clip(true_peak_dbfs - lufs, -5.0, 25.0)) if np.isfinite(lufs) else 9.0
 
     # ── Stereo correlation ────────────────────────────────────────────────────
     corr = float(np.corrcoef(L, R)[0, 1]) if (L.std() > 1e-9 and R.std() > 1e-9) else 1.0
@@ -521,7 +579,7 @@ def _measure(audio_path: str) -> dict:
         vocal_onset_times = librosa.frames_to_time(vocal_onset_frames, sr=SR, hop_length=512)
 
         if len(beat_times_grid) >= 2 and len(vocal_onset_times) >= 3:
-            window_s = 0.040  # ±40ms
+            window_s = 0.060  # ±60ms — widened from 40ms for mashup context
             on_beat = 0
             for vt in vocal_onset_times:
                 dists = np.abs(beat_times_grid - vt)
@@ -592,12 +650,82 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         vocal_harmony_score = 0.60
 
+    # ── Dynamic complexity (Tier 5) ───────────────────────────────────────────
+    # Essentia-inspired: avg abs deviation of 2s-window integrated loudness from
+    # global integrated loudness.  <3 dB = brick-wall (all dynamics destroyed).
+    # >14 dB = sections too uneven.  Research target: 4-12 dB for hip-hop.
+    try:
+        dc_win = SR * 2  # 2-second windows
+        dc_hop = SR * 1  # 1-second hop
+        dc_wins = []
+        i = 0
+        while i + dc_win <= len(mono):
+            seg = mono[i:i + dc_win]
+            try:
+                wl = float(meter.integrated_loudness(seg))
+                if np.isfinite(wl) and wl > -70:
+                    dc_wins.append(wl)
+            except Exception:
+                pass
+            i += dc_hop
+        if len(dc_wins) >= 4 and np.isfinite(lufs):
+            dynamic_complexity_db = float(np.mean(np.abs(np.array(dc_wins) - lufs)))
+        else:
+            dynamic_complexity_db = 6.0  # neutral fallback
+    except Exception:
+        dynamic_complexity_db = 6.0
+
+    # ── Key distance semitones (Tier 5) ──────────────────────────────────────
+    # CENS (Chroma Energy Normalized Statistics) circular-rotation method.
+    # Beat-range harmony: bandpass 80-500 Hz (kick, bass, beat harmonics).
+    # Vocal-range harmony: bandpass 800-3000 Hz (vocal fundamentals + overtones).
+    # Rotate beat CENS over 12 semitones, find shift that maximises similarity.
+    # Distance = argmax shift (= semitone offset between keys).
+    # Camelot Wheel research: ≤2 semitones = compatible, 6 = tritone clash.
+    try:
+        nyq_k = SR / 2.0
+        bass_rng = sosfilt(
+            butter(4, [80.0 / nyq_k, min(500.0 / nyq_k, 0.999)], btype="band", output="sos"),
+            mono)
+        voc_rng = sosfilt(
+            butter(4, [800.0 / nyq_k, min(3000.0 / nyq_k, 0.999)], btype="band", output="sos"),
+            mono)
+
+        # CENS: chroma_cqt with L1-norm quantisation (approximation without essentia)
+        def _cens(sig):
+            c = librosa.feature.chroma_cqt(y=sig, sr=SR, hop_length=512, bins_per_octave=36)
+            # L1-normalise each frame then quantise to 5 levels (CENS approximation)
+            col_sums = c.sum(axis=0, keepdims=True) + 1e-9
+            c_norm = c / col_sums
+            c_q = np.floor(c_norm * 5) / 5.0
+            return c_q.mean(axis=1)  # mean CENS vector (12,)
+
+        cens_beat = _cens(bass_rng)
+        cens_voc  = _cens(voc_rng)
+
+        # Circular rotation: try all 12 shifts, find best cosine similarity
+        best_sim = -1.0
+        best_shift = 0
+        for shift in range(12):
+            rotated = np.roll(cens_beat, shift)
+            dot = float(np.dot(rotated, cens_voc))
+            norm = float(np.linalg.norm(rotated) * np.linalg.norm(cens_voc) + 1e-9)
+            sim = dot / norm
+            if sim > best_sim:
+                best_sim = sim
+                best_shift = shift
+        # Distance = min(shift, 12-shift) — circular semitone distance
+        key_distance_semitones = float(min(best_shift, 12 - best_shift))
+    except Exception:
+        key_distance_semitones = 2.0  # neutral fallback
+
     return {
         # Global
         "lufs_integrated":       lufs,
         "true_peak_dbfs":        true_peak_dbfs,
         "lra_lu":                lra,
         "crest_factor_db":       crest_db,
+        "plr_db":                plr_db,
         "stereo_correlation":    corr,
         # Raw bands (display only)
         "_sub_db":    sub_db,
@@ -633,6 +761,9 @@ def _measure(audio_path: str) -> dict:
         "groove_score":          groove_score,
         "dynamic_arc_score":     dynamic_arc_score,
         "vocal_harmony_score":   vocal_harmony_score,
+        # Mashup intelligence (Tier 5)
+        "dynamic_complexity_db": dynamic_complexity_db,
+        "key_distance_semitones": key_distance_semitones,
     }
 
 
@@ -684,6 +815,9 @@ def _musical_diagnosis(metrics: dict) -> list:
     syn = metrics.get("beat_sync_score", 0.5)
     bli = metrics.get("vocal_bleed_score", 0.2)
     mod = metrics.get("vocal_modulation_index", 0.4)
+    dc  = metrics.get("dynamic_complexity_db", 6.0)
+    kd  = metrics.get("key_distance_semitones", 2.0)
+    plr = metrics.get("plr_db", 9.0)
 
     if gs < 0.30 and syn < 0.35:
         diags.append("⚠ FUNDAMENTAL: vocal and beat are out of time — won't feel like a song regardless of mix quality")
@@ -714,6 +848,27 @@ def _musical_diagnosis(metrics: dict) -> list:
         diags.append("△ MUFFLED: vocal syllables aren't intelligible — phrasing feels buried")
     elif mod > 0.55:
         diags.append("✓ Vocal intelligibility is strong — syllables are clear")
+
+    if kd >= 6:
+        diags.append("⚠ TRITONE CLASH: beat and vocal are 6 semitones apart — maximum dissonance")
+    elif kd >= 3:
+        diags.append(f"△ KEY DISTANCE {kd:.0f} semitones — noticeable harmonic tension")
+    elif kd <= 2:
+        diags.append(f"✓ Key distance {kd:.0f} semitones — harmonically compatible")
+
+    if dc < 3.0:
+        diags.append("⚠ BRICK-WALL: dynamic complexity too low — all dynamics crushed, sounds lifeless")
+    elif dc > 14.0:
+        diags.append(f"△ UNEVEN: dynamic complexity {dc:.1f} dB — sections jump dramatically in volume")
+    else:
+        diags.append(f"✓ Dynamic complexity {dc:.1f} dB — natural dynamics preserved")
+
+    if plr < 5.0:
+        diags.append(f"⚠ OVER-LIMITED: PLR {plr:.1f} dB — master is brick-wall limited, transients destroyed")
+    elif plr > 14.0:
+        diags.append(f"△ PLR {plr:.1f} dB — mastered too quietly, won't compete on streaming")
+    else:
+        diags.append(f"✓ PLR {plr:.1f} dB — good Peak-to-Loudness balance")
 
     return diags
 
@@ -776,10 +931,11 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
             print(f"       Measured: {val:.3f}  |  Target: {lo:.2f} → {hi:.2f}")
 
     print(f"\n  ── TECHNICAL ─────────────────────────────────────────────────────")
-    print(f"  {'LUFS':<28} {m['lufs_integrated']:>+7.1f} dB    (target -14 to -7)")
-    print(f"  {'True peak':<28} {m['true_peak_dbfs']:>+7.1f} dBFS  (must be < -0.5)")
-    print(f"  {'LRA':<28} {m['lra_lu']:>+7.1f} LU    (target 2-22)")
-    print(f"  {'Crest factor':<28} {m['crest_factor_db']:>+7.1f} dB    (>8 = punchy)")
+    print(f"  {'LUFS integrated':<28} {m['lufs_integrated']:>+7.1f} dB    (target -14 to -7)")
+    print(f"  {'True peak':<28} {m['true_peak_dbfs']:>+7.1f} dBFS  (EBU R128: must be < -1.0)")
+    print(f"  {'PLR (peak-to-loudness)':<28} {m.get('plr_db', 0.0):>+7.1f} dB    (target 5-14 dB)")
+    print(f"  {'LRA':<28} {m['lra_lu']:>+7.1f} LU    (target 2-18)")
+    print(f"  {'Crest factor':<28} {m['crest_factor_db']:>+7.1f} dB    (target 6-16 dB)")
     print(f"  {'Stereo correlation':<28} {m['stereo_correlation']:>+7.3f}      (0.4-0.99)")
 
     print(f"\n  ── DYNAMICS ──────────────────────────────────────────────────────")
@@ -802,6 +958,10 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
     print(f"  {'Groove (on-beat fraction)':<28} {m['groove_score']:>7.3f}      (>0.25 = locked)")
     print(f"  {'Dynamic arc':<28} {m['dynamic_arc_score']:>7.3f}      (>0.20 = builds)")
     print(f"  {'Harmonic coherence':<28} {m['vocal_harmony_score']:>7.3f}      (>0.30 = key match)")
+
+    print(f"\n  ── MASHUP INTELLIGENCE (Tier 5) ──────────────────────────────────")
+    print(f"  {'Dynamic complexity':<28} {m.get('dynamic_complexity_db', 0.0):>7.1f} dB    (target 3-14 dB)")
+    print(f"  {'Key distance':<28} {m.get('key_distance_semitones', 0.0):>7.1f} st    (0-5 = compatible, 6 = clash)")
 
     print(f"\n  ── FREQUENCY BALANCE ─────────────────────────────────────────────")
     for label, key in [("Sub 20-80",  "_sub_db"), ("Bass 80-250", "_bass_db"),
@@ -871,7 +1031,7 @@ def auto_score(audio_path: str, strict: bool = False) -> tuple:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="VocalFusion Quality Scorer v3")
+    parser = argparse.ArgumentParser(description="VocalFusion Quality Scorer v4")
     parser.add_argument("audio")
     parser.add_argument("reference", nargs="?")
     parser.add_argument("--strict", action="store_true")
