@@ -18,6 +18,23 @@ Usage (from fuser.py auto-correction loop):
 import json
 import os
 
+# ---------------------------------------------------------------------------
+# Reference profile — loaded once, passed to director for target-aware corrections
+# ---------------------------------------------------------------------------
+_REF_PROFILE: dict | None = None
+
+def _load_reference_profile() -> None:
+    global _REF_PROFILE
+    _profile_path = os.path.join(os.path.dirname(__file__), "reference_profile.json")
+    if os.path.exists(_profile_path):
+        try:
+            with open(_profile_path) as f:
+                _REF_PROFILE = json.load(f)
+        except Exception:
+            pass
+
+_load_reference_profile()
+
 # ── Tunable parameter bounds ───────────────────────────────────────────────────
 PARAM_BOUNDS = {
     "carve_db":              (3.0,  12.0),
@@ -170,6 +187,69 @@ Respond ONLY with a JSON object in this exact format:
 """
 
 
+def _build_reference_context() -> str:
+    """Build a reference target section for the director system prompt."""
+    if _REF_PROFILE is None:
+        return ""
+
+    b = _REF_PROFILE.get("bands", {})
+    l = _REF_PROFILE.get("loudness", {})
+    d = _REF_PROFILE.get("dynamics", {})
+    s = _REF_PROFILE.get("stereo", {})
+    n = _REF_PROFILE.get("n_tracks", "?")
+
+    def m(section, key):
+        try:
+            return f"{section[key]['median']:.1f}"
+        except Exception:
+            return "N/A"
+
+    return f"""
+
+## REFERENCE TARGET (from {n} chart/commercial tracks)
+This is what the output should sound like. Use these as your TARGET when making corrections.
+Deviations from these targets are the root cause of most quality issues.
+
+Spectral balance (dBFS RMS per band):
+  sub(20-60Hz)={m(b,'sub')}  bass(60-250Hz)={m(b,'bass')}  lo_mid(250-500Hz)={m(b,'lo_mid')}
+  mid(500-2kHz)={m(b,'mid')}  hi_mid(2-6kHz)={m(b,'hi_mid')}  presence(6-10kHz)={m(b,'presence')}  air(10kHz+)={m(b,'air')}
+
+Loudness targets:
+  LUFS={m(l,'lufs_i')}  LRA={m(l,'lra')}  PLR={m(l,'plr')}dB  crest={m(l,'crest_db')}dB  true_peak={m(l,'true_peak')}dBFS
+
+Dynamics targets:
+  spectral_slope={m(d,'spectral_slope')}  spectral_crest={m(d,'spectral_crest')}
+  transient_clarity={m(d,'transient_clarity')}  dynamic_arc={m(d,'dynamic_arc')}
+
+Stereo width targets:
+  low_freq={m(s,'width_low')} (0=mono,1=wide)  mid_freq={m(s,'width_mid')}  high_freq={m(s,'width_high')}
+
+When a metric deviates from the reference target, PRIORITIZE correcting it toward the target value.
+Reference targets override generic "acceptable range" thinking — match the chart sound."""
+
+
+def _build_spectral_delta_message(metrics: dict) -> str:
+    """Show the AI director how far off we are from the reference target."""
+    if _REF_PROFILE is None:
+        return ""
+
+    # spectral_match_score comes from listen.py
+    match_score = metrics.get("spectral_match_score", None)
+    if match_score is None:
+        return ""
+
+    lines = [f"\nSpectral match to reference: {match_score:.0f}/100"]
+    if match_score < 60:
+        lines.append("  → OUTPUT IS SIGNIFICANTLY OFF from reference spectral balance")
+        lines.append("  → Prioritize carve_db and presence_db adjustments to close the gap")
+    elif match_score < 80:
+        lines.append("  → Moderate spectral deviation from reference — fine-tune EQ parameters")
+    else:
+        lines.append("  → Good spectral match to reference")
+
+    return "\n".join(lines)
+
+
 def get_corrections(
     metrics: dict,
     issues: list,
@@ -224,6 +304,7 @@ def get_corrections(
         history_block=history_block,
         attempt_num=attempt_num + 1,
     )
+    user_msg += _build_spectral_delta_message(metrics)
 
     # ── API call ───────────────────────────────────────────────────────────────
     try:
@@ -231,7 +312,7 @@ def get_corrections(
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=512,
-            system=_SYSTEM,
+            system=_SYSTEM + _build_reference_context(),
             messages=[{"role": "user", "content": user_msg}],
         )
         raw = response.content[0].text.strip()
@@ -421,6 +502,16 @@ def _causal_corrections(metrics: dict, issues: list, current_params: dict,
     # ── LRA too high (too dynamic) ──────────────────────────────────────────
     if "lra_lu" in issue_keys and lra > 14.0:
         _set("lufs_target", min(-9.0, p.get("lufs_target", -12.0) + 1.0))
+
+    # ── Spectral mismatch vs reference target ───────────────────────────────
+    spectral_match = m.get("spectral_match_score", None)
+    if spectral_match is not None and spectral_match < 60:
+        if spectral_match < 40:
+            _set("carve_db",    max(3.0, p.get("carve_db", 10.0) - 1.0))
+            _set("presence_db", min(4.0, p.get("presence_db", 2.0) + 1.0))
+        else:  # 40 <= spectral_match < 60
+            _set("carve_db",    max(3.0, p.get("carve_db", 10.0) - 0.5))
+            _set("presence_db", min(4.0, p.get("presence_db", 2.0) + 0.5))
 
     if adj:
         print(f"  [Built-in director] Causal corrections: {adj}", flush=True)

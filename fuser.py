@@ -71,6 +71,25 @@ _MDX23C_VOCAL   = "MDX23C-8KFFT-InstVoc_HQ.ckpt"  # MDX23C vocal (SDR ~12+, bett
 _DENOISE_MODEL  = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"          # post-sep denoiser (SDR 27.99)
 _DEVERB_MODEL   = "deverb_bs_roformer_8_384dim_10depth.ckpt"                   # BS-Roformer de-reverb
 
+# ---------------------------------------------------------------------------
+# Reference profile for reference-matched mastering
+# ---------------------------------------------------------------------------
+_MASTER_REF_PROFILE: dict | None = None
+
+def _load_master_reference_profile() -> None:
+    global _MASTER_REF_PROFILE
+    _path = os.path.join(os.path.dirname(__file__), "reference_profile.json")
+    if os.path.exists(_path):
+        try:
+            import json as _json
+            with open(_path) as _f:
+                _MASTER_REF_PROFILE = _json.load(_f)
+            print(f"[fuser] Reference profile loaded for mastering ({_MASTER_REF_PROFILE.get('n_tracks','?')} tracks)", flush=True)
+        except Exception as _e:
+            print(f"[fuser] Warning: could not load reference profile: {_e}", flush=True)
+
+_load_master_reference_profile()
+
 
 def _check(y: np.ndarray, label: str) -> np.ndarray:
     """Inline signal health check — prints peak/rms and warns on NaN/Inf."""
@@ -4105,6 +4124,59 @@ def _multiband_master_compress(mix: np.ndarray) -> np.ndarray:
     return out.astype(np.float32)
 
 
+def _reference_eq(y: np.ndarray, sr: int, profile: dict, max_db: float = 3.0) -> np.ndarray:
+    """
+    Reference-matched corrective EQ pass.
+
+    Measures per-band energy of y, compares to the reference profile medians,
+    and applies a compensating gain (up to max_db) per band to close the gap.
+    Uses bandpass decomposition — splits into 7 bands, adjusts each band's gain,
+    then sums back.  Handles both mono (1-D) and stereo (samples × 2) arrays.
+    """
+    from scipy.signal import butter as _butter, sosfilt as _sosfilt
+
+    band_defs = [
+        ("sub",      20,    60),
+        ("bass",     60,    250),
+        ("lo_mid",   250,   500),
+        ("mid",      500,   2000),
+        ("hi_mid",   2000,  6000),
+        ("presence", 6000,  10000),
+        ("air",      10000, min(20000, sr // 2 - 200)),
+    ]
+
+    stereo = y.ndim == 2          # shape: (samples, 2)
+    y_f32  = y.astype(np.float32)
+    y_mono = np.mean(y_f32, axis=1) if stereo else y_f32
+    corrected = np.zeros_like(y_f32)
+
+    for band_name, lo, hi in band_defs:
+        if lo >= hi or hi >= sr // 2:
+            continue
+        try:
+            sos = _butter(4, [lo, hi], btype="bandpass", fs=sr, output="sos")
+            if stereo:
+                b_l = _sosfilt(sos, y_f32[:, 0])
+                b_r = _sosfilt(sos, y_f32[:, 1])
+                b_mono = (b_l + b_r) / 2.0
+            else:
+                b_mono = _sosfilt(sos, y_f32)
+
+            rms_db = 20.0 * np.log10(float(np.sqrt(np.mean(b_mono ** 2) + 1e-12)) + 1e-12)
+            target = float(profile["bands"][band_name]["median"])
+            gain   = 10.0 ** (float(np.clip(target - rms_db, -max_db, max_db)) / 20.0)
+
+            if stereo:
+                corrected[:, 0] += b_l * gain
+                corrected[:, 1] += b_r * gain
+            else:
+                corrected += b_mono * gain
+        except Exception:
+            pass  # keep band uncorrected rather than abort
+
+    return corrected.astype(np.float32)
+
+
 def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     """
     Mastering chain (v6):
@@ -4177,6 +4249,12 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # 4-band mastering compression: gentle tonal balance (1-3 dB GR per band)
     # Placed after mastering EQ so it controls, not changes, the tonal balance
     mix = _multiband_master_compress(mix)
+
+    # ── Reference-matched corrective EQ ────────────────────────────────────
+    if _MASTER_REF_PROFILE is not None:
+        mix = _reference_eq(mix, SR, _MASTER_REF_PROFILE, max_db=3.0)
+        print("[master:radio] Reference corrective EQ applied", flush=True)
+    # ───────────────────────────────────────────────────────────────────────
 
     # Maxx Bass, tanh saturation, and harmonic exciter all REMOVED from mastering.
     # These three nonlinear stages were stacking intermodulation distortion and
@@ -4313,6 +4391,12 @@ def _master_club(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
 
     mix = _multiband_master_compress(mix)
 
+    # ── Reference-matched corrective EQ ────────────────────────────────────
+    if _MASTER_REF_PROFILE is not None:
+        mix = _reference_eq(mix, SR, _MASTER_REF_PROFILE, max_db=3.5)
+        print("[master:club] Reference corrective EQ applied", flush=True)
+    # ───────────────────────────────────────────────────────────────────────
+
     # Soft clip
     mix_c = np.clip(mix, -1.0, 1.0)
     mix = (1.5 * mix_c - 0.5 * mix_c ** 3).astype(np.float32)
@@ -4379,6 +4463,12 @@ def _master_intimate(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-0.5),  # less HF cut = more air
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
+
+    # ── Reference-matched corrective EQ ────────────────────────────────────
+    if _MASTER_REF_PROFILE is not None:
+        mix = _reference_eq(mix, SR, _MASTER_REF_PROFILE, max_db=2.0)
+        print("[master:intimate] Reference corrective EQ applied", flush=True)
+    # ───────────────────────────────────────────────────────────────────────
 
     # No multiband compress — preserve dynamics for intimacy
     # Soft clip only

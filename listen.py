@@ -50,6 +50,8 @@ Exit code 0 = PASS, 1 = FAIL.
 
 import sys
 import argparse
+import json
+import os
 import numpy as np
 import librosa
 import pyloudnorm as pyln
@@ -58,6 +60,24 @@ from pathlib import Path
 from scipy.signal import butter, sosfilt
 
 SR = 44100
+
+# ---------------------------------------------------------------------------
+# Reference profile (optional) — built by reference.py from chart songs
+# ---------------------------------------------------------------------------
+_REF_PROFILE: dict | None = None
+
+def _load_reference_profile() -> None:
+    global _REF_PROFILE
+    _profile_path = os.path.join(os.path.dirname(__file__), "reference_profile.json")
+    if os.path.exists(_profile_path):
+        try:
+            with open(_profile_path) as f:
+                _REF_PROFILE = json.load(f)
+            print(f"[listen] Reference profile loaded ({_REF_PROFILE.get('n_tracks', '?')} tracks)", flush=True)
+        except Exception as e:
+            print(f"[listen] Warning: could not load reference profile: {e}", flush=True)
+
+_load_reference_profile()
 
 # ── Professional Reference Ranges ─────────────────────────────────────────────
 # All ratio values are (band_X - mid_band) in dB — scale-invariant.
@@ -121,6 +141,15 @@ REF = {
     "vocal_modulation_index": (0.20, 0.65),
     # vocal_presence_ratio: vocal zone (1-4kHz) / beat zone (200-1kHz) in voiced frames.
     "vocal_presence_ratio": (0.30, 1.20),
+    # vocal_hnr_db: Harmonic-to-Noise Ratio on vocal band (300-3000 Hz) voiced frames.
+    # Autocorrelation method (Praat). >15 dB = normophonic clear vocal.
+    # <10 dB = breathy/noisy. Research: Ferrand 2002; Praat documentation.
+    "vocal_hnr_db":         (10.0, 40.0),
+    # vocal_sfm: Spectral Flatness Measure of vocal band in voiced frames.
+    # Geometric/arithmetic mean ratio of power spectrum. 0 = pure tone, 1 = white noise.
+    # <0.1 = very tonal (over-tuned/robotic). 0.05-0.30 = natural harmonic vocal.
+    # >0.35 = noisy/breathy vocal or heavy bleed. Research: Izmirli ISMIR 2000.
+    "vocal_sfm":            (0.05, 0.35),
 
     # ── TIER 4: Musical intelligence ─────────────────────────────────────
     # groove_score: fraction of vocal onsets within ±60ms of a beat grid position.
@@ -160,6 +189,8 @@ REF_STRICT = {**REF,
     "dynamic_arc_score":       (0.30, 1.0),
     "vocal_harmony_score":     (0.40, 1.0),
     "vocal_presence_ratio":    (0.40, 1.20),
+    "vocal_hnr_db":            (12.0, 40.0),
+    "vocal_sfm":               (0.05, 0.28),
     "dynamic_complexity_db":   (4.0, 12.0),
     "key_distance_semitones":  (0.0, 3.0),
 }
@@ -195,6 +226,8 @@ PENALTIES = {
     "vocal_spectral_crest":   15,
     "vocal_modulation_index": 12,
     "vocal_presence_ratio":   15,   # buried vocal = unusable
+    "vocal_hnr_db":           12,   # breathy/noisy vocal
+    "vocal_sfm":              10,   # too noisy or over-tuned
     # TIER 4: Musical
     "groove_score":           20,   # no groove = doesn't sound like a song
     "dynamic_arc_score":      10,
@@ -260,6 +293,10 @@ PROBLEM_NAMES = {
                               "CHOPPY VOCAL — over-gated or clipping modulation artifacts"),
     "vocal_presence_ratio": ("VOCAL BURIED — beat energy overwhelming vocal in presence zone",
                              "beat too quiet vs vocal — no foundation"),
+    "vocal_hnr_db":         ("NOISY/BREATHY VOCAL — high noise floor in vocal band, HNR too low",
+                             "pure tone (N/A — cannot exceed physical limit)"),
+    "vocal_sfm":            ("OVER-TUNED/ROBOTIC — vocal spectrum too tonal, SFM near 0",
+                             "NOISY VOCAL — spectral flatness too high, sounds breathy or bleedy"),
     "groove_score":              ("NO GROOVE — vocal phrases float off the beat, sounds amateur",
                                   "perfect grid (N/A)"),
     "dynamic_arc_score":         ("FLAT ENERGY — no build/release, sounds like a loop not a song",
@@ -329,6 +366,65 @@ def _cens_vec(sig: np.ndarray) -> np.ndarray:
     c_norm = c / col_sums
     c_q = np.floor(c_norm * 5) / 5.0
     return c_q.mean(axis=1)  # (12,)
+
+
+def _compute_spectral_match(y_mix: np.ndarray, sr: int) -> float:
+    """
+    Compute spectral match score (0-100) against reference profile.
+    If no reference profile loaded, returns 50.0 (neutral).
+
+    Measures per-band energy and compares to reference medians.
+    Score = 100 - mean_absolute_deviation_across_bands (clamped 0-100).
+    MAD measured in dB, normalized so ±12dB deviation = 0 score.
+    """
+    if _REF_PROFILE is None:
+        return 50.0
+
+    from scipy.signal import butter, sosfilt
+    y_mono = y_mix if y_mix.ndim == 1 else np.mean(y_mix, axis=0)
+
+    band_defs = {
+        "sub":      (20,   60),
+        "bass":     (60,   250),
+        "lo_mid":   (250,  500),
+        "mid":      (500,  2000),
+        "hi_mid":   (2000, 6000),
+        "presence": (6000, 10000),
+        "air":      (10000, min(20000, sr//2 - 1)),
+    }
+
+    deviations = []
+    for band_name, (lo, hi) in band_defs.items():
+        try:
+            sos = butter(4, [lo, hi], btype='bandpass', fs=sr, output='sos')
+            filtered = sosfilt(sos, y_mono)
+            rms = float(np.sqrt(np.mean(filtered**2) + 1e-10))
+            rms_db = 20 * np.log10(rms + 1e-10)
+            target = _REF_PROFILE["bands"][band_name]["median"]
+            deviations.append(abs(rms_db - target))
+        except Exception:
+            continue
+
+    if not deviations:
+        return 50.0
+
+    mean_dev = float(np.mean(deviations))
+    score = max(0.0, 100.0 - (mean_dev / 12.0) * 100.0)
+    return round(score, 1)
+
+
+# After loading reference profile, adjust key targets if profile available
+def _get_lufs_target() -> float:
+    if _REF_PROFILE and "loudness" in _REF_PROFILE:
+        return float(_REF_PROFILE["loudness"]["lufs_i"]["median"])
+    return -12.0  # EBU R128 default
+
+def _get_lra_target() -> tuple[float, float]:
+    if _REF_PROFILE and "loudness" in _REF_PROFILE:
+        p25 = float(_REF_PROFILE["loudness"]["lra"]["p25"])
+        p75 = float(_REF_PROFILE["loudness"]["lra"]["p75"])
+        return (p25, p75)
+    return (4.0, 12.0)  # default acceptable range
 
 
 def _load(audio_path: str) -> np.ndarray:
@@ -580,6 +676,58 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         vocal_presence_ratio = 0.60
 
+    # ── VOCAL HNR (Harmonic-to-Noise Ratio, autocorrelation method) ──────────
+    # Ferrand 2002 / Praat: HNR = 10*log10(r_peak / (1 - r_peak)) on voiced frames.
+    # Target: >15 dB = normophonic. <10 dB = noisy/breathy.
+    try:
+        voc_band_hnr = _bp(mono, 300.0, 3000.0)
+        frame_len_hnr = int(0.040 * SR)   # 40ms frames
+        hop_hnr       = frame_len_hnr // 2
+        hnr_vals = []
+        n_hnr_frames = (len(voc_band_hnr) - frame_len_hnr) // hop_hnr
+        n_vm = min(n_hnr_frames, len(voiced_mask))
+        min_lag = int(SR / 600.0)  # 600 Hz max f0
+        max_lag = int(SR / 75.0)   # 75 Hz min f0
+        for fi in range(n_vm):
+            if not voiced_mask[fi]:
+                continue
+            frm = voc_band_hnr[fi * hop_hnr: fi * hop_hnr + frame_len_hnr]
+            if len(frm) < frame_len_hnr:
+                continue
+            ac = np.correlate(frm, frm, mode='full')
+            ac = ac[len(ac) // 2:]
+            ac = ac / (ac[0] + 1e-12)
+            if max_lag >= len(ac):
+                continue
+            peak_idx = np.argmax(ac[min_lag:max_lag]) + min_lag
+            r = float(ac[peak_idx])
+            if 0.0 < r < 1.0:
+                hnr_vals.append(10.0 * np.log10(r / (1.0 - r)))
+        vocal_hnr_db = float(np.median(hnr_vals)) if len(hnr_vals) >= 5 else 15.0
+        vocal_hnr_db = float(np.clip(vocal_hnr_db, 0.0, 45.0))
+    except Exception:
+        vocal_hnr_db = 15.0
+
+    # ── VOCAL SPECTRAL FLATNESS MEASURE (SFM) ─────────────────────────────────
+    # Izmirli ISMIR 2000; Sharma & Wang TASLP 2020.
+    # SFM = geom_mean(power) / arith_mean(power) on 300-3000 Hz voiced frames.
+    # 0 = pure tone, 1 = white noise. Good vocal: 0.05-0.30.
+    try:
+        mid_mask_sfm = (freqs >= 300) & (freqs < 3000)
+        n_col = min(S_mag.shape[1], len(voiced_mask))
+        S_voc_sfm = S_mag[np.ix_(mid_mask_sfm, voiced_mask[:n_col])]
+        if S_voc_sfm.shape[1] > 5:
+            power = S_voc_sfm ** 2
+            # Per-frame SFM then median
+            geo  = np.exp(np.mean(np.log(power + 1e-12), axis=0))
+            arith = np.mean(power, axis=0) + 1e-12
+            sfm_per_frame = geo / arith
+            vocal_sfm = float(np.clip(np.median(sfm_per_frame), 0.0, 1.0))
+        else:
+            vocal_sfm = 0.15
+    except Exception:
+        vocal_sfm = 0.15
+
     # ── GROOVE SCORE (uses shared beat_times, vectorized) ─────────────────────
     # Fraction of vocal onsets within ±60ms of a beat grid position.
     # Widened from 40ms to 60ms for mashup context (computer-generated timing).
@@ -690,6 +838,9 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         key_distance_semitones = 2.0
 
+    # ── SPECTRAL MATCH SCORE (vs reference profile) ───────────────────────────
+    spectral_match_score = _compute_spectral_match(y, SR)
+
     return {
         # TIER 1: Technical
         "lufs_integrated":       lufs,
@@ -728,6 +879,8 @@ def _measure(audio_path: str) -> dict:
         "vocal_spectral_crest":  vocal_spectral_crest,
         "vocal_modulation_index":vocal_modulation_index,
         "vocal_presence_ratio":  vocal_presence_ratio,
+        "vocal_hnr_db":          vocal_hnr_db,
+        "vocal_sfm":             vocal_sfm,
         # TIER 4: Musical
         "groove_score":          groove_score,
         "dynamic_arc_score":     dynamic_arc_score,
@@ -735,6 +888,8 @@ def _measure(audio_path: str) -> dict:
         # TIER 5: Mashup intelligence
         "dynamic_complexity_db": dynamic_complexity_db,
         "key_distance_semitones": key_distance_semitones,
+        # TIER 6: Reference learning
+        "spectral_match_score":  spectral_match_score,
     }
 
 
@@ -867,9 +1022,31 @@ def corrections(issues: list) -> dict:
 
 def score_file(audio_path: str, strict: bool = False, reference_path: str = None,
                print_report: bool = True) -> tuple:
-    ref = REF_STRICT if strict else REF
+    ref_base = REF_STRICT if strict else REF
+
+    # Apply dynamic LUFS/LRA overrides from reference profile (if loaded)
+    lufs_target = _get_lufs_target()
+    lra_lo, lra_hi = _get_lra_target()
+    ref = {
+        **ref_base,
+        "lufs_integrated": (lufs_target - 5.0, lufs_target + 5.0) if _REF_PROFILE else ref_base["lufs_integrated"],
+        "lra_lu": (lra_lo, lra_hi) if _REF_PROFILE else ref_base["lra_lu"],
+    }
+
     metrics = _measure(audio_path)
     score, issues = _score(metrics, ref)
+
+    # ── Change 4: spectral_match_score penalty ─────────────────────────────
+    sms = metrics.get("spectral_match_score", 50.0)
+    if sms < 20.0:
+        score = max(0, score - 10)
+        issues.append(("HIGH", "spectral_balance_mismatch", sms, 40.0, 100.0,
+                        "Output spectral balance deviates significantly from reference profile"))
+    elif sms < 40.0:
+        score = max(0, score - 5)
+        issues.append(("MEDIUM", "spectral_balance_mismatch", sms, 40.0, 100.0,
+                        "Output spectral balance deviates significantly from reference profile"))
+
     grade = _grade(score)
     if print_report:
         _print_report(audio_path, metrics, score, grade, issues, reference_path, ref)
@@ -953,6 +1130,10 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
     print(f"  {'Vocal modulation':<28} {m['vocal_modulation_index']:>7.3f}      ({lo:.2f}-{hi:.2f}){_flag(m['vocal_modulation_index'], lo, hi)}")
     lo, hi = _lo_hi("vocal_presence_ratio")
     print(f"  {'Vocal presence ratio':<28} {m['vocal_presence_ratio']:>7.3f}      (>{lo:.2f}){_flag(m['vocal_presence_ratio'], lo, hi)}")
+    lo, hi = _lo_hi("vocal_hnr_db")
+    print(f"  {'Vocal HNR':<28} {m.get('vocal_hnr_db', 15.0):>+7.1f} dB    (>{lo:.0f} dB = clear){_flag(m.get('vocal_hnr_db', 15.0), lo, hi)}")
+    lo, hi = _lo_hi("vocal_sfm")
+    print(f"  {'Vocal SFM (flatness)':<28} {m.get('vocal_sfm', 0.15):>7.3f}      ({lo:.2f}-{hi:.2f} = harmonic){_flag(m.get('vocal_sfm', 0.15), lo, hi)}")
 
     print(f"\n  ── MUSICAL ───────────────────────────────────────────────────────")
     lo, hi = _lo_hi("groove_score")
