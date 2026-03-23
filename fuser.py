@@ -926,11 +926,11 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         rest_d  = sosfilt(sos_rest_d, inst_c, axis=0).astype(np.float32)
         inst_c = (bass_d * gain_samp[:, np.newaxis] + rest_d).astype(np.float32)
 
-        # Transient shaper: sustain reduction only (no attack boost).
-        # attack_gain_db=0: the function was silently disabled (btype crash) throughout
-        # all v17 testing. Setting to 0 matches v17 effective behavior and stops
-        # hi-hat/cymbal transient boosting that was pushing High band +9.6 dB over ref.
-        inst_c = _transient_shape(inst_c, attack_gain_db=0.0, sustain_gain_db=-2.0)
+        # attack_gain_db restored: _transient_shape detects via kick(60-200Hz)+snare(150-6kHz)
+        # bands only — hi-hats are NOT in the detection signal so the old +9.6dB HF issue
+        # was caused by a previous broadband version. 2.5dB attack boost restores kick
+        # definition lost during Demucs stem separation without boosting cymbals.
+        inst_c = _transient_shape(inst_c, attack_gain_db=2.5, sustain_gain_db=-1.5)
         inst_c = _check(inst_c, f"iter{iteration+1}/transient-shape")
         # Sub-bass management: kick transient sidechains 20-80Hz sub-bass
         inst_c = _kick_sub_sidechain(inst_c, depth=0.20)  # reduced 0.35→0.20: was causing -2dB bass deficit
@@ -2514,116 +2514,90 @@ def _arrangement_gain_curves(beat_secs: list, vox_secs: list,
 def _groove_quantize(vox: np.ndarray, inst_mono: np.ndarray,
                      bpm: float, strength: float = 0.35) -> np.ndarray:
     """
-    DISABLED: overlapping segment operations cause clicks throughout the mix.
-    The overlap between fade-out zeroing and += seg_write creates gaps and
-    double-writes when onset ranges overlap (which they always do on dense vocals).
-    """
-    return vox
-    # Original broken implementation below — do not re-enable without rewrite:
-    """
     Vocal groove quantization: nudge vocal syllable onsets toward the beat grid.
-
-    Rappers and singers are naturally slightly ahead or behind the beat.
-    This function detects each vocal onset, finds the nearest beat or 8th-note
-    subdivision, and applies a small time shift to pull it toward the grid.
-
-    'strength' (0-1): 0 = no quantization, 1 = hard snap to grid
-    0.35 = subtle tightening (feels tighter but retains natural feel)
-
-    Algorithm:
-      1. Detect vocal onset positions (sample-accurate)
-      2. Compute the beat grid and 8th-note subdivisions from inst_mono
-      3. For each onset, find the nearest grid position
-      4. If offset < ±50ms (real timing, not gross error), apply time shift
-      5. Reconstruct audio by shifting segments between onsets
+    strength=0.35 = subtle tightening (feels tighter, retains natural feel).
+    Rewritten v2: uses a time-map warp instead of segment copy to avoid clicks.
     """
     if not HAS_PYRUBBERBAND:
-        return vox  # no way to do fine-grain shifts without rubberband
+        return vox
 
     try:
-        hop = 256  # smaller hop for precise onset detection
+        hop = 256
         vox_mono = _to_mono(vox)
 
-        # Detect beat grid from instrumental
+        # Beat grid from instrumental
         _, beats = librosa.beat.beat_track(y=inst_mono, sr=SR,
                                            hop_length=hop, units="samples")
-        if len(beats) < 2:
+        beats = beats.astype(np.int64)
+        if len(beats) < 4:
             return vox
 
-        # Build 8th-note grid (subdivide each beat by 2)
+        # 8th-note grid
         beat_period = float(np.median(np.diff(beats)))
-        eighth_period = beat_period / 2.0
-        grid = []
-        for b in beats:
-            grid.append(int(b))
-            eighth = int(b + eighth_period)
-            if eighth < len(vox_mono):
-                grid.append(eighth)
-        grid = sorted(set(grid))
-
-        # Detect vocal onsets
-        onset_samp = librosa.onset.onset_detect(
-            y=vox_mono, sr=SR, hop_length=hop, units="samples",
-            backtrack=True)
-
-        if len(onset_samp) == 0:
+        eighth = beat_period / 2.0
+        grid = sorted(set(
+            int(b + k * eighth)
+            for b in beats
+            for k in range(2)
+            if 0 <= int(b + k * eighth) < len(vox_mono)
+        ))
+        if len(grid) < 2:
             return vox
 
-        # Compute nudge amounts
-        max_nudge_ms = 50.0
-        max_nudge_samp = int(max_nudge_ms * SR / 1000)
-        nudges = {}  # onset_idx → nudge_samples
+        # Vocal onsets
+        onset_samp = librosa.onset.onset_detect(
+            y=vox_mono, sr=SR, hop_length=hop,
+            units="samples", backtrack=True).astype(np.int64)
+        if len(onset_samp) < 2:
+            return vox
+
+        # Build time-map: list of (original_sample, target_sample) anchor pairs
+        # Start and end are fixed (no warp at boundaries)
+        anchors_src = [0]
+        anchors_dst = [0]
+        max_nudge = int(0.050 * SR)  # 50ms max
 
         for ons in onset_samp:
-            nearest_grid = min(grid, key=lambda g: abs(g - ons))
-            raw_offset = nearest_grid - ons
-            if abs(raw_offset) <= max_nudge_samp:
-                nudge = int(raw_offset * strength)
-                nudges[int(ons)] = nudge
+            nearest = min(grid, key=lambda g: abs(g - ons))
+            raw = nearest - int(ons)
+            if abs(raw) <= max_nudge:
+                nudge = int(raw * strength)
+            else:
+                nudge = 0
+            anchors_src.append(int(ons))
+            anchors_dst.append(int(ons) + nudge)
 
-        if not nudges:
-            return vox
+        n = len(vox_mono)
+        anchors_src.append(n)
+        anchors_dst.append(n)
 
-        # Apply nudges: shift audio segments with crossfade to prevent clicks
-        result = vox.copy()
-        onset_list = sorted(nudges.keys())
-        xfade = max(64, int(SR * 0.003))  # 3ms crossfade window
+        # De-duplicate and sort
+        pairs = sorted(set(zip(anchors_src, anchors_dst)))
+        src_pts = np.array([p[0] for p in pairs], dtype=np.float64)
+        dst_pts = np.array([p[1] for p in pairs], dtype=np.float64)
 
-        for i, ons in enumerate(onset_list):
-            nudge = nudges[ons]
-            if nudge == 0:
-                continue
-            seg_end = onset_list[i + 1] if i + 1 < len(onset_list) else len(vox)
-            seg_len = seg_end - ons
+        # Build continuous warp map: for every output sample, find input sample
+        out_samples = np.arange(n, dtype=np.float64)
+        in_samples  = np.interp(out_samples, dst_pts, src_pts)
+        in_samples  = np.clip(in_samples, 0, n - 1)
 
-            if seg_len < xfade * 2:
-                continue
+        # Resample each channel using the warp map (linear interpolation)
+        stereo = vox.ndim == 2
+        n_ch = vox.shape[1] if stereo else 1
+        result_channels = []
+        for c in range(n_ch):
+            ch = vox[:, c] if stereo else vox
+            # Integer and fractional parts for linear interp
+            idx_lo = np.floor(in_samples).astype(np.int64)
+            idx_hi = np.minimum(idx_lo + 1, n - 1)
+            frac   = (in_samples - idx_lo).astype(np.float32)
+            warped = (ch[idx_lo] * (1.0 - frac) + ch[idx_hi] * frac).astype(np.float32)
+            result_channels.append(warped)
 
-            new_start = ons + nudge
-            new_start = max(0, min(new_start, len(vox) - seg_len))
-
-            # Extract segment from original
-            seg = vox[ons:ons + seg_len].copy()
-
-            # Crossfade ramp for smooth transition (prevents click at boundaries)
-            fade_in  = np.linspace(0, 1, xfade, dtype=np.float32)
-            fade_out = np.linspace(1, 0, xfade, dtype=np.float32)
-
-            # Fade out the old position in result
-            result[ons:ons + xfade] = (result[ons:ons + xfade].T * fade_out).T
-            result[ons + xfade:seg_end] = 0.0
-
-            # Fade in the new position
-            write_end = min(new_start + seg_len, len(result))
-            write_len = write_end - new_start
-            if write_len <= 0:
-                continue
-            seg_write = seg[:write_len].copy()
-            seg_write[:xfade] = (seg_write[:xfade].T * fade_in).T
-            result[new_start:write_end] = (
-                result[new_start:write_end] + seg_write).astype(np.float32)
-
-        return result.astype(np.float32)
+        if stereo:
+            return np.stack(result_channels, axis=1).astype(np.float32)
+        else:
+            return result_channels[0].astype(np.float32)
 
     except Exception as e:
         print(f"      [Groove quantize failed ({e}), skipping]", flush=True)
@@ -3548,7 +3522,12 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         for c in range(vox_ch.shape[0]):
             y_s = rb.time_stretch(vox_ch[c], SR, ratio, rbargs={'-3': ''})
             if n_semitones != 0:
-                y_s = rb.pitch_shift(y_s, SR, n_semitones, rbargs={'-3': ''})
+                # Preserve formants on large shifts (>3 semitones) to prevent "honky" artifacts.
+                # --formant tells rubberband to use a separate formant envelope during pitch shift.
+                _rb_args = {'-3': ''}
+                if abs(n_semitones) > 3:
+                    _rb_args['--formant'] = ''
+                y_s = rb.pitch_shift(y_s, SR, n_semitones, rbargs=_rb_args)
             stretched.append(y_s)
         vox_ch = np.stack(stretched, axis=0).astype(np.float32)
     elif abs(ratio - 1.0) > 0.005 or n_semitones != 0:
@@ -5046,6 +5025,8 @@ def fuse(song_a: str, song_b: str, out_path: str,
     vox = _process_vocals(vox, stretch_vocal, n_semi, vox_params, style,
                           target_root=key_a_root, target_mode=key_a_mode,
                           bpm=bpm_a)
+    vox = _groove_quantize(vox, _to_mono(inst), bpm_a, strength=0.30)
+    print("      Groove quantize applied", flush=True)
     vox = _check(vox, "post-vocal-chain")
 
     # ── Vocal Production for Beat ──────────────────────────────────────────────

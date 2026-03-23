@@ -368,6 +368,143 @@ def _cens_vec(sig: np.ndarray) -> np.ndarray:
     return c_q.mean(axis=1)  # (12,)
 
 
+def _groove_timing_score(y_mix: np.ndarray, sr: int) -> float:
+    """
+    Measure how tightly vocal content sits on the beat grid.
+    Score 0-100: 100 = every onset perfectly on beat, 0 = random timing.
+
+    Method:
+    1. Detect beat grid from the mix
+    2. Detect onsets (energy peaks in the vocal presence band 500-4000Hz)
+    3. For each onset, measure deviation from nearest beat/8th-note grid position
+    4. Score = 100 * (1 - mean_deviation_normalized)
+
+    Returns 50.0 if beat detection fails (neutral, no penalty).
+    """
+    try:
+        y_mono = y_mix if y_mix.ndim == 1 else np.mean(y_mix, axis=0)
+
+        # Beat grid
+        hop = 512
+        tempo, beats = librosa.beat.beat_track(y=y_mono, sr=sr, hop_length=hop, units="samples")
+        beats = np.array(beats, dtype=np.int64)
+        if len(beats) < 4 or not np.isfinite(tempo) or tempo < 40:
+            return 50.0
+
+        beat_period = float(np.median(np.diff(beats)))
+        eighth = beat_period / 2.0
+
+        # Build 8th-note grid
+        grid = []
+        for b in beats:
+            grid.append(int(b))
+            e = int(b + eighth)
+            if e < len(y_mono):
+                grid.append(e)
+        grid = np.array(sorted(set(grid)), dtype=np.int64)
+
+        # Onsets from vocal-presence band (500-4kHz)
+        from scipy.signal import butter, sosfilt
+        sos = butter(4, [500, 4000], btype='bandpass', fs=sr, output='sos')
+        y_vp = sosfilt(sos, y_mono)
+        onset_samp = librosa.onset.onset_detect(
+            y=y_vp, sr=sr, hop_length=hop, units="samples", backtrack=True)
+        onset_samp = np.array(onset_samp, dtype=np.int64)
+
+        if len(onset_samp) < 4:
+            return 50.0
+
+        # Measure deviation of each onset from nearest grid point
+        deviations_ms = []
+        max_consider_ms = 60.0  # only count onsets within 60ms of a beat (ignore ambient noise)
+        for ons in onset_samp:
+            nearest = grid[np.argmin(np.abs(grid - ons))]
+            dev_ms = abs(int(ons) - int(nearest)) / sr * 1000.0
+            if dev_ms < max_consider_ms:
+                deviations_ms.append(dev_ms)
+
+        if len(deviations_ms) < 4:
+            return 50.0
+
+        mean_dev = float(np.mean(deviations_ms))
+        # 0ms deviation = 100, 30ms = 0 (30ms is the JND for rhythm perception)
+        score = max(0.0, 100.0 * (1.0 - mean_dev / 30.0))
+        return round(score, 1)
+    except Exception:
+        return 50.0
+
+
+def _harmonic_clarity_score(y_mix: np.ndarray, sr: int) -> float:
+    """
+    Measure vocal intelligibility in the 1-4kHz speech clarity band.
+    Score 0-100: measures SNR of harmonic content vs noise floor in that band.
+
+    Method: HPSS-separate the mix, measure harmonic energy in 1-4kHz vs
+    percussive energy in same band. High harmonic/percussive ratio = clear vocal.
+    Returns 50.0 on failure (neutral).
+    """
+    try:
+        y_mono = y_mix if y_mix.ndim == 1 else np.mean(y_mix, axis=0)
+
+        # HPSS separation
+        D = librosa.stft(y_mono, n_fft=2048, hop_length=512)
+        H, P = librosa.decompose.hpss(np.abs(D), margin=2.0)
+
+        # Frequency bins for 1-4kHz
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+        band_mask = (freqs >= 1000) & (freqs <= 4000)
+
+        h_energy = float(np.mean(H[band_mask, :] ** 2) + 1e-12)
+        p_energy = float(np.mean(P[band_mask, :] ** 2) + 1e-12)
+
+        # Harmonic-to-percussive ratio in dB
+        hpr_db = 10 * np.log10(h_energy / p_energy)
+
+        # -6dB = 50 (balanced), +6dB = 100 (clear vocal), -12dB = 0 (buried)
+        score = float(np.clip((hpr_db + 6.0) / 12.0 * 100.0, 0.0, 100.0))
+        return round(score, 1)
+    except Exception:
+        return 50.0
+
+
+def _vocal_presence_consistency(y_mix: np.ndarray, sr: int) -> float:
+    """
+    Measure consistency of vocal presence across the mix.
+    Score 0-100: 100 = vocal equally present everywhere, 0 = disappears in sections.
+
+    Uses 10s windows. Measures RMS in vocal-presence band (500-4kHz) per window.
+    Score = 100 * (1 - coefficient_of_variation) clamped 0-100.
+    CV < 0.3 = consistent = high score. CV > 1.0 = very inconsistent = low score.
+    """
+    try:
+        y_mono = y_mix if y_mix.ndim == 1 else np.mean(y_mix, axis=0)
+
+        from scipy.signal import butter, sosfilt
+        sos = butter(4, [500, 4000], btype='bandpass', fs=sr, output='sos')
+        y_vp = sosfilt(sos, y_mono)
+
+        window_n = sr * 10  # 10 second windows
+        if len(y_vp) < window_n * 2:
+            return 50.0
+
+        rms_windows = []
+        for start in range(0, len(y_vp) - window_n, window_n // 2):
+            chunk = y_vp[start:start + window_n]
+            rms = float(np.sqrt(np.mean(chunk ** 2) + 1e-12))
+            if rms > 1e-6:
+                rms_windows.append(rms)
+
+        if len(rms_windows) < 3:
+            return 50.0
+
+        arr = np.array(rms_windows)
+        cv = float(np.std(arr) / (np.mean(arr) + 1e-12))
+        score = float(np.clip((1.0 - cv / 1.0) * 100.0, 0.0, 100.0))
+        return round(score, 1)
+    except Exception:
+        return 50.0
+
+
 def _compute_spectral_match(y_mix: np.ndarray, sr: int) -> float:
     """
     Compute spectral match score (0-100) against reference profile.
@@ -796,6 +933,15 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         vocal_harmony_score = 0.60
 
+    # ── GROOVE TIMING SCORE ───────────────────────────────────────────────────
+    groove_timing_score = _groove_timing_score(y, SR)
+
+    # ── HARMONIC CLARITY SCORE ────────────────────────────────────────────────
+    harmonic_clarity_score = _harmonic_clarity_score(y, SR)
+
+    # ── VOCAL PRESENCE CONSISTENCY ────────────────────────────────────────────
+    vocal_presence_consistency = _vocal_presence_consistency(y, SR)
+
     # ── DYNAMIC COMPLEXITY (RMS-based, fast) ──────────────────────────────────
     # Avg abs deviation of 2s-window RMS (dB) from global RMS (dB).
     # <3 dB = brick-wall limited. >14 dB = sections too uneven.
@@ -882,9 +1028,12 @@ def _measure(audio_path: str) -> dict:
         "vocal_hnr_db":          vocal_hnr_db,
         "vocal_sfm":             vocal_sfm,
         # TIER 4: Musical
-        "groove_score":          groove_score,
-        "dynamic_arc_score":     dynamic_arc_score,
-        "vocal_harmony_score":   vocal_harmony_score,
+        "groove_score":               groove_score,
+        "dynamic_arc_score":          dynamic_arc_score,
+        "vocal_harmony_score":        vocal_harmony_score,
+        "groove_timing_score":        groove_timing_score,
+        "harmonic_clarity_score":     harmonic_clarity_score,
+        "vocal_presence_consistency": vocal_presence_consistency,
         # TIER 5: Mashup intelligence
         "dynamic_complexity_db": dynamic_complexity_db,
         "key_distance_semitones": key_distance_semitones,
@@ -1046,6 +1195,39 @@ def score_file(audio_path: str, strict: bool = False, reference_path: str = None
         score = max(0, score - 5)
         issues.append(("MEDIUM", "spectral_balance_mismatch", sms, 40.0, 100.0,
                         "Output spectral balance deviates significantly from reference profile"))
+
+    # ── groove_timing_score: poor timing is immediately noticeable ────────────
+    gts = metrics.get("groove_timing_score", 50.0)
+    if gts < 30.0:
+        score = max(0, score - 10)
+        issues.append(("HIGH", "poor_groove_timing", gts, 30.0, 100.0,
+                       "Vocal onsets are loosely timed to the beat — try a tighter vocal source"))
+    elif gts < 50.0:
+        score = max(0, score - 5)
+        issues.append(("MEDIUM", "mediocre_groove_timing", gts, 50.0, 100.0,
+                       "Vocal timing could be tighter relative to the beat"))
+
+    # ── harmonic_clarity_score: muddy vocal is unacceptable ──────────────────
+    hcs = metrics.get("harmonic_clarity_score", 50.0)
+    if hcs < 30.0:
+        score = max(0, score - 10)
+        issues.append(("HIGH", "poor_harmonic_clarity", hcs, 30.0, 100.0,
+                       "Vocal is buried in the mix — beat is masking the speech intelligibility band"))
+    elif hcs < 50.0:
+        score = max(0, score - 5)
+        issues.append(("MEDIUM", "low_harmonic_clarity", hcs, 50.0, 100.0,
+                       "Vocal clarity is below target — increase carve_db or presence_db"))
+
+    # ── vocal_presence_consistency: disappearing vocal is a major quality issue
+    vpc = metrics.get("vocal_presence_consistency", 50.0)
+    if vpc < 35.0:
+        score = max(0, score - 10)
+        issues.append(("HIGH", "inconsistent_vocal_presence", vpc, 35.0, 100.0,
+                       "Vocal disappears in sections — arrangement or level targeting issue"))
+    elif vpc < 55.0:
+        score = max(0, score - 5)
+        issues.append(("MEDIUM", "uneven_vocal_presence", vpc, 55.0, 100.0,
+                       "Vocal presence is uneven across sections"))
 
     grade = _grade(score)
     if print_report:

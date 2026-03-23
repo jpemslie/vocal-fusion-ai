@@ -513,6 +513,20 @@ def _causal_corrections(metrics: dict, issues: list, current_params: dict,
             _set("carve_db",    max(3.0, p.get("carve_db", 10.0) - 0.5))
             _set("presence_db", min(4.0, p.get("presence_db", 2.0) + 0.5))
 
+    # ── Harmonic clarity low (vocal buried in speech band) ──────────────────
+    if m.get("harmonic_clarity_score", 50) < 50:
+        _set("carve_db",    min(12.0, p.get("carve_db", 10.0) + 1.5))
+        _set("presence_db", min(4.0,  p.get("presence_db", 2.0) + 1.0))
+
+    # ── Vocal presence inconsistent (vocal disappears in sections) ──────────
+    if m.get("vocal_presence_consistency", 50) < 50:
+        _set("vocal_level", min(4.0, p.get("vocal_level", 2.1) * 1.10))
+
+    # ── Groove timing poor (vocal onsets loose on beat grid) ────────────────
+    if m.get("groove_timing_score", 50) < 40:
+        # Timing is a source material issue — tighten sidechain for perceived tightness
+        _set("hihat_alpha", max(0.50, p.get("hihat_alpha", 0.90) * 0.85))
+
     if adj:
         print(f"  [Built-in director] Causal corrections: {adj}", flush=True)
     return adj
