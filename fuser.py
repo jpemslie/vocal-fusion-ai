@@ -4,8 +4,9 @@ VocalFusion Fusion Engine v4
 AI-driven adaptive mixing — parameters are derived from the actual audio
 content, not hardcoded presets.
 
-Stem separation:  Demucs htdemucs_ft (SDR ~8.5) → BS-Roformer (SDR ~13.0)
-                  via audio-separator. Night-and-day cleaner vocals.
+Stem separation:  Demucs htdemucs_ft (SDR ~8.5) → Mel-Band RoFormer (SDR ~11.4)
+                  → BS-RoFormer (SDR ~13.0) via audio-separator.
+                  Night-and-day cleaner vocals.
 Spectral carving: Fixed EQ cut → content-aware dynamic EQ. Computes exactly
                   which frequencies the vocal occupies and carves those precise
                   slots in the beat using a Wiener soft-mask.
@@ -65,7 +66,8 @@ except Exception:
     HAS_DEEPFILTER = False
 
 SR = 44100
-_BS_ROFORMER    = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+_MBR_VOCAL      = "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt"  # Mel-Band RoFormer vocal (SDR ~11.4) — primary
+_BS_ROFORMER    = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"         # BS-Roformer vocal (SDR ~12.97) — secondary fallback
 _MDX_VOCAL      = "Kim_Vocal_2.onnx"          # MDX-Net vocal (SDR ~9.5, ONNX fast on CPU)
 _MDX23C_VOCAL   = "MDX23C-8KFFT-InstVoc_HQ.ckpt"  # MDX23C vocal (SDR ~12+, better quality)
 _DENOISE_MODEL  = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"          # post-sep denoiser (SDR 27.99)
@@ -849,6 +851,20 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
     bass_band = sosfilt(sos_bass_cut, inst, axis=0).astype(np.float32)
     inst = (inst - bass_band * (1.0 - 10**(-9.0/20.0))).astype(np.float32)  # -9 dB on <350 Hz
 
+    # Use reference profile to set presence target if available
+    _ref_presence_lo = 0.45
+    _ref_presence_hi = 0.70
+    if _MASTER_REF_PROFILE is not None:
+        try:
+            dyn_arc = float(_MASTER_REF_PROFILE.get("dynamics", {}).get(
+                "dynamic_arc", {}).get("median", 0.4))
+            # High dynamic_arc = wide dynamics in reference → allow wider presence swing
+            # Low dynamic_arc = compressed reference → target tighter center
+            _ref_presence_lo = float(np.clip(0.45 - (dyn_arc - 0.4) * 0.5, 0.35, 0.50))
+            _ref_presence_hi = float(np.clip(0.70 + (dyn_arc - 0.4) * 0.5, 0.65, 0.80))
+        except Exception:
+            pass
+
     for iteration in range(max_iter):
         # Apply energy-envelope matching then static scalar
         # Presence check uses MID-FREQUENCY RMS (500-5000 Hz) — not full-band.
@@ -956,9 +972,9 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         print(f"      Mix iter {iteration+1}: presence={vp:.0%}  "
               f"level_mult={level_mult:.2f}  carve={carve_db:.1f}dB", flush=True)
 
-        if 0.45 <= vp <= 0.70 or iteration == max_iter - 1:
+        if _ref_presence_lo <= vp <= _ref_presence_hi or iteration == max_iter - 1:
             break
-        elif vp < 0.45:
+        elif vp < _ref_presence_lo:
             level_mult = min(level_mult * 1.20, 4.0)
         else:
             level_mult = max(level_mult * 0.88, 1.0)  # floor at 1.0 — never go below starting point
@@ -1311,8 +1327,9 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
              upgrade_vocal: bool = False, clean_vocal: bool = False) -> dict:
     """
     Separate vocals using the best available model:
-      GPU available → BS-Roformer via audio-separator (SDR ~13, fast on GPU)
-      CPU only      → Demucs htdemucs_ft (SDR ~8.5, fast on CPU; BS-Roformer
+      GPU available → Mel-Band RoFormer via audio-separator (SDR ~11.4, primary)
+                      → BS-Roformer via audio-separator (SDR ~13, secondary fallback)
+      CPU only      → Demucs htdemucs_ft (SDR ~8.5, fast on CPU; RoFormer models
                       would take 50+ minutes without hardware acceleration)
 
     Cached by file fingerprint. Returns stereo (samples, 2) float32 arrays.
@@ -1325,10 +1342,33 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
         cached.mkdir(exist_ok=True)
 
         if _has_gpu():
-            # GPU path: BS-Roformer via audio-separator
+            # GPU path: try Mel-Band RoFormer first, then BS-RoFormer, then Demucs.
             tmp_dir = Path(tempfile.mkdtemp(dir=cache_dir))
             try:
                 from audio_separator.separator import Separator
+
+                # Determine which model to use: prefer Mel-Band RoFormer.
+                _sep_model = _MBR_VOCAL
+                _sep_label = f"Mel-Band RoFormer ({_MBR_VOCAL})"
+                try:
+                    _probe = Separator(log_level=logging.WARNING,
+                                       model_file_dir=str(Path(cache_dir) / "_models"))
+                    supported = _probe.list_supported_model_files()
+                    _all_ckpts = set()
+                    for _cat_entries in supported.values():
+                        if isinstance(_cat_entries, dict):
+                            for _info in _cat_entries.values():
+                                if isinstance(_info, dict):
+                                    _all_ckpts.update(_info.keys())
+                                elif isinstance(_info, str):
+                                    _all_ckpts.add(_info)
+                    if _MBR_VOCAL not in _all_ckpts:
+                        _sep_model = _BS_ROFORMER
+                        _sep_label = f"BS-RoFormer ({_BS_ROFORMER}) [MBR not in model list]"
+                except Exception:
+                    pass  # keep _sep_model = _MBR_VOCAL; let load_model surface any real error
+
+                print(f"      [Separator] Using {_sep_label}", flush=True)
                 sep = Separator(
                     log_level=logging.WARNING,
                     output_dir=str(tmp_dir),
@@ -1336,7 +1376,15 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
                     sample_rate=SR,
                     model_file_dir=str(Path(cache_dir) / "_models"),
                 )
-                sep.load_model(_BS_ROFORMER)
+                try:
+                    sep.load_model(_sep_model)
+                except Exception as _load_err:
+                    if _sep_model != _BS_ROFORMER:
+                        print(f"      [Mel-Band RoFormer load failed ({_load_err}), trying BS-RoFormer]",
+                              flush=True)
+                        sep.load_model(_BS_ROFORMER)
+                    else:
+                        raise
                 sep.separate(audio_path)
 
                 vox_src = inst_src = None
@@ -1358,7 +1406,7 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
                     else:
                         raise RuntimeError("audio-separator produced no output")
             except Exception as e:
-                print(f"      [BS-Roformer failed ({e}), falling back to Demucs]",
+                print(f"      [RoFormer failed ({e}), falling back to Demucs htdemucs_ft]",
                       flush=True)
                 _separate_demucs(audio_path, cached)
             finally:
@@ -1887,6 +1935,33 @@ def _harmonic_vocal_process(vox: np.ndarray, mix_dry: float = 0.50) -> np.ndarra
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
 
+def _detect_beats(y_mono: np.ndarray, sr: int) -> tuple[float, np.ndarray]:
+    """
+    Detect BPM and beat positions using madmom DBNBeatTracker when available,
+    falling back to librosa.beat.beat_track.
+
+    Returns (bpm, beat_samples) where beat_samples is array of sample indices.
+    madmom is substantially more accurate on complex/swing rhythms.
+    """
+    try:
+        import madmom
+        from madmom.features.beats import RNNBeatProcessor, DBNBeatTrackingProcessor
+        proc = DBNBeatTrackingProcessor(fps=100)
+        act  = RNNBeatProcessor()(y_mono.astype(np.float32))
+        beat_times = proc(act)  # in seconds
+        if len(beat_times) >= 4:
+            beat_samples = (beat_times * sr).astype(np.int64)
+            bpm = float(60.0 / np.median(np.diff(beat_times)))
+            if 40 <= bpm <= 250:
+                return bpm, beat_samples
+    except Exception:
+        pass
+    # Fallback: librosa
+    bpm, beat_frames = librosa.beat.beat_track(y=y_mono, sr=sr, hop_length=512)
+    beat_samples = librosa.frames_to_samples(beat_frames, hop_length=512)
+    return float(bpm), beat_samples.astype(np.int64)
+
+
 def detect_bpm(y_mono: np.ndarray) -> float:
     """
     Genre-agnostic BPM detection using multi-prior consensus + spectral fingerprint.
@@ -1925,8 +2000,7 @@ def detect_bpm(y_mono: np.ndarray) -> float:
         prior_centers = [110, 128, 95]     # pop / dance / default
 
     # ── Method 1: beat_track (autocorrelation — no genre prior) ───────────────
-    bpm_bt = float(librosa.beat.beat_track(
-        onset_envelope=onset_env, sr=SR, hop_length=hop)[0])
+    bpm_bt, _ = _detect_beats(y_mono, SR)
 
     # ── Method 2: multiple lognormal priors across the tempo spectrum ──────────
     candidates = [bpm_bt]
@@ -4486,6 +4560,35 @@ def _master_intimate(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     return mix
 
 
+def _matchering_master(mix: np.ndarray, reference_path: str, sr: int = SR) -> np.ndarray:
+    """
+    Reference-matched mastering using the matchering library.
+    Matches the mix's RMS, frequency response, and stereo width to a reference track.
+    Falls back to _master() if matchering fails or reference not found.
+    """
+    try:
+        import matchering as mg
+        import tempfile, soundfile as sf
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_in:
+            sf.write(tmp_in.name, mix, sr)
+            tmp_in_path = tmp_in.name
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_out:
+            tmp_out_path = tmp_out.name
+
+        mg.process(
+            target=tmp_in_path,
+            reference=reference_path,
+            results=[mg.pcm24(tmp_out_path)]
+        )
+        result, _ = sf.read(tmp_out_path, always_2d=True)
+        return result.astype(np.float32)
+    except Exception as e:
+        print(f"[matchering] Failed ({e}), falling back to standard mastering", flush=True)
+        return _master(mix)
+
+
 def _fade(y: np.ndarray, fade_s: float = 2.0) -> np.ndarray:
     n = min(int(SR * fade_s), len(y) // 6)
     y = y.copy()
@@ -4730,6 +4833,19 @@ def fuse(song_a: str, song_b: str, out_path: str,
           f"  SNR: {_sq['snr_db']:.0f} dB"
           f"  confidence: {_sq['vocal_confidence']:.1f}"
           f"  {'[NEEDS DENOISER]' if _sq['needs_denoiser'] else ''}", flush=True)
+
+    # Hard stop: if bleed is catastrophic, fail fast with a useful error
+    # rather than running 5 minutes and producing an unusable mix.
+    if _sq.get("bleed_ratio", 0.0) > 0.65:
+        raise RuntimeError(
+            f"Vocal stem has severe bleed ({_sq['bleed_ratio']:.0%} contamination). "
+            "This vocal source is not compatible with clean separation. "
+            "Try a different Song B with a cleaner vocal recording."
+        )
+    elif _sq.get("bleed_ratio", 0.0) > 0.45:
+        print(f"  [WARNING] High vocal bleed ({_sq['bleed_ratio']:.0%}) — "
+              "output quality may be reduced. Consider a cleaner vocal source.", flush=True)
+
     _save_fp(fid_b, stems_cache, {
         "stem_bleed_ratio": _sq["bleed_ratio"],
         "stem_snr_db":      _sq["snr_db"],
@@ -5248,6 +5364,15 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
             # Determine if we need to re-run bleed removal (bleed params changed)
             _bleed_changed = any(k in _adj for k in _bleed_params)
+
+            # Re-run bleed removal if bleed params changed OR if vocal became louder/brighter
+            # (which exposes remaining bleed that was previously masked)
+            _exposure_changed = (
+                abs(_adj.get("carve_db", _current_params.get("carve_db", 0)) - _current_params.get("carve_db", 0)) > 1.0 or
+                abs(_adj.get("vocal_level", _current_params.get("vocal_level", 1)) - _current_params.get("vocal_level", 1)) > 0.2 or
+                abs(_adj.get("presence_db", _current_params.get("presence_db", 0)) - _current_params.get("presence_db", 0)) > 1.0
+            )
+            _bleed_changed = _bleed_changed or _exposure_changed
 
             # Apply mix-layer parameter adjustments
             if "carve_db"    in _adj:

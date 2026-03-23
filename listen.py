@@ -467,6 +467,78 @@ def _harmonic_clarity_score(y_mix: np.ndarray, sr: int) -> float:
         return 50.0
 
 
+def _vocal_intelligibility_score(y_mix: np.ndarray, sr: int) -> float:
+    """
+    Estimate vocal intelligibility using a proxy STOI-inspired method.
+
+    True STOI requires a clean reference signal. As a proxy, we:
+    1. Extract the "clean" vocal estimate via HPSS harmonic separation
+    2. Compare harmonic signal vs full mix in the 300-3000Hz speech band
+    3. Score = harmonic energy fraction in that band (0-100)
+
+    This approximates how much of the speech band is harmonic (voice) vs
+    percussive (beat masking). High score = intelligible vocal.
+    Returns 50.0 on failure.
+    """
+    try:
+        y_mono = y_mix if y_mix.ndim == 1 else np.mean(y_mix, axis=0)
+
+        # HPSS to isolate harmonic (vocal) content
+        D = librosa.stft(y_mono, n_fft=2048, hop_length=512)
+        H, P = librosa.decompose.hpss(np.abs(D), margin=3.0)
+
+        # Speech band 300-3000Hz
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+        band  = (freqs >= 300) & (freqs <= 3000)
+
+        h_energy   = float(np.mean(H[band] ** 2) + 1e-12)
+        mix_energy = float(np.mean((H[band] + P[band]) ** 2) + 1e-12)
+
+        # Fraction of speech band that is harmonic
+        harmonic_frac = h_energy / mix_energy
+
+        # Scale: 0.5 frac = 50 (neutral), 0.8 frac = 100 (clear), 0.2 frac = 0 (buried)
+        score = float(np.clip((harmonic_frac - 0.2) / 0.6 * 100.0, 0.0, 100.0))
+        return round(score, 1)
+    except Exception:
+        return 50.0
+
+
+def _mel_stft_quality_score(y_mix: np.ndarray, sr: int) -> float:
+    """
+    Compute a perceptual quality score using mel-STFT spectral flatness analysis.
+    Measures how "musical" vs "noisy" the mix sounds across mel-scaled frequency bands.
+
+    Uses auraloss if available, falls back to librosa mel spectrogram analysis.
+    Score 0-100: 100 = smooth, musical spectrogram; 0 = harsh artifacts.
+    """
+    try:
+        import torch
+        import auraloss.freq as af
+
+        # Convert to torch tensor (batch=1, channels=1 or 2, samples)
+        y_t = torch.from_numpy(y_mix.T if y_mix.ndim == 2 else y_mix[np.newaxis]).float().unsqueeze(0)
+
+        # Self-comparison with small noise: measures spectrogram smoothness
+        noise = torch.randn_like(y_t) * 0.001
+        loss_fn = af.MelSTFTLoss(sample_rate=sr, n_mels=64, fft_size=2048, hop_size=512)
+        loss = float(loss_fn(y_t + noise, y_t).item())
+
+        # Lower loss = smoother = better. Typical range 0.1-2.0
+        score = float(np.clip(100.0 * (1.0 - loss / 2.0), 0.0, 100.0))
+        return round(score, 1)
+    except Exception:
+        # Fallback: mel spectrogram variance as proxy for harshness
+        try:
+            y_mono = y_mix if y_mix.ndim == 1 else np.mean(y_mix, axis=0)
+            mel = librosa.feature.melspectrogram(y=y_mono, sr=sr, n_mels=64)
+            mel_db = librosa.power_to_db(mel + 1e-6)
+            smoothness = 1.0 - float(np.std(np.diff(mel_db, axis=1)) / 20.0)
+            return float(np.clip(smoothness * 100.0, 0.0, 100.0))
+        except Exception:
+            return 50.0
+
+
 def _vocal_presence_consistency(y_mix: np.ndarray, sr: int) -> float:
     """
     Measure consistency of vocal presence across the mix.
@@ -590,7 +662,17 @@ def _measure(audio_path: str) -> dict:
     freqs = librosa.fft_frequencies(sr=SR, n_fft=2048)
 
     # Beat grid — used for both groove_score and tempo_stability
-    _, _beat_frames = librosa.beat.beat_track(y=mono, sr=SR, hop_length=512)
+    try:
+        import madmom
+        from madmom.features.beats import RNNBeatProcessor, DBNBeatTrackingProcessor
+        _proc = DBNBeatTrackingProcessor(fps=100)
+        _act  = RNNBeatProcessor()(mono.astype(np.float32))
+        _beat_times = _proc(_act)
+        _beat_frames = ((_beat_times * SR) / 512).astype(int)  # convert to hop_length=512 frames
+        if len(_beat_frames) < 4:
+            raise ValueError("too few beats")
+    except Exception:
+        _, _beat_frames = librosa.beat.beat_track(y=mono, sr=SR, hop_length=512)
     beat_times = librosa.frames_to_time(_beat_frames, sr=SR, hop_length=512)
 
     # HPSS harmonic signal — used for vocal_harmony_score and key_distance
@@ -942,6 +1024,12 @@ def _measure(audio_path: str) -> dict:
     # ── VOCAL PRESENCE CONSISTENCY ────────────────────────────────────────────
     vocal_presence_consistency = _vocal_presence_consistency(y, SR)
 
+    # ── VOCAL INTELLIGIBILITY SCORE (STOI-proxy) ──────────────────────────────
+    vocal_intelligibility_score = _vocal_intelligibility_score(y, SR)
+
+    # ── MEL-STFT QUALITY SCORE (auraloss perceptual quality) ─────────────────
+    mel_stft_quality_score = _mel_stft_quality_score(y, SR)
+
     # ── DYNAMIC COMPLEXITY (RMS-based, fast) ──────────────────────────────────
     # Avg abs deviation of 2s-window RMS (dB) from global RMS (dB).
     # <3 dB = brick-wall limited. >14 dB = sections too uneven.
@@ -1034,6 +1122,8 @@ def _measure(audio_path: str) -> dict:
         "groove_timing_score":        groove_timing_score,
         "harmonic_clarity_score":     harmonic_clarity_score,
         "vocal_presence_consistency": vocal_presence_consistency,
+        "vocal_intelligibility_score": vocal_intelligibility_score,
+        "mel_stft_quality_score":      mel_stft_quality_score,
         # TIER 5: Mashup intelligence
         "dynamic_complexity_db": dynamic_complexity_db,
         "key_distance_semitones": key_distance_semitones,
@@ -1228,6 +1318,24 @@ def score_file(audio_path: str, strict: bool = False, reference_path: str = None
         score = max(0, score - 5)
         issues.append(("MEDIUM", "uneven_vocal_presence", vpc, 55.0, 100.0,
                        "Vocal presence is uneven across sections"))
+
+    # ── mel_stft_quality_score: perceptual smoothness / musical quality ──────
+    msqs = metrics.get("mel_stft_quality_score", 50.0)
+    if msqs < 30.0:
+        score = max(0, score - 5)
+        issues.append(("MEDIUM", "low_mel_stft_quality", msqs, 30.0, 100.0,
+                       "Mix sounds harsh or artifact-laden — mel-STFT quality score below threshold"))
+
+    # ── vocal_intelligibility_score: STOI-proxy — can listeners understand words?
+    vis = metrics.get("vocal_intelligibility_score", 50.0)
+    if vis < 35.0:
+        score = max(0, score - 10)
+        issues.append(("HIGH", "low_vocal_intelligibility", vis, 35.0, 100.0,
+                       "Vocal is largely unintelligible — beat masking the speech band (300-3000Hz)"))
+    elif vis < 55.0:
+        score = max(0, score - 5)
+        issues.append(("MEDIUM", "low_vocal_intelligibility", vis, 55.0, 100.0,
+                       "Vocal intelligibility is below target — percussive energy competing in speech band"))
 
     grade = _grade(score)
     if print_report:

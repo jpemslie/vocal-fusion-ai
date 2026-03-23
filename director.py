@@ -527,6 +527,11 @@ def _causal_corrections(metrics: dict, issues: list, current_params: dict,
         # Timing is a source material issue — tighten sidechain for perceived tightness
         _set("hihat_alpha", max(0.50, p.get("hihat_alpha", 0.90) * 0.85))
 
+    # ── Vocal intelligibility low (beat masking speech band) ────────────────
+    if m.get("vocal_intelligibility_score", 50) < 50:
+        adj["carve_db"]    = adj.get("carve_db", p.get("carve_db", 6.0)) + 2.0
+        adj["presence_db"] = adj.get("presence_db", p.get("presence_db", 1.5)) + 1.5
+
     if adj:
         print(f"  [Built-in director] Causal corrections: {adj}", flush=True)
     return adj
