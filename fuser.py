@@ -727,18 +727,21 @@ def _produce_vocal_for_beat(
     return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 
+def _scale_tones(root, mode):
+    major = [0, 2, 4, 5, 7, 9, 11]
+    minor = [0, 2, 3, 5, 7, 8, 10]
+    degrees = major if mode == "major" else minor
+    return set((root + d) % 12 for d in degrees)
+
+
 def _smart_key_shift(n_semi: int, key_b_root: int, key_b_mode: str,
                      key_a_root: int, key_a_mode: str) -> tuple:
     """
-    If the direct semitone shift is large (>3), try alternate harmonic
-    relationships that might be more compatible:
-      - Try parallel mode: if B is minor, try its relative major (+3 semitones)
-      - Try octave-equivalent: n_semi - 12 or n_semi + 12
+    Pick the candidate shift that produces the most harmonic overlap between
+    the shifted source key (B) and the target key (A).  Ties are broken by
+    smallest absolute semitone movement.
     Returns (best_n_semi, explanation).
     """
-    if abs(n_semi) <= 3:
-        return n_semi, "compatible"
-
     candidates = [n_semi]
 
     # Relative major/minor: same key signature, different root
@@ -761,8 +764,15 @@ def _smart_key_shift(n_semi: int, key_b_root: int, key_b_mode: str,
     for adj in (2, -2, 5, -5, 7, -7):
         candidates.append(n_semi + adj - round((n_semi + adj) / 12) * 12)
 
-    # Pick the smallest absolute shift
-    best = min(candidates, key=abs)
+    # Score each candidate by harmonic overlap with target key A
+    target_tones = _scale_tones(key_a_root, key_a_mode)
+
+    def _score(c):
+        shifted_root = (key_b_root + c) % 12
+        overlap = len(_scale_tones(shifted_root, key_b_mode) & target_tones)
+        return (overlap, -abs(c))  # maximise overlap, then minimise shift
+
+    best = max(candidates, key=_score)
     if abs(best) > 5:
         msg = (f"re-mapped {n_semi:+d} → {best:+d} st "
                f"[WARNING: {abs(best)} semitones — quality may suffer]")
@@ -3792,10 +3802,10 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         for c in range(vox_ch.shape[0]):
             y_s = rb.time_stretch(vox_ch[c], SR, ratio, rbargs={'-3': ''})
             if n_semitones != 0:
-                # Preserve formants on large shifts (>3 semitones) to prevent "honky" artifacts.
+                # Preserve formants on any pitch shift to prevent "honky" artifacts.
                 # --formant tells rubberband to use a separate formant envelope during pitch shift.
                 _rb_args = {'-3': ''}
-                if abs(n_semitones) > 3:
+                if abs(n_semitones) > 0:
                     _rb_args['--formant'] = ''
                 y_s = rb.pitch_shift(y_s, SR, n_semitones, rbargs=_rb_args)
             stretched.append(y_s)
@@ -5077,6 +5087,22 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
     inst = stems_a["no_vocals"]   # (samples, 2)
     vox  = stems_b["vocals"]      # (samples, 2)
+
+    # ── Stem-based key refinement ──────────────────────────────────────────────
+    # Re-detect keys on clean stems: instrumental for A (no vocal noise),
+    # isolated vocal for B (no beat interference).  Do NOT write to fingerprint
+    # cache — stems aren't cached so next run will re-detect anyway.
+    print("      Re-detecting keys on separated stems…", flush=True)
+    inst_mono = np.mean(inst, axis=1) if inst.ndim == 2 and inst.shape[1] == 2 else inst
+    vox_mono  = np.mean(vox,  axis=1) if vox.ndim  == 2 and vox.shape[1]  == 2 else vox
+    stem_key_a_root, stem_key_a_mode = detect_key(inst_mono)
+    stem_key_b_root, stem_key_b_mode = detect_key(vox_mono)
+    print(f"      A: was {_NOTES[key_a_root]} {key_a_mode} → "
+          f"stem-detected {_NOTES[stem_key_a_root]} {stem_key_a_mode}", flush=True)
+    print(f"      B: was {_NOTES[key_b_root]} {key_b_mode} → "
+          f"stem-detected {_NOTES[stem_key_b_root]} {stem_key_b_mode}", flush=True)
+    key_a_root, key_a_mode = stem_key_a_root, stem_key_a_mode
+    key_b_root, key_b_mode = stem_key_b_root, stem_key_b_mode
 
     # ── System 2: Assess stem quality BEFORE bleed removal to set adaptive params ──
     _sq = _assess_stem_quality(vox, inst)
