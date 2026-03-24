@@ -306,6 +306,18 @@ def get_corrections(
     )
     user_msg += _build_spectral_delta_message(metrics)
 
+    # Per-band spectral deltas
+    band_deltas = {k: v for k, v in metrics.items() if k.startswith("delta_")}
+    if band_deltas:
+        lines = ["\nPer-band deviation from Drake reference (dB, + = too loud, - = too quiet):"]
+        for band in ["sub", "bass", "lo_mid", "mid", "hi_mid", "presence", "air"]:
+            key = f"delta_{band}"
+            if key in band_deltas:
+                val = band_deltas[key]
+                flag = " <- FIX" if abs(val) > 3.0 else ""
+                lines.append(f"  {band:10s}: {val:+.1f} dB{flag}")
+        user_msg += "\n".join(lines)
+
     # ── API call ───────────────────────────────────────────────────────────────
     try:
         client   = anthropic.Anthropic(api_key=api_key)
@@ -512,6 +524,19 @@ def _causal_corrections(metrics: dict, issues: list, current_params: dict,
         else:  # 40 <= spectral_match < 60
             _set("carve_db",    max(3.0, p.get("carve_db", 10.0) - 0.5))
             _set("presence_db", min(4.0, p.get("presence_db", 2.0) + 0.5))
+
+    # ── Band-specific corrections from per-band deltas ───────────────────────
+    delta_sub      = m.get("delta_sub",      0.0)
+    delta_bass     = m.get("delta_bass",     0.0)
+    delta_mid      = m.get("delta_mid",      0.0)
+    delta_presence = m.get("delta_presence", 0.0)
+
+    if delta_mid < -3.0:   # mid band too quiet — vocal getting masked
+        adj["carve_db"]    = adj.get("carve_db", p.get("carve_db", 6.0)) + 1.5
+    if delta_presence < -3.0:  # presence band too quiet
+        adj["presence_db"] = adj.get("presence_db", p.get("presence_db", 1.5)) + 1.0
+    if delta_mid > 3.0:   # mid too loud — reduce carving to let beat breathe
+        adj["carve_db"]    = adj.get("carve_db", p.get("carve_db", 6.0)) - 1.0
 
     # ── Harmonic clarity low (vocal buried in speech band) ──────────────────
     if m.get("harmonic_clarity_score", 50) < 50:

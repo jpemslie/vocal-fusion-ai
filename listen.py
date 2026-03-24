@@ -577,6 +577,69 @@ def _vocal_presence_consistency(y_mix: np.ndarray, sr: int) -> float:
         return 50.0
 
 
+def _stereo_width_score(y_mix: np.ndarray, sr: int) -> float:
+    """
+    Score stereo width against reference profile target.
+    Score 100 = width matches reference exactly.
+    Score decreases as width deviates from reference (too wide or too narrow).
+    Returns 50.0 if no reference profile or mono input.
+    """
+    if _REF_PROFILE is None or y_mix.ndim != 2:
+        return 50.0
+    try:
+        from scipy.signal import butter, sosfilt
+        target_mid = float(_REF_PROFILE["stereo"]["width_mid"]["median"])
+
+        sos = butter(4, [500, 4000], btype="bandpass", fs=sr, output="sos")
+        l_filt = sosfilt(sos, y_mix[:, 0] if y_mix.shape[1] == 2 else y_mix[:, 0])
+        r_filt = sosfilt(sos, y_mix[:, 1] if y_mix.shape[1] == 2 else y_mix[:, 0])
+
+        corr = float(np.corrcoef(l_filt, r_filt)[0, 1])
+        actual_width = 1.0 - abs(corr)
+
+        deviation = abs(actual_width - target_mid)
+        score = float(np.clip(100.0 * (1.0 - deviation / 0.5), 0.0, 100.0))
+        return round(score, 1)
+    except Exception:
+        return 50.0
+
+
+def _spectral_band_deltas(y_mix: np.ndarray, sr: int) -> dict:
+    """
+    Compute per-band deviation from reference profile in dB.
+    Returns flat dict: {"delta_sub": X, "delta_bass": X, ...}
+    All values in dB. Positive = our mix is louder than reference in that band.
+    Returns empty dict if no profile loaded.
+    """
+    if _REF_PROFILE is None:
+        return {}
+
+    from scipy.signal import butter, sosfilt
+    y_mono = y_mix if y_mix.ndim == 1 else np.mean(y_mix, axis=0)
+
+    band_defs = {
+        "sub":      (20,   60),
+        "bass":     (60,   250),
+        "lo_mid":   (250,  500),
+        "mid":      (500,  2000),
+        "hi_mid":   (2000, 6000),
+        "presence": (6000, 10000),
+        "air":      (10000, min(20000, sr//2 - 200)),
+    }
+
+    deltas = {}
+    for name, (lo, hi) in band_defs.items():
+        try:
+            sos = butter(4, [lo, hi], btype="bandpass", fs=sr, output="sos")
+            filtered = sosfilt(sos, y_mono)
+            rms_db = 20.0 * np.log10(float(np.sqrt(np.mean(filtered**2) + 1e-12)) + 1e-12)
+            target = float(_REF_PROFILE["bands"][name]["median"])
+            deltas[f"delta_{name}"] = round(rms_db - target, 1)
+        except Exception:
+            deltas[f"delta_{name}"] = 0.0
+    return deltas
+
+
 def _compute_spectral_match(y_mix: np.ndarray, sr: int) -> float:
     """
     Compute spectral match score (0-100) against reference profile.
@@ -634,6 +697,40 @@ def _get_lra_target() -> tuple[float, float]:
         p75 = float(_REF_PROFILE["loudness"]["lra"]["p75"])
         return (p25, p75)
     return (4.0, 12.0)  # default acceptable range
+
+
+def _profile_ref_ranges() -> dict:
+    """
+    Build reference scoring ranges from the loaded profile.
+    Returns dict of metric → (lo, hi) acceptable range.
+    Falls back to static defaults if no profile loaded.
+    """
+    defaults = {
+        "transient_clarity": (8.0, 25.0),
+        "sub_to_bass_db":    (-3.0, +3.0),   # sub vs bass balance
+        "stereo_width_mid":  (0.05, 0.60),   # acceptable mid-band width
+    }
+    if _REF_PROFILE is None:
+        return defaults
+    try:
+        tc = _REF_PROFILE["dynamics"]["transient_clarity"]
+        out = {
+            "transient_clarity": (
+                float(tc["p25"]) * 0.7,   # lo = 70% of p25
+                float(tc["p75"]) * 1.3,   # hi = 130% of p75
+            ),
+            "sub_to_bass_db": (
+                float(_REF_PROFILE["bands"]["sub"]["median"]) - float(_REF_PROFILE["bands"]["bass"]["median"]) - 3.0,
+                float(_REF_PROFILE["bands"]["sub"]["median"]) - float(_REF_PROFILE["bands"]["bass"]["median"]) + 3.0,
+            ),
+            "stereo_width_mid": (
+                max(0.02, float(_REF_PROFILE["stereo"]["width_mid"]["p25"]) * 0.5),
+                min(0.80, float(_REF_PROFILE["stereo"]["width_mid"]["p75"]) * 2.0),
+            ),
+        }
+        return out
+    except Exception:
+        return defaults
 
 
 def _load(audio_path: str) -> np.ndarray:
@@ -1075,6 +1172,12 @@ def _measure(audio_path: str) -> dict:
     # ── SPECTRAL MATCH SCORE (vs reference profile) ───────────────────────────
     spectral_match_score = _compute_spectral_match(y, SR)
 
+    # ── STEREO WIDTH SCORE (vs reference profile) ─────────────────────────────
+    stereo_width_score = _stereo_width_score(y, SR)
+
+    # ── PER-BAND SPECTRAL DELTAS (vs reference profile) ───────────────────────
+    spectral_band_deltas = _spectral_band_deltas(y, SR)
+
     return {
         # TIER 1: Technical
         "lufs_integrated":       lufs,
@@ -1129,6 +1232,9 @@ def _measure(audio_path: str) -> dict:
         "key_distance_semitones": key_distance_semitones,
         # TIER 6: Reference learning
         "spectral_match_score":  spectral_match_score,
+        "stereo_width_score":    stereo_width_score,
+        # Per-band spectral deltas vs reference (dB, + = too loud, - = too quiet)
+        **spectral_band_deltas,
     }
 
 
@@ -1263,13 +1369,15 @@ def score_file(audio_path: str, strict: bool = False, reference_path: str = None
                print_report: bool = True) -> tuple:
     ref_base = REF_STRICT if strict else REF
 
-    # Apply dynamic LUFS/LRA overrides from reference profile (if loaded)
+    # Apply dynamic LUFS/LRA/transient overrides from reference profile (if loaded)
     lufs_target = _get_lufs_target()
     lra_lo, lra_hi = _get_lra_target()
+    _pref = _profile_ref_ranges()
     ref = {
         **ref_base,
         "lufs_integrated": (lufs_target - 5.0, lufs_target + 5.0) if _REF_PROFILE else ref_base["lufs_integrated"],
         "lra_lu": (lra_lo, lra_hi) if _REF_PROFILE else ref_base["lra_lu"],
+        "transient_clarity": _pref["transient_clarity"] if _REF_PROFILE else ref_base["transient_clarity"],
     }
 
     metrics = _measure(audio_path)
@@ -1336,6 +1444,13 @@ def score_file(audio_path: str, strict: bool = False, reference_path: str = None
         score = max(0, score - 5)
         issues.append(("MEDIUM", "low_vocal_intelligibility", vis, 55.0, 100.0,
                        "Vocal intelligibility is below target — percussive energy competing in speech band"))
+
+    # ── stereo_width_score: penalize if width deviates too far from reference ─
+    sws = metrics.get("stereo_width_score", 50.0)
+    if sws < 40.0:
+        score = max(0, score - 5)
+        issues.append(("MEDIUM", "stereo_width_mismatch", sws, 40.0, 100.0,
+                       "Stereo width deviates significantly from reference profile target"))
 
     grade = _grade(score)
     if print_report:

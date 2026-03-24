@@ -996,7 +996,17 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
     # Floor at 0.6: prevents stereo field from collapsing entirely during loud vocals.
     # On wide stacks with out-of-phase hi-hats, unconstrained narrowing can push
     # stereo correlation below 0.5 and cause mono-sum cancellation.
-    width_gain = np.maximum(width_gain, 0.60).astype(np.float32)
+    # Width floor from reference profile (Drake = 0.13, generic = 0.60)
+    _width_floor = 0.60
+    if _MASTER_REF_PROFILE is not None:
+        try:
+            _width_floor = float(np.clip(
+                _MASTER_REF_PROFILE["stereo"]["width_mid"]["median"] * 2.0,
+                0.20, 0.75
+            ))
+        except Exception:
+            pass
+    width_gain = np.maximum(width_gain, _width_floor).astype(np.float32)
     inst_M, inst_S = _ms_encode(inst_c)
     vox_M, _       = _ms_encode(vox_scaled)
     inst_S_dynamic = (inst_S * width_gain).astype(np.float32)
@@ -3974,6 +3984,21 @@ def _sidechain(inst: np.ndarray, vox: np.ndarray,
 
 # ── Mastering ─────────────────────────────────────────────────────────────────
 
+def _profile_lufs_target(variant: str = "radio") -> float:
+    """Return LUFS target from reference profile, or sensible defaults."""
+    try:
+        if _MASTER_REF_PROFILE:
+            base = float(_MASTER_REF_PROFILE["loudness"]["lufs_i"]["median"])
+            if variant == "club":
+                return base + 2.0   # club is always louder
+            elif variant == "intimate":
+                return base - 2.0   # intimate is quieter
+            return base
+    except Exception:
+        pass
+    return {"radio": -12.0, "club": -9.0, "intimate": -14.0}[variant]
+
+
 def _lufs_normalize(y: np.ndarray, target: float = -9.0) -> np.ndarray:
     meter = pyln.Meter(SR)
     lufs = meter.integrated_loudness(y)
@@ -4275,10 +4300,18 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
         # cut muddy low-mids on sides, add high-shelf air to widen presence.
         # Research: sides low-mids (300-600Hz) are often murky; cut 2-3dB here
         # improves clarity without affecting the vocal (which is Mid-only).
+        # Sides air: reduce if reference profile shows narrow stereo target
+        _sides_air_db = +1.0
+        if _MASTER_REF_PROFILE is not None:
+            try:
+                if float(_MASTER_REF_PROFILE["stereo"]["width_high"]["median"]) < 0.10:
+                    _sides_air_db = -0.5  # narrow down to match reference
+            except Exception:
+                pass
         sides_eq = Pedalboard([
             HighpassFilter(cutoff_frequency_hz=120.0),              # 120Hz mono-safe (safer than 100Hz)
             PeakFilter(cutoff_frequency_hz=400.0, gain_db=-2.5, q=0.8),  # muddy sides cut
-            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=+1.0),    # +1.0dB: add air to sides (was -1.0 to tame old exciters)
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=_sides_air_db),    # add air to sides (was -1.0 to tame old exciters)
         ])
         S_proc = sides_eq(S[np.newaxis, :].astype(np.float32), SR)[0]
 
@@ -4355,7 +4388,19 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     _sub_rms = float(np.sqrt(np.mean(_mix_mono_sub**2)) + 1e-9)
     _mid_rms = float(np.sqrt(np.mean(_mix_mono_mid**2)) + 1e-9)
     _sub_excess = float(np.clip(_sub_rms / (_mid_rms + 1e-9) - 0.5, 0.0, 2.0))
-    _sub_atten_lin = float(np.interp(_sub_excess, [0.0, 2.0], [0.84, 0.35]))
+    # Reference-aware sub attenuation cap
+    # Drake and hip-hop have intentionally hot subs — don't over-cut
+    _sub_atten_floor = 0.35  # default: max -9 dB cut (for EDM/over-loaded sub)
+    if _MASTER_REF_PROFILE is not None:
+        try:
+            ref_sub_db = float(_MASTER_REF_PROFILE["bands"]["sub"]["median"])
+            if ref_sub_db > -18.0:   # reference has hot sub (Drake = -15.5)
+                _sub_atten_floor = 0.65  # max -3.7 dB cut — preserve the sub punch
+            elif ref_sub_db > -22.0:
+                _sub_atten_floor = 0.50  # max -6 dB cut
+        except Exception:
+            pass
+    _sub_atten_lin = float(np.interp(_sub_excess, [0.0, 2.0], [0.84, _sub_atten_floor]))
     mix_sub_lim = (mix_sub_lim * _sub_atten_lin).astype(np.float32)
     print(f"      Sub attenuation: sub/mid={_sub_rms/_mid_rms:.2f} → "
           f"{20*np.log10(_sub_atten_lin):.1f} dB", flush=True)
@@ -4373,7 +4418,7 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # means transients pass through — kick hits harder, snare cracks more, vocals
     # don't get smashed at the ceiling. Streaming platforms normalize to -14 LUFS
     # anyway, so -12 is still competitive without destroying dynamics.
-    mix = _lufs_normalize(mix, -12.0)
+    mix = _lufs_normalize(mix, _profile_lufs_target("radio"))
 
     # Post-normalize HF gentle control: -3.0 dB at 6kHz (down from -5.5 dB).
     # Previous -5.5 dB was calibrated for harmonic exciters/waveshaper HF excess.
@@ -4399,7 +4444,7 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # Safety: run a final limiter instead of hard-clip — hard-clip removes transient
     # energy which reduces LUFS back below -12 (observed: -15.3 instead of -12).
     try:
-        mix = _lufs_normalize(mix, -12.0)
+        mix = _lufs_normalize(mix, _profile_lufs_target("radio"))
         final_lim = Pedalboard([Limiter(threshold_db=-0.5, release_ms=30.0)])
         mix = final_lim(mix.T.astype(np.float32), SR).T.astype(np.float32)
     except Exception:
@@ -4472,7 +4517,7 @@ def _master_club(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     mix = (mix_abv + mix_sub).astype(np.float32)
 
     # LUFS -9 for club loudness
-    mix = _lufs_normalize(mix, -9.0)
+    mix = _lufs_normalize(mix, _profile_lufs_target("club"))
     post_eq = Pedalboard([HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-2.5)])
     mix = post_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
@@ -4546,7 +4591,7 @@ def _master_intimate(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     mix = (mix_abv + mix_sub).astype(np.float32)
 
     # LUFS -14 (streaming standard — Spotify/Apple target)
-    mix = _lufs_normalize(mix, -14.0)
+    mix = _lufs_normalize(mix, _profile_lufs_target("intimate"))
 
     # Very slight HF control
     post_eq = Pedalboard([HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-1.5)])
