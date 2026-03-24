@@ -59,6 +59,16 @@ import soundfile as sf
 from pathlib import Path
 from scipy.signal import butter, sosfilt
 
+# Pre-load torch at module level. If torch initializes for the first time inside
+# _mel_stft_quality_score() while the process is mid-computation, it triggers a
+# native segfault (exit 139). Importing it here ensures torch is fully initialized
+# before any audio processing begins.
+try:
+    import torch as _torch_preload  # noqa: F401
+    import auraloss.freq as _auraloss_preload  # noqa: F401
+except Exception:
+    pass
+
 SR = 44100
 
 # ---------------------------------------------------------------------------
@@ -169,6 +179,17 @@ REF = {
     # bass-range (80-500 Hz) and vocal-range (800-3000 Hz) harmonics.
     # Camelot wheel: 0-2 = compatible, 3-5 = noticeable, 6 = tritone clash.
     "key_distance_semitones": (0.0, 5.0),
+
+    # ── TIER 6: Reference profile band deltas (dB deviation vs Drake target) ─
+    # These are only populated when a reference profile is loaded.
+    # ±4 dB = acceptable variation. Outside that = audibly off-balance.
+    "delta_sub":      (-4.0, +4.0),
+    "delta_bass":     (-4.0, +4.0),
+    "delta_lo_mid":   (-4.0, +4.0),
+    "delta_mid":      (-3.0, +3.0),   # mid is most audible — tighter window
+    "delta_hi_mid":   (-3.0, +3.0),
+    "delta_presence": (-3.0, +3.0),   # presence = vocal intelligibility zone
+    "delta_air":      (-5.0, +5.0),   # air shelf more forgiving
 }
 
 REF_STRICT = {**REF,
@@ -235,6 +256,14 @@ PENALTIES = {
     # TIER 5: Mashup intelligence
     "dynamic_complexity_db":   8,
     "key_distance_semitones": 20,   # key clash = unlistenable
+    # TIER 6: Reference band deltas — penalize when bands deviate from Drake target
+    "delta_sub":       12,   # missing sub = sounds small
+    "delta_bass":       8,
+    "delta_lo_mid":     6,
+    "delta_mid":       10,   # mid zone = vocal intelligibility
+    "delta_hi_mid":     8,
+    "delta_presence":  10,   # presence = vocal sits forward
+    "delta_air":        8,   # air = top-end life
 }
 
 PROBLEM_NAMES = {
@@ -307,6 +336,21 @@ PROBLEM_NAMES = {
                                   "UNEVEN — volume jumps drastically between sections"),
     "key_distance_semitones":    ("key match (N/A)",
                                   "KEY CLASH — beat and vocal are >5 semitones apart, sounds dissonant"),
+    # Per-band delta problem names
+    "delta_sub":      ("SUB MISSING — sub-bass 4+ dB below reference, sounds weak/small",
+                       "SUB OVERLOADED — sub-bass 4+ dB above reference, boomy"),
+    "delta_bass":     ("BASS THIN — bass band too quiet vs reference",
+                       "BASS HEAVY — bass band too loud vs reference, muddy"),
+    "delta_lo_mid":   ("LO-MID SCOOPED — hollow, phone-speaker sound",
+                       "LO-MID MUDDY — 250-800 Hz excess masking vocal"),
+    "delta_mid":      ("MIDS DIP — vocal presence zone too quiet, sounds recessed",
+                       "MIDS HARSH — vocal presence zone too loud, fatiguing"),
+    "delta_hi_mid":   ("HI-MID DULL — 2-5 kHz too quiet, clarity gone",
+                       "HI-MID HARSH — 2-5 kHz too loud, ear fatigue"),
+    "delta_presence": ("PRESENCE MISSING — 3-6 kHz too quiet, vocal behind glass",
+                       "PRESENCE HARSH — 3-6 kHz too loud, ice-pick"),
+    "delta_air":      ("AIR MISSING — 8+ kHz dead, sounds dark and muffled",
+                       "TOO BRIGHT — 8+ kHz hyped, sounds thin and harsh"),
 }
 
 CORRECTIONS = {
@@ -328,6 +372,12 @@ CORRECTIONS = {
     "key_distance_semitones":("carve_db",           0.0, +2.0),
     "dynamic_complexity_db": ("lufs_delta",         0.0, -1.5),
     "plr_db":                ("lufs_delta",        +1.0, -1.0),
+    # Band delta corrections: too quiet → boost (positive adj), too loud → cut (negative)
+    "delta_sub":       ("lufs_delta",        +1.5, -1.5),  # sub thin → boost master
+    "delta_bass":      ("carve_db",          -1.0, +1.0),  # bass thin → cut less carve
+    "delta_mid":       ("carve_db",          -1.5, +1.5),  # mid thin → cut less in mid
+    "delta_presence":  ("presence_db",       +1.5, -1.5),  # presence thin → boost presence
+    "delta_air":       ("air_db",            +1.5, -1.5),  # air thin → boost air shelf
 }
 
 
@@ -1113,19 +1163,22 @@ def _measure(audio_path: str) -> dict:
         vocal_harmony_score = 0.60
 
     # ── GROOVE TIMING SCORE ───────────────────────────────────────────────────
-    groove_timing_score = _groove_timing_score(y, SR)
+    # NOTE: pass mono (1D), not y (2D stereo). These functions expect 1D.
+    # Bug: passing y (n_samples, 2) caused np.mean(y, axis=0) → shape (2,)
+    # → beat tracking received a 2-sample array → segfault (exit 139).
+    groove_timing_score = _groove_timing_score(mono, SR)
 
     # ── HARMONIC CLARITY SCORE ────────────────────────────────────────────────
-    harmonic_clarity_score = _harmonic_clarity_score(y, SR)
+    harmonic_clarity_score = _harmonic_clarity_score(mono, SR)
 
     # ── VOCAL PRESENCE CONSISTENCY ────────────────────────────────────────────
-    vocal_presence_consistency = _vocal_presence_consistency(y, SR)
+    vocal_presence_consistency = _vocal_presence_consistency(mono, SR)
 
     # ── VOCAL INTELLIGIBILITY SCORE (STOI-proxy) ──────────────────────────────
-    vocal_intelligibility_score = _vocal_intelligibility_score(y, SR)
+    vocal_intelligibility_score = _vocal_intelligibility_score(mono, SR)
 
     # ── MEL-STFT QUALITY SCORE (auraloss perceptual quality) ─────────────────
-    mel_stft_quality_score = _mel_stft_quality_score(y, SR)
+    mel_stft_quality_score = _mel_stft_quality_score(mono, SR)
 
     # ── DYNAMIC COMPLEXITY (RMS-based, fast) ──────────────────────────────────
     # Avg abs deviation of 2s-window RMS (dB) from global RMS (dB).
@@ -1170,13 +1223,14 @@ def _measure(audio_path: str) -> dict:
         key_distance_semitones = 2.0
 
     # ── SPECTRAL MATCH SCORE (vs reference profile) ───────────────────────────
-    spectral_match_score = _compute_spectral_match(y, SR)
+    spectral_match_score = _compute_spectral_match(mono, SR)
 
     # ── STEREO WIDTH SCORE (vs reference profile) ─────────────────────────────
+    # _stereo_width_score needs stereo (n_samples, 2) — pass y, not mono
     stereo_width_score = _stereo_width_score(y, SR)
 
     # ── PER-BAND SPECTRAL DELTAS (vs reference profile) ───────────────────────
-    spectral_band_deltas = _spectral_band_deltas(y, SR)
+    spectral_band_deltas = _spectral_band_deltas(mono, SR)
 
     return {
         # TIER 1: Technical
@@ -1375,7 +1429,9 @@ def score_file(audio_path: str, strict: bool = False, reference_path: str = None
     _pref = _profile_ref_ranges()
     ref = {
         **ref_base,
-        "lufs_integrated": (lufs_target - 5.0, lufs_target + 5.0) if _REF_PROFILE else ref_base["lufs_integrated"],
+        # Tighter window than generic: ±3 dB below, +2 dB above.
+        # Asymmetric: being too quiet is more common/damaging than slightly too loud.
+        "lufs_integrated": (lufs_target - 3.0, lufs_target + 2.0) if _REF_PROFILE else ref_base["lufs_integrated"],
         "lra_lu": (lra_lo, lra_hi) if _REF_PROFILE else ref_base["lra_lu"],
         "transient_clarity": _pref["transient_clarity"] if _REF_PROFILE else ref_base["transient_clarity"],
     }
