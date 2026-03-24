@@ -773,14 +773,13 @@ def _smart_key_shift(n_semi: int, key_b_root: int, key_b_mode: str,
     return best, msg
 
 
-def _deepfilter_clean(vox_mono: np.ndarray) -> np.ndarray:
+def _deepfilter_clean(vox_mono: np.ndarray, wet: float = 0.45) -> np.ndarray:
     """
-    Clean vocal stem using DeepFilterNet (neural noise suppression).
+    Clean vocal stem using a wet/dry blend of DeepFilterNet + original signal.
 
-    Neural approach: understands speech/vocal structure vs noise. Removes residual
-    drum bleed, hi-hat smear, and room tone left by stem separation far more
-    cleanly than spectral gating (noisereduce), which leaves 'musical noise'
-    artifacts when bleed is tonal.
+    DeepFilterNet at 100% wet strips bleed but also removes vocal harmonics it
+    classifies as noise — result sounds thin/metallic on music stems.
+    Blending at 45% wet removes enough bleed without killing harmonic body.
 
     Uses a module-level cached model so the network loads once per process.
     Falls back to noisereduce if DeepFilterNet is unavailable.
@@ -792,10 +791,12 @@ def _deepfilter_clean(vox_mono: np.ndarray) -> np.ndarray:
         import soxr
         model, df_state = _get_df_model()
         # DeepFilterNet expects 48 kHz mono float32
-        vox_48k = soxr.resample(vox_mono.astype(np.float32), SR, 48000).astype(np.float32)
+        vox_48k  = soxr.resample(vox_mono.astype(np.float32), SR, 48000).astype(np.float32)
         t        = _torch.from_numpy(vox_48k).unsqueeze(0)
         enhanced = enhance(model, df_state, t).squeeze(0).numpy()
-        return soxr.resample(enhanced, 48000, SR).astype(np.float32)
+        cleaned  = soxr.resample(enhanced, 48000, SR).astype(np.float32)
+        n = min(len(vox_mono), len(cleaned))
+        return (wet * cleaned[:n] + (1.0 - wet) * vox_mono[:n]).astype(np.float32)
     except Exception as e:
         print(f"      [DeepFilter failed ({e}), using noisereduce]", flush=True)
         return _clean_vocal(vox_mono)
