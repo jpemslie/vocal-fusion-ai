@@ -783,6 +783,139 @@ def _deepfilter_clean(vox_mono: np.ndarray) -> np.ndarray:
         return _clean_vocal(vox_mono)
 
 
+def _phrase_gain_rider(vox: np.ndarray, inst: np.ndarray,
+                       presence_target: float = 0.52,
+                       min_silence_s: float = 0.15,
+                       ramp_s: float = 0.05) -> np.ndarray:
+    """
+    Phrase-level gain automation: assigns an independent gain to each vocal phrase
+    so every phrase sits at the target presence level relative to its local beat context.
+
+    A 'phrase' is a contiguous region of vocal energy above the noise floor,
+    separated from adjacent phrases by at least min_silence_s of silence.
+    Gain only changes at phrase boundaries (with a short ramp) — never mid-phrase.
+    This prevents the pumping / LRA-kill caused by per-window gain riding.
+
+    Why this beats _energy_match_envelope:
+      - That function used a 2s gaussian-smoothed window that tracked the beat's
+        energy continuously → vocal level rose and fell with the beat → pumping
+        artifact, and LRA collapsed from ~8 to ~2.5 LU on flat-energy EDM beats.
+      - This function detects actual silences, assigns ONE gain per phrase, and
+        only ramps at phrase boundaries (silence gaps). Gain is constant mid-phrase.
+
+    presence_target: vocal RMS / (vocal + beat RMS) target in 500-5000 Hz band
+    min_silence_s:   silence gaps shorter than this are absorbed into same phrase
+    ramp_s:          crossfade duration at phrase boundaries (inaudible transition)
+    """
+    hop = 512
+    win = 2048
+    n   = min(len(vox), len(inst))
+
+    # Mid-frequency band (500-5 kHz) — where vocal intelligibility lives
+    nyq = SR / 2.0
+    sos_hp = butter(4, 500.0 / nyq, btype="high", output="sos")
+    sos_lp = butter(4, 5000.0 / nyq, btype="low",  output="sos")
+
+    def _mid_rms_frames(y_mono: np.ndarray) -> np.ndarray:
+        band = sosfilt(sos_hp, sosfilt(sos_lp, y_mono, axis=0))
+        return librosa.feature.rms(y=band.astype(np.float32),
+                                   frame_length=win, hop_length=hop)[0]
+
+    vox_mono  = _to_mono(vox[:n])
+    inst_mono = _to_mono(inst[:n])
+    vox_f     = _mid_rms_frames(vox_mono)
+    inst_f    = _mid_rms_frames(inst_mono)
+    n_frames  = len(vox_f)
+
+    # ── Phrase detection ───────────────────────────────────────────────────────
+    active = vox_f > 1e-9
+    if not active.any():
+        return vox  # silence — nothing to do
+
+    noise_floor = float(np.percentile(vox_f[active], 15)) * 1.5
+    is_voiced   = vox_f > noise_floor
+
+    # Fill gaps shorter than min_silence_s (breath gaps within a phrase)
+    min_gap_frames = max(1, int(min_silence_s * SR / hop))
+    filled     = is_voiced.copy()
+    in_gap     = False
+    gap_start  = 0
+    for fi in range(n_frames):
+        if is_voiced[fi]:
+            if in_gap and (fi - gap_start) <= min_gap_frames:
+                filled[gap_start:fi] = True
+            in_gap = False
+        else:
+            if not in_gap:
+                gap_start = fi
+                in_gap    = True
+
+    # Collect phrase (start, end) pairs in frame coordinates
+    phrases: list = []
+    in_phrase = False
+    p_start   = 0
+    for fi in range(n_frames):
+        if filled[fi] and not in_phrase:
+            p_start   = fi
+            in_phrase = True
+        elif not filled[fi] and in_phrase:
+            phrases.append((p_start, fi))
+            in_phrase = False
+    if in_phrase:
+        phrases.append((p_start, n_frames))
+
+    if not phrases:
+        return vox
+
+    # ── Per-phrase gain computation ────────────────────────────────────────────
+    ctx_pad = max(1, int(0.2 * SR / hop))   # 200ms context around each phrase
+    phrase_gains: list = []
+    for (p0, p1) in phrases:
+        ctx0  = max(0, p0 - ctx_pad)
+        ctx1  = min(n_frames, p1 + ctx_pad)
+        v_rms = float(np.mean(vox_f[p0:p1])  + 1e-9)
+        i_rms = float(np.mean(inst_f[ctx0:ctx1]) + 1e-9)
+        # Solve for gain: gain * v / (gain * v + i) = target  →  gain = target * i / ((1-target) * v)
+        g = (presence_target * i_rms) / ((1.0 - presence_target) * v_rms)
+        phrase_gains.append(float(np.clip(g, 0.4, 3.5)))
+
+    # ── Build frame-level gain curve with ramps at phrase boundaries ───────────
+    gain_frames  = np.ones(n_frames, dtype=np.float32)
+    ramp_frames  = max(1, int(ramp_s * SR / hop))
+    for i, (p0, p1) in enumerate(phrases):
+        g            = phrase_gains[i]
+        phrase_len   = max(1, p1 - p0)
+        ri           = min(ramp_frames, phrase_len // 2)
+        ro_start     = max(p0 + ri, p1 - ri)
+        # ramp in
+        for fi in range(ri):
+            gain_frames[p0 + fi] = 1.0 + (g - 1.0) * (fi / ri)
+        # flat hold
+        gain_frames[p0 + ri : ro_start] = g
+        # ramp out
+        ro_len = p1 - ro_start
+        for fi in range(ro_len):
+            gain_frames[ro_start + fi] = g + (1.0 - g) * (fi / max(1, ro_len))
+
+    # Light gaussian smooth to remove any discontinuities at phrase edges
+    gain_frames = gaussian_filter1d(
+        gain_frames.astype(np.float64), sigma=2.0
+    ).astype(np.float32)
+
+    # ── Upsample to sample resolution ─────────────────────────────────────────
+    x_f      = np.arange(n_frames, dtype=np.float64) * hop
+    x_s      = np.arange(n,        dtype=np.float64)
+    gain_samp = np.interp(x_s, x_f, gain_frames).astype(np.float32)
+
+    if len(vox) > n:
+        gain_samp = np.concatenate([
+            gain_samp,
+            np.ones(len(vox) - n, dtype=np.float32)
+        ])
+
+    return (vox * gain_samp[:, np.newaxis]).astype(np.float32)
+
+
 def _energy_match_envelope(inst: np.ndarray, vox: np.ndarray,
                             target_ratio: float = 1.2,
                             window_s: float = 2.0) -> np.ndarray:
@@ -881,9 +1014,20 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         vr = _rms_mid(_to_mono(vox))
         vox_scaled = (vox * (ir * level_mult / (vr + 1e-9))).astype(np.float32)
 
+        # Phrase-level gain rider: each vocal phrase gets its own gain so that
+        # it sits at ~52% presence relative to the local beat energy.
+        # Unlike _energy_match_envelope (disabled: caused pumping on EDM beats),
+        # this only changes gain at silence gaps between phrases — never mid-phrase.
+        # Result: a quiet verse phrase is lifted, a loud chorus phrase is tamed,
+        # without any audible level pumping.
+        vox_scaled = _phrase_gain_rider(
+            vox_scaled, inst,
+            presence_target=float(np.mean([_ref_presence_lo, _ref_presence_hi])),
+        )
+
         # Note: _energy_match_envelope is intentionally disabled. For EDM/house beats
         # with flat energy envelopes, local tracking kills vocal LRA (was 2.5 LU).
-        # The static mid-RMS scalar above handles presence; iterative loop handles targeting.
+        # The phrase_gain_rider above is the replacement — phrase-aware, not window-aware.
 
         # Process instrumental — pass content-adaptive carve range from style
         inst_c = _adaptive_spectral_carve(
@@ -954,10 +1098,14 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         # Style-adaptive sidechain window: rap syllables are faster, need tighter tracking
         # Release stays constant (100ms) to prevent pumping between phrases
         sc_window_ms = int(np.interp(style.get("_rap_score", 0.5), [0, 1], [40, 15]))
+        # lookahead_ms=30: beat starts ducking 30ms before the vocal phrase hits.
+        # This is how professional mixing engineers anticipate vocal entries —
+        # without it, the duck always feels reactive/late.
         inst_c = _sidechain(inst_c, vox_scaled,
                             depth=sidechain_depth * style["sidechain_mult"],
                             window_ms=sc_window_ms,
-                            attack_ms=10.0, release_ms=100.0)
+                            attack_ms=10.0, release_ms=100.0,
+                            lookahead_ms=30.0)
 
         # Evaluate presence using mid-frequency RMS (500-5000 Hz).
         # CRITICAL: use original `inst` (pre-carve), NOT `inst_c` (post-carve).
@@ -3913,12 +4061,17 @@ def _parallel_compress_vocal(vox_ch: np.ndarray, rap_score: float = 0.5) -> np.n
 def _sidechain_envelope(vox_mono: np.ndarray, n_out: int,
                         depth: float, window_ms: int = 40,
                         attack_ms: float = 10.0,
-                        release_ms: float = 100.0) -> np.ndarray:
+                        release_ms: float = 100.0,
+                        lookahead_ms: float = 0.0) -> np.ndarray:
     """
     Compute per-sample sidechain gain curve (1.0 = no duck, < 1.0 = ducked).
 
     Separate attack/release smoothing prevents pumping at vocal phrase boundaries.
     Without it, the gain snaps back as soon as the RMS window drops — audible thump.
+
+    lookahead_ms: shift the duck curve earlier in time so the beat starts ducking
+    before the vocal phrase hits. Professional mixers do this by feel; 20-40ms is
+    transparent and makes the mix feel 'tight' rather than reactive.
 
     Research: 10ms attack, 80-120ms release = transparent hip-hop sidechain.
     """
@@ -3932,6 +4085,14 @@ def _sidechain_envelope(vox_mono: np.ndarray, n_out: int,
         for i in range(n_frames)
     ], dtype=np.float32)
     env /= _rms(vox_mono) + 1e-9
+
+    # Look-ahead: roll the envelope earlier so the duck anticipates the vocal
+    if lookahead_ms > 0.0:
+        la_frames = int(lookahead_ms * SR / 1000.0 / max(hop, 1))
+        if 0 < la_frames < n_frames:
+            env = np.roll(env, -la_frames)
+            env[-la_frames:] = env[-la_frames - 1]  # hold last value at tail
+
     target_gain = (1.0 - depth * np.clip(env, 0.0, 1.0)).astype(np.float64)
 
     # Attack/release smoothing in frame domain
@@ -3957,7 +4118,8 @@ def _sidechain_envelope(vox_mono: np.ndarray, n_out: int,
 
 def _sidechain(inst: np.ndarray, vox: np.ndarray,
                depth: float, window_ms: int = 40,
-               attack_ms: float = 10.0, release_ms: float = 100.0) -> np.ndarray:
+               attack_ms: float = 10.0, release_ms: float = 100.0,
+               lookahead_ms: float = 0.0) -> np.ndarray:
     """
     Broadband sidechain: duck everything above 200 Hz when vocal is loud.
 
@@ -3977,7 +4139,8 @@ def _sidechain(inst: np.ndarray, vox: np.ndarray,
 
     vox_mono = _to_mono(vox)
     gain = _sidechain_envelope(vox_mono, len(inst), depth, window_ms,
-                                attack_ms=attack_ms, release_ms=release_ms)
+                                attack_ms=attack_ms, release_ms=release_ms,
+                                lookahead_ms=lookahead_ms)
 
     return (inst_lo + inst_high * gain[:, np.newaxis]).astype(np.float32)
 
