@@ -773,13 +773,14 @@ def _smart_key_shift(n_semi: int, key_b_root: int, key_b_mode: str,
     return best, msg
 
 
-def _deepfilter_clean(vox_mono: np.ndarray, wet: float = 0.45) -> np.ndarray:
+def _deepfilter_clean(vox_mono: np.ndarray, wet: float = 0.20) -> np.ndarray:
     """
     Clean vocal stem using a wet/dry blend of DeepFilterNet + original signal.
 
     DeepFilterNet at 100% wet strips bleed but also removes vocal harmonics it
     classifies as noise — result sounds thin/metallic on music stems.
-    Blending at 45% wet removes enough bleed without killing harmonic body.
+    Blending at 20% wet (down from 45%) preserves harmonic body and HNR.
+    At 45%: HNR was 1.7 dB (heavily degraded harmonics). Target HNR >10 dB.
 
     Uses a module-level cached model so the network loads once per process.
     Falls back to noisereduce if DeepFilterNet is unavailable.
@@ -995,13 +996,28 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
     carve_db   = style["carve_db"]
 
     # ── Pre-mix bass management ────────────────────────────────────────────────
-    # House/EDM beats have +20-25 dB of bass vs mids.
-    # Two-band approach: harder sub cut (<80 Hz) + medium bass cut (80-350 Hz)
-    # Target: bring bass vs mid from +17 to +15, lo-mid vs mid from +9 to +8.
+    # Pre-mix bass management: reduce low-end of the instrumental so the vocal
+    # has room without the beat's sub overwhelming it.
+    # Cut depth is reference-profile-driven: if the reference has hot sub (like
+    # Drake at -15.5 dBFS) we cut less — only -3 dB. For generic/unknown profiles
+    # we use -6 dB. The old -9 dB was tuned for EDM and was stripping 6-7 dB of
+    # sub from hip-hop beats where sub should stay punchy.
     nyq_m = SR / 2.0
+    _bass_cut_db = -6.0  # default
+    if _MASTER_REF_PROFILE is not None:
+        try:
+            _ref_sub_median = float(
+                _MASTER_REF_PROFILE.get("bands", {}).get("sub", {}).get("median", -20.0)
+            )
+            if _ref_sub_median > -17.0:   # hot sub reference (Drake = -15.5)
+                _bass_cut_db = -3.0       # preserve sub punch
+            elif _ref_sub_median > -20.0: # moderate sub
+                _bass_cut_db = -5.0
+        except Exception:
+            pass
     sos_bass_cut = butter(4, 350.0 / nyq_m, btype="low", output="sos")
     bass_band = sosfilt(sos_bass_cut, inst, axis=0).astype(np.float32)
-    inst = (inst - bass_band * (1.0 - 10**(-9.0/20.0))).astype(np.float32)  # -9 dB on <350 Hz
+    inst = (inst - bass_band * (1.0 - 10**(_bass_cut_db/20.0))).astype(np.float32)
 
     # Use reference profile to set presence target if available
     _ref_presence_lo = 0.45
@@ -4626,12 +4642,17 @@ def _master(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     # Re-normalize to enforce exact -12 LUFS target.
     # The limiter + post-norm EQ + glue comp can drift the final LUFS by ±2 LU.
     # A second LUFS pass locks it in before return.
-    # Safety: run a final limiter instead of hard-clip — hard-clip removes transient
-    # energy which reduces LUFS back below -12 (observed: -15.3 instead of -12).
+    # IMPORTANT: do NOT use a second Limiter here — a full Limiter after normalize
+    # reduces dynamic peaks → LUFS drops 2-3 LU below target (observed: -15.6).
+    # Instead use a simple peak-ceiling scale: if peaks exceed -0.3 dBFS after
+    # the normalize, scale the whole signal linearly so max peak == -0.3 dBFS.
+    # Linear scale preserves LUFS (no dynamic range reduction).
     try:
         mix = _lufs_normalize(mix, _profile_lufs_target("radio"))
-        final_lim = Pedalboard([Limiter(threshold_db=-0.5, release_ms=30.0)])
-        mix = final_lim(mix.T.astype(np.float32), SR).T.astype(np.float32)
+        tp_ceil = 10 ** (-0.3 / 20.0)  # -0.3 dBFS true-peak ceiling
+        tp = float(np.max(np.abs(mix)))
+        if tp > tp_ceil:
+            mix = (mix * (tp_ceil / tp)).astype(np.float32)
     except Exception:
         pass  # if loudnorm fails for any reason, keep existing mix
     return mix
