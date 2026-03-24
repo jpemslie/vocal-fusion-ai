@@ -65,6 +65,18 @@ try:
 except Exception:
     HAS_DEEPFILTER = False
 
+# Cache the DeepFilterNet model so it's loaded once per process, not per call
+_DF_MODEL_CACHE: tuple | None = None  # (model, df_state)
+
+def _get_df_model():
+    """Return cached (model, df_state), initializing on first call."""
+    global _DF_MODEL_CACHE
+    if _DF_MODEL_CACHE is None:
+        print("      [DeepFilter] Loading model (first call)…", flush=True)
+        model, df_state, _ = _df_init_df()
+        _DF_MODEL_CACHE = (model, df_state)
+    return _DF_MODEL_CACHE
+
 SR = 44100
 _MBR_VOCAL      = "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt"  # Mel-Band RoFormer vocal (SDR ~11.4) — primary
 _BS_ROFORMER    = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"         # BS-Roformer vocal (SDR ~12.97) — secondary fallback
@@ -763,19 +775,25 @@ def _smart_key_shift(n_semi: int, key_b_root: int, key_b_mode: str,
 
 def _deepfilter_clean(vox_mono: np.ndarray) -> np.ndarray:
     """
-    Clean vocal stem using DeepFilterNet (neural noise suppression) if available.
-    Handles musical noise and bleed artifacts far better than spectral gating.
-    Falls back to noisereduce if DeepFilterNet is not installed.
+    Clean vocal stem using DeepFilterNet (neural noise suppression).
+
+    Neural approach: understands speech/vocal structure vs noise. Removes residual
+    drum bleed, hi-hat smear, and room tone left by stem separation far more
+    cleanly than spectral gating (noisereduce), which leaves 'musical noise'
+    artifacts when bleed is tonal.
+
+    Uses a module-level cached model so the network loads once per process.
+    Falls back to noisereduce if DeepFilterNet is unavailable.
     """
     if not HAS_DEEPFILTER:
         return _clean_vocal(vox_mono)
 
     try:
         import soxr
-        model, df_state, _ = _df_init_df()
-        # DeepFilterNet expects 48 kHz
+        model, df_state = _get_df_model()
+        # DeepFilterNet expects 48 kHz mono float32
         vox_48k = soxr.resample(vox_mono.astype(np.float32), SR, 48000).astype(np.float32)
-        t = _torch.from_numpy(vox_48k).unsqueeze(0)
+        t        = _torch.from_numpy(vox_48k).unsqueeze(0)
         enhanced = enhance(model, df_state, t).squeeze(0).numpy()
         return soxr.resample(enhanced, 48000, SR).astype(np.float32)
     except Exception as e:
@@ -3688,15 +3706,18 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # (samples, 2) → (2, samples) for pedalboard / pyrubberband
     vox_ch = vox.T.astype(np.float32)
 
-    # Stage 0: Spectral noise reduction — remove residual stem-separation bleed.
-    # The Wiener mask handles bins where instrumental dominates.
-    # noisereduce (prop_decrease=0.55) handles the noise floor left behind.
-    # NaN guard: noisereduce can produce NaN in silent/zero regions (divide-by-zero
-    # in spectral gating) — replace with 0 before any further processing.
+    # Stage 0: Neural vocal cleaning via DeepFilterNet.
+    # Removes residual drum bleed, hi-hat smear, and room tone left by stem
+    # separation. Neural approach understands speech structure and removes only
+    # what isn't vocal — far cleaner than spectral gating which leaves 'musical
+    # noise' when bleed is tonal (e.g. piano notes bleeding into the vocal stem).
+    # Falls back to noisereduce if DeepFilterNet is unavailable.
+    # NaN guard: apply after cleaning in case silent regions produce NaN.
     vox_ch = np.stack([
-        np.nan_to_num(_clean_vocal(vox_ch[c]), nan=0.0, posinf=0.0, neginf=0.0)
+        np.nan_to_num(_deepfilter_clean(vox_ch[c]), nan=0.0, posinf=0.0, neginf=0.0)
         for c in range(vox_ch.shape[0])
     ], axis=0)
+    print("      [Stage 0] DeepFilterNet vocal cleaning applied.", flush=True)
 
     # Stage 0.5: HPSS harmonic masking — removes hi-hat/percussive bleed.
     # Hi-hats are percussive (vertical in spectrogram); vocals are harmonic (horizontal).
