@@ -5078,6 +5078,17 @@ def fuse(song_a: str, song_b: str, out_path: str,
     if not pf["pass"]:
         raise RuntimeError("Pre-flight check failed: " + " | ".join(pf["warnings"]))
 
+    # Preload DeepFilterNet model BEFORE stem separation.
+    # Demucs (used in separate()) initializes torch internally. If DeepFilterNet
+    # then tries to load its model AFTER Demucs has run, torch re-initialization
+    # causes a semaphore leak / segfault (exit 139). Loading it first keeps torch
+    # in a stable state throughout the entire pipeline.
+    if HAS_DEEPFILTER:
+        try:
+            _get_df_model()
+        except Exception as _e:
+            print(f"      [DeepFilter preload failed: {_e}] — will retry at vocal stage", flush=True)
+
     sep_model = "BS-Roformer" if _has_gpu() else "MDX-Net Kim Vocal 2→Demucs fallback"
     step(4, TOTAL, f"Separating stems — Song A (instrumental) via {sep_model}…")
     stems_a = separate(song_a, stems_cache, upgrade_vocal=False)  # beat — no vocal needed
