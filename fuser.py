@@ -2922,9 +2922,177 @@ def _groove_quantize(vox: np.ndarray, inst_mono: np.ndarray,
         return vox
 
 
+def _detect_first_downbeat(y_mono: np.ndarray, bpm: float, sr: int = SR) -> float:
+    """
+    Detect the time offset (seconds) of the first genuine bar-1 downbeat in the
+    instrumental.  Returns 0.0 on failure or if detection is unreliable.
+
+    Algorithm:
+      1. Get beat times from librosa.
+      2. Try all four bar phases (which beat in a 4-beat cycle is beat 1) and score
+         each phase by the mean onset-strength at its downbeat positions.
+      3. Return the first downbeat time of the winning phase.
+    """
+    try:
+        _, beats = librosa.beat.beat_track(
+            y=y_mono, sr=sr, hop_length=512, bpm=bpm, units='time'
+        )
+        beats = np.asarray(beats, dtype=np.float64)
+        if len(beats) < 8:
+            return 0.0
+
+        beat_period = float(np.median(np.diff(beats)))
+        if beat_period <= 0:
+            return 0.0
+
+        oenv = librosa.onset.onset_strength(y=y_mono, sr=sr, hop_length=512)
+        oenv_times = librosa.frames_to_time(
+            np.arange(len(oenv)), sr=sr, hop_length=512
+        )
+
+        best_phase = 0
+        best_score = -1.0
+        for phase in range(4):
+            downbeats = beats[phase::4]
+            if len(downbeats) == 0:
+                continue
+            # For each downbeat time, find nearest oenv frame index
+            strengths = []
+            for db_t in downbeats:
+                idx = int(np.argmin(np.abs(oenv_times - db_t)))
+                strengths.append(float(oenv[idx]))
+            score = float(np.mean(strengths))
+            if score > best_score:
+                best_score = score
+                best_phase = phase
+
+        first_downbeat = float(beats[best_phase])
+
+        # Sanity check: reject if the result is more than 8 bars from the start
+        max_allowed = beat_period * 4 * 8  # 8 bars
+        if first_downbeat > max_allowed:
+            print(f"      [Downbeat] Detected offset {first_downbeat:.3f}s exceeds "
+                  f"8-bar window ({max_allowed:.3f}s) — using 0.0", flush=True)
+            return 0.0
+
+        print(f"      [Downbeat] First bar-1 downbeat at {first_downbeat:.3f}s "
+              f"(phase={best_phase}, score={best_score:.3f})", flush=True)
+        return first_downbeat
+
+    except Exception as e:
+        print(f"      [Downbeat] Detection failed ({e}), using 0.0", flush=True)
+        return 0.0
+
+
+def _align_vocal_phase(vox: np.ndarray, inst_mono: np.ndarray,
+                       bpm: float, downbeat_offset: float,
+                       sr: int = SR) -> np.ndarray:
+    """
+    Fallback phrase-level alignment used when section detection did not produce
+    usable beat_secs / vox_secs data.
+
+    Finds the first genuine vocal phrase onset, then shifts the vocal so that
+    onset lands on the nearest 2-bar boundary of the instrumental's bar grid.
+
+    Returns the aligned vocal array (stereo, same dtype as input; may be shorter
+    than the original if leading silence was trimmed).
+    """
+    try:
+        original_len = len(vox)
+        vox_mono = _to_mono(vox)
+
+        # ── Find first vocal phrase start ──────────────────────────────────────
+        energy = librosa.feature.rms(
+            y=vox_mono, hop_length=512, frame_length=2048
+        )[0]
+        threshold = float(energy.max()) * 0.08
+        voiced_frames = np.where(energy > threshold)[0]
+
+        if len(voiced_frames) < 8:
+            print("      [PhaseAlign] Too few voiced frames — skipping", flush=True)
+            return vox
+
+        # Find first run of 8+ consecutive voiced frames
+        run_start = None
+        run_len = 1
+        for i in range(1, len(voiced_frames)):
+            if voiced_frames[i] == voiced_frames[i - 1] + 1:
+                run_len += 1
+                if run_len >= 8 and run_start is None:
+                    run_start = voiced_frames[i - 7]
+            else:
+                run_len = 1
+
+        if run_start is None:
+            print("      [PhaseAlign] No sustained voiced run found — skipping", flush=True)
+            return vox
+
+        vox_start_s = float(run_start) * 512.0 / sr
+        vox_start_sample = int(run_start * 512)
+
+        # ── Find nearest 2-bar boundary on the beat grid ───────────────────────
+        bar_s = 60.0 / max(bpm, 40.0) * 4.0
+        two_bar_s = bar_s * 2.0
+        bar_positions = [
+            downbeat_offset + n * two_bar_s
+            for n in range(200)
+        ]
+
+        nearest_bar = min(bar_positions, key=lambda b: abs(b - vox_start_s))
+        target_bar_s = nearest_bar
+
+        offset_s = target_bar_s - vox_start_s
+        offset_samples = int(offset_s * sr)
+
+        # Safety: skip if shift is unreasonably large
+        if abs(offset_samples) > sr * 16:
+            print(f"      [PhaseAlign] Offset {offset_s:.2f}s exceeds 16s safety limit "
+                  f"— skipping", flush=True)
+            return vox
+
+        print(f"      [PhaseAlign] vox_start={vox_start_s:.3f}s  "
+              f"target_bar={target_bar_s:.3f}s  "
+              f"shift={offset_s:+.3f}s ({offset_samples:+d} samples)", flush=True)
+
+        stereo = vox.ndim == 2
+        n_ch = vox.shape[1] if stereo else 1
+
+        if offset_samples > 0:
+            # Prepend silence — vocal starts later
+            pad = np.zeros((offset_samples, n_ch), dtype=np.float32) if stereo \
+                  else np.zeros(offset_samples, dtype=np.float32)
+            vox_aligned = np.concatenate([pad, vox], axis=0)
+
+        elif offset_samples < 0:
+            trim = abs(offset_samples)
+            if trim < vox_start_sample:
+                # Safe to trim: removes only leading silence
+                vox_aligned = vox[trim:]
+            else:
+                # Trim would cut into voiced content — pad by one bar instead
+                next_bar_samples = int(two_bar_s * sr)
+                pad = np.zeros((next_bar_samples, n_ch), dtype=np.float32) if stereo \
+                      else np.zeros(next_bar_samples, dtype=np.float32)
+                vox_aligned = np.concatenate([pad, vox], axis=0)
+                print("      [PhaseAlign] Trim would cut voiced content — "
+                      "padding to next bar instead", flush=True)
+        else:
+            vox_aligned = vox  # already aligned
+
+        # Trim back to original length (don't extend beyond the mix window)
+        vox_aligned = vox_aligned[:original_len]
+
+        return vox_aligned.astype(np.float32)
+
+    except Exception as e:
+        print(f"      [PhaseAlign] Failed ({e}) — returning original vocal", flush=True)
+        return vox
+
+
 def _build_mashup_arrangement(vox: np.ndarray, vox_secs: list,
                                beat_secs: list, bpm: float,
-                               sr: int = SR) -> np.ndarray:
+                               sr: int = SR,
+                               downbeat_offset: float = 0.0) -> np.ndarray:
     """
     Build a professional song arrangement from scratch.
 
@@ -3004,11 +3172,12 @@ def _build_mashup_arrangement(vox: np.ndarray, vox_secs: list,
                   f"{beat_sec['start_s']:.0f}s → silence (beat-only intro)", flush=True)
             continue
 
-        # Snap beat section start to the nearest bar boundary.
-        # Reject snap if it overshoots more than half a bar (relative threshold,
-        # replaces the old hardcoded 0.5s which broke on fast BPMs).
-        bars = round(beat_sec['start_s'] / bar_s)
-        snapped_s = bars * bar_s
+        # Snap beat section start to the nearest bar boundary, accounting for
+        # the true bar-1 origin (downbeat_offset).  When downbeat_offset=0.0
+        # the behaviour is identical to the previous implementation.
+        bars = round((beat_sec['start_s'] - downbeat_offset) / bar_s)
+        snapped_s = downbeat_offset + bars * bar_s
+        snapped_s = max(snapped_s, 0.0)  # never go negative
         if snapped_s >= beat_sec['end_s'] - bar_s * 0.5:
             snapped_s = beat_sec['start_s']
 
@@ -5494,6 +5663,13 @@ def fuse(song_a: str, song_b: str, out_path: str,
     L = min(len(inst), len(vox))
     inst, vox = inst[:L], vox[:L]
 
+    # ── Detect true bar-1 downbeat in instrumental for phase-accurate grid ─────
+    print("      Detecting instrumental downbeat…", flush=True)
+    _downbeat_offset = _detect_first_downbeat(_to_mono(inst), bpm_a)
+    print(f"      Bar 1 downbeat at {_downbeat_offset:.3f}s "
+          f"({'%.0f' % (_downbeat_offset * bpm_a / 60)} beats from start)",
+          flush=True)
+
     # ── Detect sections in both stems ──────────────────────────────────────────
     print("      Detecting sections for song construction…", flush=True)
     beat_secs = _detect_all_sections(_to_mono(inst))
@@ -5515,8 +5691,15 @@ def fuse(song_a: str, song_b: str, out_path: str,
     # timing artifacts and fell back to unordered overlay 40% of the time.
     if beat_secs and vox_secs:
         print("      [Song Builder] Building song arrangement…", flush=True)
-        vox_built = _build_mashup_arrangement(vox, vox_secs, beat_secs, bpm_a, sr=SR)
+        vox_built = _build_mashup_arrangement(
+            vox, vox_secs, beat_secs, bpm_a, sr=SR,
+            downbeat_offset=_downbeat_offset
+        )
         vox = vox_built
+    else:
+        print("      [Section detection incomplete — applying phrase-level alignment]",
+              flush=True)
+        vox = _align_vocal_phase(vox, _to_mono(inst), bpm_a, _downbeat_offset)
 
     # ── Arrangement gain curves (dynamic section automation) ───────────────────
     if beat_secs or vox_secs:
