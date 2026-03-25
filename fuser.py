@@ -3377,15 +3377,15 @@ def _assess_stem_quality(vox: np.ndarray, inst: np.ndarray) -> dict:
     # Map metrics → recommended processing parameters
     if bleed_ratio > 0.25:     # heavy bleed (e.g. Demucs on complex EDM)
         wiener_floor   = 0.08
-        nr_strength    = 0.40
+        nr_strength    = 0.08   # was 0.40 — at 0.40 noisereduce strips vocal harmonics → HNR 0.6 dB
         bleed_level    = "high"
     elif bleed_ratio > 0.12:   # medium bleed
         wiener_floor   = 0.14
-        nr_strength    = 0.25
+        nr_strength    = 0.05   # was 0.25 — gentle touch only
         bleed_level    = "medium"
     else:                       # clean stem (MDX-Net upgrade successful)
         wiener_floor   = 0.20
-        nr_strength    = 0.15
+        nr_strength    = 0.03   # was 0.15 — near-zero on clean stems
         bleed_level    = "low"
 
     # Low vocal confidence → cap FET ratio to avoid crushing already-thin vocal
@@ -3735,7 +3735,7 @@ def _clean_vocal(vox_mono: np.ndarray) -> np.ndarray:
     return nr.reduce_noise(
         y=vox_mono, sr=SR,
         stationary=False,
-        prop_decrease=0.40,   # increased from 0.15 — deephouse/EDM bleed (hi-hat artifacts) needs stronger reduction
+        prop_decrease=0.06,   # was 0.40 — high values strip vocal harmonics and destroy HNR
         n_fft=2048,
     ).astype(np.float32)
 
