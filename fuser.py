@@ -787,27 +787,62 @@ def _deepfilter_clean(vox_mono: np.ndarray, wet: float = 0.20) -> np.ndarray:
     """
     Clean vocal stem using a wet/dry blend of DeepFilterNet + original signal.
 
-    DeepFilterNet at 100% wet strips bleed but also removes vocal harmonics it
-    classifies as noise — result sounds thin/metallic on music stems.
-    Blending at 20% wet (down from 45%) preserves harmonic body and HNR.
-    At 45%: HNR was 1.7 dB (heavily degraded harmonics). Target HNR >10 dB.
-
-    Uses a module-level cached model so the network loads once per process.
-    Falls back to noisereduce if DeepFilterNet is unavailable.
+    Runs in an isolated subprocess so a torch segfault cannot kill the server.
+    Blending at 20% wet preserves harmonic body (HNR). Falls back to noisereduce
+    on any failure (timeout, crash, invalid output).
     """
     if not HAS_DEEPFILTER:
         return _clean_vocal(vox_mono)
 
     try:
-        import soxr
-        model, df_state = _get_df_model()
-        # DeepFilterNet expects 48 kHz mono float32
-        vox_48k  = soxr.resample(vox_mono.astype(np.float32), SR, 48000).astype(np.float32)
-        t        = _torch.from_numpy(vox_48k).unsqueeze(0)
-        enhanced = enhance(model, df_state, t).squeeze(0).numpy()
-        cleaned  = soxr.resample(enhanced, 48000, SR).astype(np.float32)
-        n = min(len(vox_mono), len(cleaned))
-        return (wet * cleaned[:n] + (1.0 - wet) * vox_mono[:n]).astype(np.float32)
+        import sys as _sys_df, tempfile as _tmp_df, subprocess as _sp_df
+        import soundfile as _sf_df
+
+        with _tmp_df.NamedTemporaryFile(suffix=".wav", delete=False) as _f_in:
+            _df_in = _f_in.name
+        with _tmp_df.NamedTemporaryFile(suffix=".wav", delete=False) as _f_out:
+            _df_out = _f_out.name
+
+        _sf_df.write(_df_in, vox_mono, SR, subtype="PCM_24")
+
+        _df_script = (
+            "import sys, numpy as np, soundfile as sf, soxr\n"
+            "from df.enhance import enhance, init_df\n"
+            "vox, sr = sf.read(sys.argv[1])\n"
+            "vox = vox.astype(np.float32)\n"
+            "model, df_state, _ = init_df()\n"
+            "import torch\n"
+            "vox_48k = soxr.resample(vox, sr, 48000).astype(np.float32)\n"
+            "t = torch.from_numpy(vox_48k).unsqueeze(0)\n"
+            "enhanced = enhance(model, df_state, t).squeeze(0).numpy()\n"
+            "cleaned = soxr.resample(enhanced, 48000, sr).astype(np.float32)\n"
+            "sf.write(sys.argv[2], cleaned, sr, subtype='PCM_24')\n"
+        )
+
+        _proc = _sp_df.run(
+            [_sys_df.executable, "-c", _df_script, _df_in, _df_out],
+            capture_output=True, text=True, timeout=60,
+        )
+
+        result = vox_mono  # default: return original
+        if _proc.returncode == 0:
+            _cleaned, _ = _sf_df.read(_df_out)
+            _cleaned = _cleaned.astype(np.float32)
+            n = min(len(vox_mono), len(_cleaned))
+            if n > 0 and np.isfinite(_cleaned).all():
+                result = (wet * _cleaned[:n] + (1.0 - wet) * vox_mono[:n]).astype(np.float32)
+                print("      [DeepFilter] Subprocess enhancement done.", flush=True)
+            else:
+                print("      [DeepFilter] Invalid output — skipping.", flush=True)
+        else:
+            print(f"      [DeepFilter] Subprocess failed (rc={_proc.returncode}) — skipping.", flush=True)
+
+        try:
+            os.unlink(_df_in); os.unlink(_df_out)
+        except OSError:
+            pass
+        return result
+
     except Exception as e:
         print(f"      [DeepFilter failed ({e}), using noisereduce]", flush=True)
         return _clean_vocal(vox_mono)
@@ -5081,17 +5116,6 @@ def fuse(song_a: str, song_b: str, out_path: str,
     _save_fp(fid_a, stems_cache, {"genre_sim_with_last_b": pf.get("genre_sim", 0.5)})
     if not pf["pass"]:
         raise RuntimeError("Pre-flight check failed: " + " | ".join(pf["warnings"]))
-
-    # Preload DeepFilterNet model BEFORE stem separation.
-    # Demucs (used in separate()) initializes torch internally. If DeepFilterNet
-    # then tries to load its model AFTER Demucs has run, torch re-initialization
-    # causes a semaphore leak / segfault (exit 139). Loading it first keeps torch
-    # in a stable state throughout the entire pipeline.
-    if HAS_DEEPFILTER:
-        try:
-            _get_df_model()
-        except Exception as _e:
-            print(f"      [DeepFilter preload failed: {_e}] — will retry at vocal stage", flush=True)
 
     sep_model = "BS-Roformer" if _has_gpu() else "MDX-Net Kim Vocal 2→Demucs fallback"
     step(4, TOTAL, f"Separating stems — Song A (instrumental) via {sep_model}…")
