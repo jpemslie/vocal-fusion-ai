@@ -994,7 +994,7 @@ def _energy_match_envelope(inst: np.ndarray, vox: np.ndarray,
 
 def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
                    style: dict, sidechain_depth: float,
-                   bpm_a: float, max_iter: int = 3) -> np.ndarray:
+                   bpm_a: float, max_iter: int = 8) -> np.ndarray:
     """
     Closed-loop mixer: produce a mix, evaluate vocal presence,
     adjust level multiplier, repeat until target is met.
@@ -1043,6 +1043,7 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         except Exception:
             pass
 
+    prev_presence = None
     for iteration in range(max_iter):
         # Apply energy-envelope matching then static scalar
         # Presence check uses MID-FREQUENCY RMS (500-5000 Hz) — not full-band.
@@ -1164,6 +1165,11 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
 
         print(f"      Mix iter {iteration+1}: presence={vp:.0%}  "
               f"level_mult={level_mult:.2f}  carve={carve_db:.1f}dB", flush=True)
+
+        if prev_presence is not None and abs(vp - prev_presence) < 0.004:
+            print(f"      Mix iter {iteration+1}: presence delta < 0.4pp — converged, stopping early.", flush=True)
+            break
+        prev_presence = vp
 
         if _ref_presence_lo <= vp <= _ref_presence_hi or iteration == max_iter - 1:
             break
@@ -4737,11 +4743,10 @@ def _master_club(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     post_eq = Pedalboard([HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-2.5)])
     mix = post_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
-    limiter = Pedalboard([Limiter(threshold_db=-1.0, release_ms=40.0)])
-    mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
-    clip_ceil = 10 ** (-1.0 / 20.0)
-    if float(np.max(np.abs(mix))) > clip_ceil:
-        mix = np.clip(mix, -clip_ceil, clip_ceil).astype(np.float32)
+    tp_ceil = 10 ** (-0.3 / 20.0)
+    tp = float(np.max(np.abs(mix)))
+    if tp > tp_ceil:
+        mix = (mix * (tp_ceil / tp)).astype(np.float32)
     return mix
 
 
@@ -4813,11 +4818,10 @@ def _master_intimate(mix: np.ndarray, bpm: float = 120.0) -> np.ndarray:
     post_eq = Pedalboard([HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=-1.5)])
     mix = post_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
-    limiter = Pedalboard([Limiter(threshold_db=-1.5, release_ms=60.0)])
-    mix = limiter(mix.T.astype(np.float32), SR).T.astype(np.float32)
-    clip_ceil = 10 ** (-1.5 / 20.0)
-    if float(np.max(np.abs(mix))) > clip_ceil:
-        mix = np.clip(mix, -clip_ceil, clip_ceil).astype(np.float32)
+    tp_ceil = 10 ** (-0.3 / 20.0)
+    tp = float(np.max(np.abs(mix)))
+    if tp > tp_ceil:
+        mix = (mix * (tp_ceil / tp)).astype(np.float32)
     return mix
 
 
@@ -5239,7 +5243,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
                 )
                 _re_proc = _sp.run(
                     [_sys_re.executable, "-c", _re_script, _re_in, _re_out],
-                    capture_output=True, text=True, timeout=600,
+                    capture_output=True, text=True, timeout=45,
                 )
                 if _re_proc.returncode == 0:
                     _vox_enh, _ = sf.read(_re_out, always_2d=True)
