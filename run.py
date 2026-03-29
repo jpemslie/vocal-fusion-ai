@@ -29,16 +29,46 @@ _jobs: dict = {}
 _lock = threading.Lock()
 
 
-def _run_fuse(job_id: str, path_a: str, path_b: str, out_path: str) -> None:
+def _run_fuse(job_id: str, path_a: str, path_b: str, out_path: str,
+              direct_vocal: bool = False) -> None:
+    import time
+
     def on_progress(step, total, msg):
         with _lock:
             _jobs[job_id]["progress"] = int(step / total * 100)
             _jobs[job_id]["message"] = msg
+            # Mark previous step done, current step running
+            steps = _jobs[job_id]["steps"]
+            for s in steps:
+                if s["n"] < step and s["status"] == "running":
+                    s["status"] = "done"
+                    s["elapsed"] = round(time.time() - s.get("_started", time.time()), 1)
+            # Find or create current step
+            existing = next((s for s in steps if s["n"] == step), None)
+            if not existing:
+                steps.append({"n": step, "status": "running", "title": msg,
+                               "details": {}, "_started": time.time(), "elapsed": None})
+            else:
+                existing["status"] = "running"
+                existing["title"] = msg
+                existing.setdefault("_started", time.time())
+
+    def on_step_details(step_n, data):
+        with _lock:
+            steps = _jobs[job_id]["steps"]
+            existing = next((s for s in steps if s["n"] == step_n), None)
+            if existing:
+                existing["details"] = data
+            else:
+                steps.append({"n": step_n, "status": "running", "title": "",
+                               "details": data, "_started": __import__('time').time(), "elapsed": None})
 
     try:
         result = fuse(path_a, path_b, out_path,
                       stems_cache=str(STEMS_DIR),
-                      progress_cb=on_progress)
+                      progress_cb=on_progress,
+                      step_details_cb=on_step_details,
+                      direct_vocal=direct_vocal)
 
         # result is a dict {"radio": path, "club": path, "intimate": path}
         # or a plain string (backward compat)
@@ -60,6 +90,10 @@ def _run_fuse(job_id: str, path_a: str, path_b: str, out_path: str) -> None:
             variants["intimate"] = f"/output/{Path(intimate_path).name}"
 
         with _lock:
+            # Mark all steps done on completion
+            for s in _jobs[job_id]["steps"]:
+                if s["status"] == "running":
+                    s["status"] = "done"
             _jobs[job_id].update(
                 status="done",
                 progress=100,
@@ -86,6 +120,10 @@ def fuse_route():
     if not file_a or not file_b:
         return jsonify(error="Upload both song_a and song_b"), 400
 
+    # direct_vocal=true means song_b is a clean phone recording (M4A/WAV/etc.)
+    # — skips Demucs stem separation on the vocal track.
+    direct_vocal = request.form.get("direct_vocal", "false").lower() in ("1", "true", "yes")
+
     job_id = uuid.uuid4().hex[:8]
     path_a = str(UPLOAD_DIR / f"{job_id}_a{Path(file_a.filename).suffix}")
     path_b = str(UPLOAD_DIR / f"{job_id}_b{Path(file_b.filename).suffix}")
@@ -99,10 +137,12 @@ def fuse_route():
             "status": "running", "progress": 0, "message": "Starting…",
             "name_a": Path(file_a.filename).stem,
             "name_b": Path(file_b.filename).stem,
+            "direct_vocal": direct_vocal,
+            "steps": [],
         }
 
     t = threading.Thread(
-        target=_run_fuse, args=(job_id, path_a, path_b, out_path), daemon=True
+        target=_run_fuse, args=(job_id, path_a, path_b, out_path, direct_vocal), daemon=True
     )
     t.start()
     return jsonify(job_id=job_id)
@@ -112,7 +152,14 @@ def fuse_route():
 def status(job_id: str):
     with _lock:
         job = _jobs.get(job_id)
-    return (jsonify(job), 200) if job else (jsonify(error="Unknown job"), 404)
+    if not job:
+        return jsonify(error="Unknown job"), 404
+    # Strip internal timing keys before sending to client
+    import copy
+    clean = copy.deepcopy(job)
+    for s in clean.get("steps", []):
+        s.pop("_started", None)
+    return jsonify(clean), 200
 
 
 @app.route("/share/<job_id>")
