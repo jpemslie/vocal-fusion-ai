@@ -1493,17 +1493,24 @@ if chosen and chosen.exists():
 else:
     print("      [Roformer] No usable output file found", flush=True)
 """
-    # System 4: Watchdog thread — kills subprocess if tmp_dir is stale for >3 min.
-    # Without this, audio-separator can hang mid-chunk (MPS/ONNX deadlock) and
-    # never exit, blocking the entire fuse for 40 minutes.
-    _STALE_LIMIT = 180   # seconds with no new output file activity → kill
+    # System 4: Watchdog thread — kills subprocess if it HANGS (no CPU activity).
+    # The old file-based stale check killed long-running CPU models like Mel-Roformer
+    # (45s/chunk × 20 chunks = 15 min) which write output only at the very end.
+    # New approach: distinguish "slow but working" from "hung".
+    #   - File activity stale limit: 1800s (30 min) for pure file monitoring
+    #   - CPU activity: if psutil available, kill if CPU% < 2% for > 60s (true hang)
+    #   - Hard ceiling: 40 min regardless
+    _STALE_LIMIT = 1800  # 30 min file-activity window — long enough for any RoFormer run
 
     def _watchdog(proc, watch_dir: Path, stale_s: int):
         last_activity = time.time()
+        # Track CPU-idle stretches (true hang = no CPU for >60s)
+        _cpu_idle_since = None
+        _CPU_HANG_LIMIT = 90  # seconds of <2% CPU → assume hung
         while proc.poll() is None:
             time.sleep(20)
             try:
-                # Any WAV or flag written to the tmp dir counts as activity
+                # File activity check
                 latest_mtime = max(
                     (f.stat().st_mtime for f in watch_dir.iterdir()
                      if f.suffix in (".wav", ".flag")),
@@ -1511,8 +1518,31 @@ else:
                 )
                 if latest_mtime > last_activity:
                     last_activity = latest_mtime
+
+                # CPU activity check — only kill if clearly hung (no CPU for >90s)
+                _cpu_active = True
+                try:
+                    import psutil as _ps
+                    _p = _ps.Process(proc.pid)
+                    _cpu = _p.cpu_percent(interval=1.0)
+                    if _cpu < 2.0:
+                        if _cpu_idle_since is None:
+                            _cpu_idle_since = time.time()
+                        elif time.time() - _cpu_idle_since > _CPU_HANG_LIMIT:
+                            _cpu_active = False
+                    else:
+                        _cpu_idle_since = None  # reset: process is working
+                except Exception:
+                    pass  # psutil unavailable — fall back to file-only check
+
+                if not _cpu_active:
+                    print(f"      [{model_name}] watchdog: CPU hung for {_CPU_HANG_LIMIT}s"
+                          " — killing stalled subprocess", flush=True)
+                    proc.kill()
+                    return
+
                 if time.time() - last_activity > stale_s and proc.poll() is None:
-                    print(f"      [{model_name}] watchdog: no activity for {stale_s}s"
+                    print(f"      [{model_name}] watchdog: no file activity for {stale_s}s"
                           " — killing stalled subprocess", flush=True)
                     proc.kill()
                     return
@@ -5008,7 +5038,8 @@ def _reference_eq(y: np.ndarray, sr: int, profile: dict, max_db: float = 3.0) ->
     return corrected.astype(np.float32)
 
 
-def _master(mix: np.ndarray, bpm: float = 120.0, sub_cut_db: float = 0.0) -> np.ndarray:
+def _master(mix: np.ndarray, bpm: float = 120.0, sub_cut_db: float = 0.0,
+            lufs_target: float | None = None) -> np.ndarray:
     """
     Mastering chain (v6):
       M/S EQ → mastering EQ → soft clip → glue comp → sub-bass limiter
@@ -5107,15 +5138,35 @@ def _master(mix: np.ndarray, bpm: float = 120.0, sub_cut_db: float = 0.0) -> np.
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
-    # Sub-cut correction EQ — applied when listen.py detects ratio_sub_to_mid too high.
-    # Targeted low-shelf below 80 Hz cuts sub without affecting bass/mids.
-    # sub_cut_db is cumulative from the auto-correction loop (0.0 = no correction).
-    if sub_cut_db > 0.1:
+    # Sub-cut correction EQ — two-stage:
+    # 1. Auto-detect: measure sub/mid ratio NOW and cut immediately (don't wait for loop)
+    # 2. Loop correction: apply accumulated sub_cut_db from listen.py correction passes
+    _auto_sub_cut = 0.0
+    try:
+        _sos_sub  = butter(4, [20.0/(SR/2), 80.0/(SR/2)],  btype="band", output="sos")
+        _sos_mid4 = butter(4, [500.0/(SR/2), 4000.0/(SR/2)], btype="band", output="sos")
+        _m = _to_mono(mix)
+        _sub_r  = float(np.sqrt(np.mean(sosfilt(_sos_sub,  _m) ** 2)) + 1e-9)
+        _mid4_r = float(np.sqrt(np.mean(sosfilt(_sos_mid4, _m) ** 2)) + 1e-9)
+        _sub_mid_ratio = _sub_r / (_mid4_r + 1e-9)
+        # Target sub/mid linear ratio ≤ 1.8 (≈ 18 in the proportional scorer).
+        # Above 1.8: apply a shelf cut proportional to the excess.
+        if _sub_mid_ratio > 1.8:
+            _excess_db = 20.0 * np.log10(_sub_mid_ratio / 1.8)
+            _auto_sub_cut = float(np.clip(_excess_db * 0.7, 0.0, 6.0))  # 70% of excess, max 6 dB
+            print(f"      [Auto sub-cut] sub/mid={_sub_mid_ratio:.2f} → auto-cut {_auto_sub_cut:.1f} dB @80Hz",
+                  flush=True)
+    except Exception:
+        pass
+
+    _total_sub_cut = sub_cut_db + _auto_sub_cut
+    if _total_sub_cut > 0.1:
         _sub_eq = Pedalboard([
-            LowShelfFilter(cutoff_frequency_hz=80.0, gain_db=-float(sub_cut_db)),
+            LowShelfFilter(cutoff_frequency_hz=80.0, gain_db=-float(_total_sub_cut)),
         ])
         mix = _sub_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
-        print(f"      [Sub correction EQ] -{sub_cut_db:.1f} dB shelf @80Hz", flush=True)
+        print(f"      [Sub correction EQ] -{_total_sub_cut:.1f} dB shelf @80Hz "
+              f"(loop={sub_cut_db:.1f} + auto={_auto_sub_cut:.1f})", flush=True)
 
     # 4-band mastering compression: gentle tonal balance (1-3 dB GR per band)
     # Placed after mastering EQ so it controls, not changes, the tonal balance
@@ -5199,7 +5250,8 @@ def _master(mix: np.ndarray, bpm: float = 120.0, sub_cut_db: float = 0.0) -> np.
     # causing PLR of +5.5 vs reference +10.5 = destroyed transients and dynamics).
     # Single limiter pass preserves LRA and PLR while enforcing EBU R128 compliance.
     try:
-        mix = _lufs_normalize(mix, _profile_lufs_target("radio"))
+        _effective_lufs = lufs_target if lufs_target is not None else _profile_lufs_target("radio")
+        mix = _lufs_normalize(mix, _effective_lufs)
         _tp_lim = Pedalboard([Limiter(threshold_db=-1.0, release_ms=80.0)])
         mix = _tp_lim(mix.T.astype(np.float32), SR).T.astype(np.float32)
         _tp_peak = float(np.max(np.abs(mix)))
@@ -6361,13 +6413,16 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
         best_score = 0
         best_mix   = mix.copy()
-        _lufs_target = -12.0   # mutable within this loop
+        best_style = style.copy()   # track best style alongside best mix to revert on regression
+        _lufs_target = -14.0   # mutable — was -12, now -14 for 2 dB more headroom (better LRA)
         _sub_cut_db  = 0.0     # cumulative sub shelf cut (dB), applied in _master()
         _correction_history = []   # tracks prior attempts for director context
         _adj = {}              # corrections from previous attempt (empty on first pass)
+        _N_PASSES = 6          # was 3 — more passes = sub cuts accumulate, better convergence
+        _score_history = []    # for oscillation detection
 
-        for _attempt in range(3):
-            print(f"\n── Quality Check (attempt {_attempt + 1}/3) {'─' * 35}",
+        for _attempt in range(_N_PASSES):
+            print(f"\n── Quality Check (attempt {_attempt + 1}/{_N_PASSES}) {'─' * 33}",
                   flush=True)
             _passed, _score, _summary, _issues = _auto_score(out_path)
             # Also get raw metrics for the AI director
@@ -6377,12 +6432,34 @@ def fuse(song_a: str, song_b: str, out_path: str,
             if _score > best_score:
                 best_score = _score
                 best_mix   = mix.copy()
+                best_style = style.copy()
+
+            _score_history.append(_score)
+
+            # Regression guard: if score dropped >5 pts vs best, revert style to best known
+            if _attempt >= 1 and _score < best_score - 5:
+                print(f"  Score regressed {best_score - _score:.0f} pts — reverting style to best params.", flush=True)
+                style = best_style.copy()
 
             if _passed:
                 print(f"  ✓ Mix passed QC on attempt {_attempt + 1}.", flush=True)
                 break
 
-            if _attempt == 2:
+            # Oscillation detection: if score is cycling between two values, stop
+            if _attempt >= 3 and len(_score_history) >= 4:
+                _recent = _score_history[-4:]
+                if (abs(_recent[0] - _recent[2]) < 1.0 and
+                        abs(_recent[1] - _recent[3]) < 1.0 and
+                        abs(_recent[0] - _recent[1]) > 2.0):
+                    print(f"  Oscillation detected (scores: {_recent}) — stopping corrections.", flush=True)
+                    break
+            # Also stop if score hasn't improved in 3 consecutive passes
+            if _attempt >= 3 and max(_score_history[-3:]) <= _score_history[-4] + 0.5:
+                print(f"  No improvement in 3 passes (scores: {_score_history[-4:]}) — stopping.",
+                      flush=True)
+                break
+
+            if _attempt == _N_PASSES - 1:
                 print("  Max correction attempts reached — running grid search.", flush=True)
                 # System 3: try parameter grid before giving up
                 _gm, _gs, _gstyle = _param_grid_search(
@@ -6454,7 +6531,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
                         style["carve_db"] + _adj_raw["carve_db"], 3.0, 12.0))
                 if "presence_db" in _adj_raw:
                     _adj["presence_db"] = float(np.clip(
-                        style.get("presence_db", 1.5) + _adj_raw["presence_db"], 0.0, 4.0))
+                        style.get("presence_db", 1.5) + _adj_raw["presence_db"], 1.5, 4.0))
                 if "air_db" in _adj_raw:
                     _adj["air_db"] = float(np.clip(
                         style.get("air_db", 2.5) + _adj_raw["air_db"], 0.0, 5.0))
@@ -6475,7 +6552,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
                     _sub_cut_db + _adj_raw["sub_cut_db"], 0.0, 9.0))
             if "presence_db" in _adj_raw and "presence_db" not in _adj:
                 _adj["presence_db"] = float(np.clip(
-                    style.get("presence_db", 1.5) + _adj_raw["presence_db"], 0.0, 4.0))
+                    style.get("presence_db", 1.5) + _adj_raw["presence_db"], 1.5, 4.0))
 
             if not _adj:
                 print("  No correctable issues found — keeping current mix.", flush=True)
@@ -6499,7 +6576,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
             if "carve_db"    in _adj:
                 style["carve_db"]    = float(np.clip(_adj["carve_db"], 3.0, 12.0))
             if "presence_db" in _adj:
-                style["presence_db"] = float(np.clip(_adj["presence_db"], 0.0, 4.0))
+                style["presence_db"] = float(np.clip(_adj["presence_db"], 1.5, 4.0))
             if "air_db"      in _adj:
                 style["air_db"]      = float(np.clip(_adj["air_db"], 0.0, 5.0))
             if "vocal_level" in _adj:
@@ -6557,7 +6634,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
             mix = _iterative_mix(inst_remix, _vox_for_remix, style, sidechain_depth, bpm_a)
             mix = _check(mix, f"remix-{_attempt+2}/mix")
             mix = _fade(mix, fade_s=2.0)
-            mix = _master(mix, bpm=bpm_a, sub_cut_db=_sub_cut_db)
+            mix = _master(mix, bpm=bpm_a, sub_cut_db=_sub_cut_db, lufs_target=_lufs_target)
             mix = _check(mix, f"remix-{_attempt+2}/master")
             sf.write(out_path, mix, SR, subtype="PCM_24")
 
