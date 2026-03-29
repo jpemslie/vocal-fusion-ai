@@ -6411,11 +6411,13 @@ def fuse(song_a: str, song_b: str, out_path: str,
         except ImportError:
             _has_director = False
 
-        best_score = 0
-        best_mix   = mix.copy()
-        best_style = style.copy()   # track best style alongside best mix to revert on regression
-        _lufs_target = -14.0   # mutable — was -12, now -14 for 2 dB more headroom (better LRA)
-        _sub_cut_db  = 0.0     # cumulative sub shelf cut (dB), applied in _master()
+        best_score    = 0
+        best_mix      = mix.copy()
+        best_style    = style.copy()   # track best style alongside best mix to revert on regression
+        _lufs_target  = -14.0   # mutable — was -12, now -14 for 2 dB more headroom (better LRA)
+        _sub_cut_db   = 0.0     # cumulative sub shelf cut (dB), applied in _master()
+        _best_lufs    = _lufs_target
+        _best_sub_cut = _sub_cut_db
         _correction_history = []   # tracks prior attempts for director context
         _adj = {}              # corrections from previous attempt (empty on first pass)
         _N_PASSES = 6          # was 3 — more passes = sub cuts accumulate, better convergence
@@ -6430,16 +6432,20 @@ def fuse(song_a: str, song_b: str, out_path: str,
             print(f"  → {_summary}", flush=True)
 
             if _score > best_score:
-                best_score = _score
-                best_mix   = mix.copy()
-                best_style = style.copy()
+                best_score    = _score
+                best_mix      = mix.copy()
+                best_style    = style.copy()
+                _best_lufs    = _lufs_target
+                _best_sub_cut = _sub_cut_db
 
             _score_history.append(_score)
 
-            # Regression guard: if score dropped >5 pts vs best, revert style to best known
+            # Regression guard: if score dropped >5 pts vs best, revert ALL mutable params
             if _attempt >= 1 and _score < best_score - 5:
-                print(f"  Score regressed {best_score - _score:.0f} pts — reverting style to best params.", flush=True)
-                style = best_style.copy()
+                print(f"  Score regressed {best_score - _score:.0f} pts — reverting to best params.", flush=True)
+                style        = best_style.copy()
+                _lufs_target = _best_lufs
+                _sub_cut_db  = _best_sub_cut
 
             if _passed:
                 print(f"  ✓ Mix passed QC on attempt {_attempt + 1}.", flush=True)
@@ -6528,7 +6534,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
                 _adj = {}
                 if "carve_db" in _adj_raw:
                     _adj["carve_db"] = float(np.clip(
-                        style["carve_db"] + _adj_raw["carve_db"], 3.0, 12.0))
+                        style["carve_db"] + _adj_raw["carve_db"], 3.0, 8.0))
                 if "presence_db" in _adj_raw:
                     _adj["presence_db"] = float(np.clip(
                         style.get("presence_db", 1.5) + _adj_raw["presence_db"], 1.5, 4.0))
@@ -6574,7 +6580,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
 
             # Apply mix-layer parameter adjustments
             if "carve_db"    in _adj:
-                style["carve_db"]    = float(np.clip(_adj["carve_db"], 3.0, 12.0))
+                style["carve_db"]    = float(np.clip(_adj["carve_db"], 3.0, 8.0))
             if "presence_db" in _adj:
                 style["presence_db"] = float(np.clip(_adj["presence_db"], 1.5, 4.0))
             if "air_db"      in _adj:
