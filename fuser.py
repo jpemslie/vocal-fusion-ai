@@ -1710,7 +1710,15 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
                     return 0.0
             import shutil as _shutil_tmp
             _voc_backup = cached / "_vocals_pre_denoise.wav"
-            _shutil_tmp.copy2(str(_voc_path), str(_voc_backup))
+            if _voc_backup.exists():
+                # Backup already exists from a prior denoise run — use IT as the true original.
+                # (current vocals.wav may already be denoised from a previous run)
+                _shutil_tmp.copy2(str(_voc_backup), str(_voc_path))
+                print("      [Neural Denoiser] Restored pre-denoise original from backup.",
+                      flush=True)
+            else:
+                # First time — save original before denoising
+                _shutil_tmp.copy2(str(_voc_path), str(_voc_backup))
             _hnr_before = _quick_hnr(_voc_path)
             ok = _run_roformer_on_stem(_voc_path, _DENOISE_MODEL, cache_dir,
                                        want_label="(dry)")  # model target_instrument=dry → outputs (Dry)/(No Dry)
