@@ -18,6 +18,14 @@ venv/
 # Runtime data (songs, stems, ML models — not committed)
 vf_data/
 
+# API keys — NEVER commit this file; use VF_API_KEY env var instead
+vf_data/api_keys.json
+api_keys.json
+
+# Environment secrets
+.env
+.env.*
+
 # IDE
 .vscode/
 .idea/

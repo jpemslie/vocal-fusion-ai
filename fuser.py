@@ -36,6 +36,31 @@ import time
 import shutil
 from pathlib import Path
 
+# ── VocalFusion internal modules ─────────────────────────────────────────────
+# Extracted from this file to improve testability and maintainability.
+# fuser.py continues to define the functions locally (for backward compat)
+# but imports these as the canonical sources for constants and utilities.
+from vf.constants import (
+    SR as _VF_SR,
+    MBR_VOCAL     as _VF_MBR_VOCAL,
+    BS_ROFORMER   as _VF_BS_ROFORMER,
+    DENOISE_MODEL as _VF_DENOISE_MODEL,
+    DEVERB_MODEL  as _VF_DEVERB_MODEL,
+    MDX_VOCAL     as _VF_MDX_VOCAL,
+    MDX_VOCAL_2   as _VF_MDX_VOCAL_2,
+)
+from vf.utils import (
+    file_id   as _vf_file_id,
+    load_fp   as _vf_load_fp,
+    save_fp   as _vf_save_fp,
+    ms_encode as _vf_ms_encode,
+    ms_decode as _vf_ms_decode,
+    to_mono   as _vf_to_mono,
+    rms       as _vf_rms,
+    check     as _vf_check,
+)
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── DeepFilterNet must be imported and initialised FIRST ─────────────────────
 # On macOS ARM, loading pedalboard (JUCE) before calling init_df() causes a
 # SIGSEGV in DeepFilter's Rust/ONNX runtime. Pre-loading here before any other

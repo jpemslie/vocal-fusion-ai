@@ -8,9 +8,18 @@ GET  /api/v1/status/<id>   — {status, progress, message, variants?, score?, sh
 GET  /api/v1/keys          — list your key's metadata {key, name, created_at, usage_count}
 POST /api/v1/keys          — generate new key: body {name: str} → {key, name, created_at}
 DELETE /api/v1/keys/<key>  — revoke a key
+
+Auth priority:
+  1. VF_API_KEY env var — if set, any request bearing that key as Bearer token is accepted
+     (no JSON file needed; useful in CI, Docker, or dev environments)
+  2. JSON key store (VF_KEYS_FILE or vf_data/api_keys.json) — created on first run if absent
+
+IMPORTANT: Never commit vf_data/api_keys.json to version control.
+           Use VF_API_KEY env var for CI/deployment instead.
 """
 
 import json
+import os
 import secrets
 import threading
 import uuid
@@ -22,7 +31,13 @@ from flask import Blueprint, g, jsonify, render_template, request
 # Shared state from run.py — imported at request time to avoid circular import issues
 # (run.py imports api_bp from this module, so we do lazy imports inside handlers)
 
-KEYS_FILE = Path("vf_data/api_keys.json")
+# Allow overriding the keys file path via environment variable.
+KEYS_FILE = Path(os.environ.get("VF_KEYS_FILE", "vf_data/api_keys.json"))
+
+# Single-key shortcut: set VF_API_KEY to bypass the JSON store entirely.
+# Useful for CI, Docker, and single-user dev setups.
+_ENV_API_KEY: str | None = os.environ.get("VF_API_KEY")
+
 _keys_lock = threading.Lock()
 
 api_bp = Blueprint("api_v1", __name__, url_prefix="/api/v1")
@@ -89,6 +104,12 @@ def _authenticate():
         return _error("Missing or malformed Authorization header", "UNAUTHORIZED", 401)
 
     provided_key = auth_header[len("Bearer "):].strip()
+
+    # Fast path: VF_API_KEY env var (no JSON file I/O, suitable for CI/Docker)
+    if _ENV_API_KEY and secrets.compare_digest(provided_key, _ENV_API_KEY):
+        g.api_key = provided_key
+        g.api_key_data = {"name": "env", "active": True, "usage_count": 0}
+        return None
 
     with _keys_lock:
         keys = _load_keys()

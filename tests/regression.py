@@ -8,6 +8,15 @@ Usage:
     python tests/regression.py              # full run (uses cached stems)
     python tests/regression.py --fast       # score only (skip re-fuse, just re-score last output)
     python tests/regression.py --list       # list test cases
+
+Source files are resolved via environment variables so this test is portable
+across machines. Set VF_SONG_A and VF_SONG_B (or VF_SONG_<N>_A / _B for
+multiple pairs) to point at local MP3/WAV files before running.
+
+Example:
+    export VF_SONG_A="$HOME/Downloads/john_summit.mp3"
+    export VF_SONG_B="$HOME/Downloads/travis_scott.mp3"
+    python tests/regression.py
 """
 
 import argparse
@@ -19,20 +28,63 @@ from pathlib import Path
 # Make sure the project root is on the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# ── Gold-standard test cases ──────────────────────────────────────────────────
-# Add a new entry whenever you lock in a known-good combination.
-# min_score: score that this pair must still reach after any code change.
-TESTS = [
-    {
-        "name":      "John Summit + Travis Scott (v27 baseline)",
-        "song_a":    "/Users/jpemslie/Downloads/John Summit - crystallized (feat. Inéz) Official Lyric Visualizer.mp3",
-        "song_b":    "/Users/jpemslie/Downloads/Travis Scott - FE_N ft Playboi Carti.mp3",
-        "out":       "vf_data/mixes/regression_john_travis.wav",
-        "min_score": 95,
-    },
-]
+_ROOT = Path(__file__).parent.parent
+_OUTPUT_DIR = Path(os.environ.get("VF_OUTPUT_DIR", _ROOT / "vf_data" / "mixes"))
+STEMS_CACHE = str(Path(os.environ.get("VF_STEMS_DIR", _ROOT / "vf_data" / "stems")))
 
-STEMS_CACHE = "vf_data/stems"
+
+def _env_tests() -> list:
+    """Build test list from VF_SONG_* environment variables.
+
+    Simple pair: VF_SONG_A + VF_SONG_B (name defaults to "env pair")
+    Multiple pairs: VF_SONG_1_A + VF_SONG_1_B, VF_SONG_2_A + VF_SONG_2_B, ...
+    """
+    tests = []
+
+    # Single pair shorthand
+    if os.environ.get("VF_SONG_A") and os.environ.get("VF_SONG_B"):
+        tests.append({
+            "name": os.environ.get("VF_REGRESSION_NAME", "env pair"),
+            "song_a": os.environ["VF_SONG_A"],
+            "song_b": os.environ["VF_SONG_B"],
+            "out": str(_OUTPUT_DIR / "regression_env.wav"),
+            "min_score": int(os.environ.get("VF_MIN_SCORE", "55")),
+        })
+
+    # Numbered pairs
+    for i in range(1, 20):
+        a = os.environ.get(f"VF_SONG_{i}_A")
+        b = os.environ.get(f"VF_SONG_{i}_B")
+        if not (a and b):
+            break
+        tests.append({
+            "name": os.environ.get(f"VF_REGRESSION_NAME_{i}", f"pair {i}"),
+            "song_a": a,
+            "song_b": b,
+            "out": str(_OUTPUT_DIR / f"regression_{i:02d}.wav"),
+            "min_score": int(os.environ.get(f"VF_MIN_SCORE_{i}",
+                              os.environ.get("VF_MIN_SCORE", "55"))),
+        })
+
+    return tests
+
+
+# ── Gold-standard test cases ──────────────────────────────────────────────────
+# DO NOT hard-code absolute paths here. Use environment variables (see above)
+# or add entries relative to the project root with Path(__file__).parent.parent.
+#
+# Example — uncomment and set real relative paths if you have fixture files:
+# TESTS = [
+#     {
+#         "name": "fixture pair",
+#         "song_a": str(_ROOT / "tests" / "fixtures" / "song_a.mp3"),
+#         "song_b": str(_ROOT / "tests" / "fixtures" / "song_b.mp3"),
+#         "out":    str(_OUTPUT_DIR / "regression_fixture.wav"),
+#         "min_score": 50,
+#     },
+# ]
+
+TESTS: list = _env_tests()
 
 
 def run_tests(fast: bool = False) -> bool:

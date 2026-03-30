@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install lint tools
+        run: pip install ruff
+      - name: Ruff lint
+        run: ruff check --select E,W,F --ignore E501 .
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install core dependencies
+        run: |
+          pip install numpy scipy librosa soundfile pytest
+          # Lightweight install — skip heavy models (torch/demucs) for CI speed
+          pip install pyloudnorm noisereduce
+      - name: Run unit tests
+        run: python -m pytest tests/unit/ -v --tb=short
+        env:
+          VF_STEMS_DIR: /tmp/vf_stems
+          VF_OUTPUT_DIR: /tmp/vf_output
+
+  import-check:
+    name: Import Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install stubs
+        run: pip install numpy scipy
+      - name: Check module imports don't blow up
+        run: |
+          python -c "
+          import sys, importlib, types
+
+          # Stub heavy optional imports so the import graph resolves
+          for mod in ['torch', 'torchaudio', 'demucs', 'pedalboard',
+                      'anthropic', 'pyloudnorm', 'noisereduce',
+                      'audio_separator', 'onnxruntime']:
+              sys.modules[mod] = types.ModuleType(mod)
+
+          # These should import without errors
+          import listen
+          import director
+          print('OK: listen, director')
+          "
