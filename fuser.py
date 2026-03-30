@@ -309,9 +309,11 @@ def _style_params(beat_char: dict, vox_char: dict, beat_fp: dict = None) -> dict
         "opto_release": float(np.interp(agg, [0, 1], [300.0, 150.0])),
 
         # Presence boost: 3 kHz is the key vocal intelligibility / "cut-through"
-        # frequency. +2-3.5 dB — the +4dB high shelf was removed (caused harshness);
-        # vocals cut through via spectral carve, not aggressive presence boost.
-        "presence_db":  float(np.interp(rap, [0, 1], [2.0, 3.5])),
+        # frequency. Reduced from [2.0, 3.5] → [1.5, 2.5]: listen.py consistently
+        # flags "PRESENCE HARSH" at 2.2+ dB. 1.5 dB adds intelligibility without
+        # making 3-6 kHz jump out. Vocals cut through via spectral carve, not
+        # aggressive presence boost.
+        "presence_db":  float(np.interp(rap, [0, 1], [1.5, 2.5])),
         "presence_hz":  3000.0,  # fixed: 3 kHz is the universal cut-through freq
 
         # Air shelf: compensate for HF stripped by Demucs mask + de-esser.
