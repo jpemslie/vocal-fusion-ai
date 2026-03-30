@@ -3,7 +3,29 @@
 **Goal:** Beat ChatGPT's mashup quality. Professional, commercial-sounding output on any two songs, any genre, any BPM/key combo.
 
 **Current best score:** 67/100 [C] (Mahalanobis ML scorer) | beats 83-86% of Drake reference
+**listen.py best:** 55/100 (v44, v48) — structural ceilings: sub/mid+22 (Rhyme Dust), HNR 0.4 dB (Demucs bleed)
 **Target:** A-grade (85+) on ML scorer + CLAP scorer
+
+---
+
+## Session 2026-03-29 Progress
+
+- [x] Smart CPU-aware watchdog (Mel-Roformer survives 15-min run — was killed at 13/20 chunks)
+- [x] HNR gate: A/B test denoised vs original; revert if HNR gain < 1 dB
+  - Result: E85 vocal HNR 2.2 → 2.2 dB (+0.0 dB) — denoiser always rejected for Demucs-separated commercial stems
+  - Root cause: Demucs bleed is signal-correlated — not noise, denoiser can't touch it
+- [x] Carve ceiling 12 → 8 dB (11.5 dB was eating mid band, making sub/mid ratio fail harder)
+- [x] Regression guard: saves/restores ALL mutable params (style + sub_cut_db + lufs_target)
+- [x] Regression guard: clean revert — skip corrections that pass, remix first then score fresh
+- [x] presence_db floor 0.0 → 1.5 dB (director was burying vocals)
+- [x] LUFS -12 → -14 dBFS for better LRA/headroom
+- [x] Auto sub-cut in mastering: measure sub/mid ratio, cut up to 6 dB if > 1.8
+- [x] Correction passes 3 → 6 with oscillation detection
+
+**Ceiling diagnosis:** listen.py 55/100 is the hard ceiling for Toliver E85 × Rhyme Dust:
+- Sub vs Mid +22 dB (target ≤ +18): Rhyme Dust sub is structural, cutting it makes the mix thin
+- HNR 0.4-0.6 dB: Demucs bleed = correlated artifacts, can't be denoised
+- Breaking past 55 requires Phase 1A (BSRoformer stems, ~10 dB SDR) or Phase 1B (StemPostFilter)
 
 ---
 
