@@ -349,8 +349,9 @@ def _style_params(beat_char: dict, vox_char: dict, beat_fp: dict = None) -> dict
         "reverb_damp":  float(np.interp(rap, [0, 1], [0.70, 0.90])),
         "reverb_wet":   reverb_wet,
 
-        # Spectral carve: more bass-heavy → carve deeper. 8-10 dB for house/EDM.
-        "carve_db":     float(np.interp(bass, [0, 1], [6.0, 10.0])),
+        # Spectral carve: more bass-heavy → carve deeper. Capped at 8 dB (ceiling
+        # matched to correction loop clamp — was 6-10, 10 dB ate mid-band badly).
+        "carve_db":     float(np.interp(bass, [0, 1], [5.0, 8.0])),
         # Carve frequency range: content-adaptive (see computation above)
         "carve_lo_hz":  carve_lo_hz,
         "carve_hi_hz":  carve_hi_hz,
@@ -6483,7 +6484,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
         best_score    = 0
         best_mix      = mix.copy()
         best_style    = style.copy()   # track best style alongside best mix to revert on regression
-        _lufs_target  = -14.0   # mutable — was -12, now -14 for 2 dB more headroom (better LRA)
+        _lufs_target  = -11.0   # mutable — Drake ref median is -10, scorer target is -13 to -8; -11 gives headroom without LUFS-too-quiet penalty
         _sub_cut_db   = 0.0     # cumulative sub shelf cut (dB), applied in _master()
         _best_lufs    = _lufs_target
         _best_sub_cut = _sub_cut_db
@@ -6622,7 +6623,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
                         style["carve_db"] + _adj_raw["carve_db"], 3.0, 8.0))
                 if "presence_db" in _adj_raw:
                     _adj["presence_db"] = float(np.clip(
-                        style.get("presence_db", 1.5) + _adj_raw["presence_db"], 1.5, 4.0))
+                        style.get("presence_db", 1.5) + _adj_raw["presence_db"], 1.5, 3.0))
                 if "air_db" in _adj_raw:
                     _adj["air_db"] = float(np.clip(
                         style.get("air_db", 2.5) + _adj_raw["air_db"], 0.0, 5.0))
@@ -6643,7 +6644,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
                     _sub_cut_db + _adj_raw["sub_cut_db"], 0.0, 9.0))
             if "presence_db" in _adj_raw and "presence_db" not in _adj:
                 _adj["presence_db"] = float(np.clip(
-                    style.get("presence_db", 1.5) + _adj_raw["presence_db"], 1.5, 4.0))
+                    style.get("presence_db", 1.5) + _adj_raw["presence_db"], 1.5, 3.0))
 
             if not _adj:
                 print("  No correctable issues found — keeping current mix.", flush=True)
@@ -6667,7 +6668,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
             if "carve_db"    in _adj:
                 style["carve_db"]    = float(np.clip(_adj["carve_db"], 3.0, 8.0))
             if "presence_db" in _adj:
-                style["presence_db"] = float(np.clip(_adj["presence_db"], 1.5, 4.0))
+                style["presence_db"] = float(np.clip(_adj["presence_db"], 1.5, 3.0))
             if "air_db"      in _adj:
                 style["air_db"]      = float(np.clip(_adj["air_db"], 0.0, 5.0))
             if "vocal_level" in _adj:
