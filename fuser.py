@@ -1696,12 +1696,39 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
         if not _denoise_sentinel.exists():
             print("      [Neural Denoiser] Running Mel-Roformer-Denoise on vocal stem…",
                   flush=True)
+            # Measure HNR before denoising so we can A/B reject if it doesn't help
+            def _quick_hnr(path: Path) -> float:
+                try:
+                    import librosa as _lr
+                    y, _sr = _lr.load(str(path), sr=16000, mono=True, duration=30.0)
+                    harm = _lr.effects.harmonic(y)
+                    rms_h = float(np.sqrt(np.mean(harm ** 2)) + 1e-9)
+                    noise = y - harm
+                    rms_n = float(np.sqrt(np.mean(noise ** 2)) + 1e-9)
+                    return float(20 * np.log10(rms_h / rms_n))
+                except Exception:
+                    return 0.0
+            import shutil as _shutil_tmp
+            _voc_backup = cached / "_vocals_pre_denoise.wav"
+            _shutil_tmp.copy2(str(_voc_path), str(_voc_backup))
+            _hnr_before = _quick_hnr(_voc_path)
             ok = _run_roformer_on_stem(_voc_path, _DENOISE_MODEL, cache_dir,
                                        want_label="(dry)")  # model target_instrument=dry → outputs (Dry)/(No Dry)
             if ok:
-                _denoise_sentinel.touch()
-                print("      [Neural Denoiser] Vocal stem cleaned.", flush=True)
+                _hnr_after = _quick_hnr(_voc_path)
+                _hnr_gain = _hnr_after - _hnr_before
+                print(f"      [Neural Denoiser] HNR: {_hnr_before:.1f} → {_hnr_after:.1f} dB "
+                      f"(gain={_hnr_gain:+.1f} dB)", flush=True)
+                if _hnr_gain < 1.0:
+                    # Denoiser didn't help — restore original to avoid spectral degradation
+                    _shutil_tmp.copy2(str(_voc_backup), str(_voc_path))
+                    print("      [Neural Denoiser] HNR gain <1 dB — reverting to original "
+                          "(denoiser hurts this stem).", flush=True)
+                else:
+                    _denoise_sentinel.touch()
+                    print("      [Neural Denoiser] Vocal stem cleaned.", flush=True)
             else:
+                _shutil_tmp.copy2(str(_voc_backup), str(_voc_path))
                 print("      [Neural Denoiser] Failed — using undenoised vocal.", flush=True)
 
         # De-reverb DISABLED: studio-recorded vocals have intentional production reverb
@@ -6441,11 +6468,15 @@ def fuse(song_a: str, song_b: str, out_path: str,
             _score_history.append(_score)
 
             # Regression guard: if score dropped >5 pts vs best, revert ALL mutable params
+            # then CONTINUE to next QC pass (skip applying new corrections this iteration
+            # so the reverted state is scored cleanly before further adjustments)
+            _reverted = False
             if _attempt >= 1 and _score < best_score - 5:
                 print(f"  Score regressed {best_score - _score:.0f} pts — reverting to best params.", flush=True)
                 style        = best_style.copy()
                 _lufs_target = _best_lufs
                 _sub_cut_db  = _best_sub_cut
+                _reverted    = True
 
             if _passed:
                 print(f"  ✓ Mix passed QC on attempt {_attempt + 1}.", flush=True)
@@ -6477,6 +6508,18 @@ def fuse(song_a: str, song_b: str, out_path: str,
                     style      = _gstyle
                     print(f"  Grid search improved score to {best_score}/100", flush=True)
                 break
+
+            # After regression revert: re-mix with reverted params, score next pass fresh
+            if _reverted:
+                print("  Re-mixing with reverted params (no additional corrections this pass)…",
+                      flush=True)
+                mix = _iterative_mix(inst_remix, vox_remix, style, sidechain_depth, bpm_a)
+                mix = _check(mix, f"revert-{_attempt+2}/mix")
+                mix = _fade(mix, fade_s=2.0)
+                mix = _master(mix, bpm=bpm_a, sub_cut_db=_sub_cut_db, lufs_target=_lufs_target)
+                mix = _check(mix, f"revert-{_attempt+2}/master")
+                sf.write(out_path, mix, SR, subtype="PCM_24")
+                continue
 
             # Record this attempt in history for the director's context
             _correction_history.append({
