@@ -4273,7 +4273,10 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     if not _is_direct:
         try:
             n_fft_hpss = 2048
-            hpss_blend = 0.90
+            # Blend 40% (was 90%) — commercial stems are already studio-processed.
+            # 90% destroyed consonants (t, k, p, d) giving a washed-out warbly sound.
+            # 40% removes most drum bleed while preserving vocal transient attack.
+            hpss_blend = 0.40
             cleaned_ch = np.zeros_like(vox_ch)
             for c in range(vox_ch.shape[0]):
                 D = librosa.stft(vox_ch[c].astype(np.float64), n_fft=n_fft_hpss)
@@ -4283,7 +4286,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
                 y_harm = librosa.istft(D_harm, length=vox_ch.shape[1]).astype(np.float32)
                 cleaned_ch[c] = (y_harm * hpss_blend + vox_ch[c] * (1.0 - hpss_blend))
             vox_ch = np.nan_to_num(cleaned_ch, nan=0.0, posinf=0.0, neginf=0.0)
-            print("      [Stage 0.5] HPSS harmonic mask applied.", flush=True)
+            print("      [Stage 0.5] HPSS harmonic mask applied (40% blend).", flush=True)
         except Exception as _hpss_e:
             print(f"      [Stage 0.5 HPSS failed: {_hpss_e}]", flush=True)
     else:
@@ -4309,12 +4312,13 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
             HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=-1.5),  # mild air rolloff only
         ])
     else:
+        # Commercial stems: already professionally EQ'd in studio.
+        # Old -5 dB at 300 Hz was stripping warmth/body from the vocal.
+        # Keep HPF + mild hi-hat roll-off only; let the original EQ breathe.
         pre_eq = Pedalboard([
             HighpassFilter(cutoff_frequency_hz=80.0),
-            PeakFilter(cutoff_frequency_hz=300.0, gain_db=-5.0, q=1.2),  # mud (Demucs residue)
-            PeakFilter(cutoff_frequency_hz=450.0, gain_db=-3.0, q=1.4),  # cardboard box
-            PeakFilter(cutoff_frequency_hz=500.0, gain_db=-2.0, q=1.5),  # boxy
-            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=-3.0),   # hi-hat bleed roll-off
+            PeakFilter(cutoff_frequency_hz=300.0, gain_db=-2.0, q=1.2),  # light mud only
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=-2.0),   # hi-hat bleed roll-off
         ])
     vox_ch = pre_eq(vox_ch, SR).astype(np.float32)
 
@@ -4471,13 +4475,16 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
               flush=True)
 
     # Stage 11: auto harmony — diatonic third above.
-    # wet controlled by _PARAM_OVERRIDE["harmony_wet"] (default 0.14, 0.0 = off).
+    # Disabled for commercial stems: adds a synthetic pitch-shifted layer on top of
+    # professionally-produced vocals (Don Toliver, Travis, etc.) which already have
+    # studio harmonies baked in. The extra layer sounds fake and clutters the mix.
+    # Only used for direct_vocal (phone/recorded) where harmonies genuinely add depth.
     _harmony_wet = float(_PARAM_OVERRIDE.get("harmony_wet", 0.14))
-    if _harmony_wet > 0.01:
+    if _harmony_wet > 0.01 and style.get("_direct_vocal", False):
         vox_ch = _auto_harmony(vox_ch, key_root=target_root, key_mode=target_mode, wet=_harmony_wet)
         print(f"      [Stage 11] Auto harmony added (diatonic 3rd, {_harmony_wet*100:.0f}% wet)", flush=True)
     else:
-        print("      [Stage 11] Auto harmony skipped (ML override wet=0)", flush=True)
+        print("      [Stage 11] Auto harmony skipped (commercial stem — studio harmonies preserved).", flush=True)
 
     return vox_ch.T  # (samples, 2)
 
