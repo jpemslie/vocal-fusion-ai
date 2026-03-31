@@ -120,7 +120,7 @@ REF = {
     "ratio_sub_to_mid":    (+4.0, +18.0),
     "ratio_bass_to_mid":   (+2.0, +20.0),
     "ratio_lowmid_to_mid": (-3.0, +10.0),
-    "ratio_himid_to_mid":  (-20.0, -1.0),
+    "ratio_himid_to_mid":  (-12.0, -1.0),  # below -12 dB = presence-dead, audibly dull
     "ratio_high_to_mid":   (-32.0, -8.0),
     "lowmid_over_himid":   (+3.0, +20.0),
     "high_over_himid":     (-20.0, -4.0),
@@ -160,10 +160,9 @@ REF = {
     # vocal_hnr_db: Harmonic-to-Noise Ratio on vocal band (300-3000 Hz) voiced frames.
     # Autocorrelation method (Praat). >15 dB = normophonic clear vocal.
     # <10 dB = breathy/noisy. Research: Ferrand 2002; Praat documentation.
-    # Lower bound 10→0.5: Demucs htdemucs_ft creates a structural HNR ceiling of
-    # 0.5-2 dB due to stem bleed. Penalising below 0.5 scores an uncorrectable
-    # structural property, not a mix defect. HNR 0.5-10 is still flagged diagnostically.
-    "vocal_hnr_db":         (0.5, 40.0),
+    # Lower bound 8 dB: good-quality Demucs stems land at 8-20 dB. Below 8 dB
+    # indicates actual vocal noise/bleed that is audible and should be penalized.
+    "vocal_hnr_db":         (8.0, 40.0),
     # vocal_sfm: Spectral Flatness Measure of vocal band in voiced frames.
     # Geometric/arithmetic mean ratio of power spectrum. 0 = pure tone, 1 = white noise.
     # <0.1 = very tonal (over-tuned/robotic). 0.05-0.30 = natural harmonic vocal.
@@ -171,9 +170,9 @@ REF = {
     "vocal_sfm":            (0.05, 0.35),
 
     # ── TIER 4: Musical intelligence ─────────────────────────────────────
-    # groove_score: fraction of vocal onsets within ±60ms of a beat grid position.
-    # Window widened from 40ms to 60ms for mashup context.
-    "groove_score":         (0.25, 1.0),
+    # groove_score: fraction of vocal onsets within ±35ms of a beat grid position.
+    # ±35ms = ~9% of a beat at 130 BPM. Loose pocket. ±60ms was so wide anything passed.
+    "groove_score":         (0.35, 1.0),
     # dynamic_arc_score: correlation between actual per-section loudness and ideal arc.
     "dynamic_arc_score":    (0.20, 1.0),
     # vocal_harmony_score: CENS-based chroma coherence between beat-range and
@@ -182,11 +181,11 @@ REF = {
 
     # ── TIER 5: Mashup intelligence ───────────────────────────────────────
     # dynamic_complexity_db: avg abs deviation of 2s-window RMS (dB) from global
-    # RMS (dB). <1.5 = brick-wall. >14 = sections too uneven.
-    # Lowered to 1.5 (from 2.0) — modern EDM/house/trap mastering produces very
-    # flat RMS (1.6-2.0 dB). 1.5 dB floor reflects the structural reality of
-    # heavily side-chained, constant-energy electronic production.
-    "dynamic_complexity_db": (1.5, 14.0),
+    # RMS (dB). <2.5 = brick-wall. >14 = sections too uneven.
+    # Well-mastered hip-hop with sidechain still exhibits 3-5 dB because the sidechain
+    # creates audible envelope variation (big on beat, small off-beat). 1.5 dB floor
+    # was accepting genuinely over-limited output as within spec.
+    "dynamic_complexity_db": (2.5, 14.0),
     # vocal_robot_score: 0 = natural voice, 1 = severe WORLD vocoder artifacts.
     # Frame-to-frame HNR std-dev / 15 dB. >0.45 = audibly robotic/pitch-shifted.
     "vocal_robot_score":     (0.0, 0.45),
@@ -1046,9 +1045,12 @@ def _measure(audio_path: str) -> dict:
     # Old formula (20-300 Hz vs 1-4 kHz) compared the wrong bands — sub-bass
     # is separated from speech by several octaves and not the primary masker.
     try:
-        speech_lo_mask_db = _band_db(S_mag, freqs, 300,   800)
-        speech_int_db     = _band_db(S_mag, freqs, 800,  3000)
-        masking_pressure  = max(0.0, speech_lo_mask_db - speech_int_db - 3.0)
+        kick_bass_db      = _band_db(S_mag, freqs,  60,   200)  # kick/808 upward masking
+        speech_lo_mask_db = _band_db(S_mag, freqs, 300,   800)  # low-mid masking
+        speech_int_db     = _band_db(S_mag, freqs, 800,  3000)  # primary intelligibility zone
+        # Primary masker is the louder of kick/bass or low-mid band
+        dominant_masker   = max(kick_bass_db, speech_lo_mask_db)
+        masking_pressure  = max(0.0, dominant_masker - speech_int_db - 3.0)
         vocal_clarity_index = float(speech_int_db - masking_pressure)
     except Exception:
         vocal_clarity_index = 5.0
@@ -1193,7 +1195,7 @@ def _measure(audio_path: str) -> dict:
         if len(beat_times) >= 2 and len(vot) >= 3:
             # Vectorized: (n_onsets, n_beats) → min distance per onset
             dists = np.abs(vot[:, None] - beat_times[None, :]).min(axis=1)
-            groove_score = float(np.clip(np.mean(dists <= 0.060), 0.0, 1.0))
+            groove_score = float(np.clip(np.mean(dists <= 0.035), 0.0, 1.0))
         else:
             groove_score = 0.50
     except Exception:
@@ -1235,9 +1237,14 @@ def _measure(audio_path: str) -> dict:
                 # Classic crescendo (original): steady build + resolve
                 "crescendo":  [0.3, 0.5, 0.75, 1.0, 0.9, 0.7],
             }
-            best_corr = max(_arc_template_corr(pts)
-                            for pts in arc_templates.values())
-            dynamic_arc_score = float(np.clip((best_corr + 1.0) / 2.0, 0.0, 1.0))
+            corrs = [_arc_template_corr(pts) for pts in arc_templates.values()]
+            best_corr = max(corrs)
+            mean_corr = float(np.mean(corrs))
+            # Use weighted blend: best template gets 60%, mean gets 40%.
+            # Pure max() always passes (~0.5 floor); pure mean() is too strict for
+            # genre mixes. Blend rewards genuine structure without free-passing flat mixes.
+            blended_corr = 0.60 * best_corr + 0.40 * mean_corr
+            dynamic_arc_score = float(np.clip((blended_corr + 1.0) / 2.0, 0.0, 1.0))
         else:
             dynamic_arc_score = 0.50
     except Exception:
@@ -1503,7 +1510,10 @@ def _score(metrics: dict, ref: dict) -> tuple:
 
     worst_tier = min(tier_scores.values()) if tier_scores else 100.0
     if worst_tier < TIER_FLOOR:
-        score = min(score, 65)
+        # Scale cap: borderline failure (worst_tier≈30) → cap at 65;
+        # catastrophic failure (worst_tier≈0) → cap at 50.
+        scaled_cap = int(50 + (worst_tier / TIER_FLOOR) * 15)
+        score = min(score, scaled_cap)
 
     return max(0, score), issues, tier_scores
 

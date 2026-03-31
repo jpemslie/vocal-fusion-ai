@@ -290,17 +290,18 @@ def _style_params(beat_char: dict, vox_char: dict, beat_fp: dict = None) -> dict
     rap  = vox_char["rap_score"]         # 0–1
 
     # ── Reverb: match beat's acoustic space ───────────────────────────────────
-    # Base: very dry (AI stems already have original reverb baked in).
-    # Scale: if the beat lives in a roomy space (reverb_tail high), give the
-    # vocal more space to match — otherwise it sounds pasted on top.
-    base_room = float(np.interp(rap, [0, 1], [0.15, 0.06]))
-    base_wet  = float(np.interp(rap, [0, 1], [0.04, 0.02]))
+    # Professional standard: 10-18% wet on a short room reverb (HPF'd at 500 Hz).
+    # The HPF prevents mud — the wet level can be higher because low-mid energy
+    # is removed from the return. Below 10% the vocal sounds superimposed; above
+    # 20% it washes out in a dense hip-hop mix.
+    base_room = float(np.interp(rap, [0, 1], [0.18, 0.10]))
+    base_wet  = float(np.interp(rap, [0, 1], [0.14, 0.10]))
     if beat_fp is not None:
         reverb_tail = float(beat_fp.get("reverb_tail", 0.3))
-        # room_scale: 0.7× for punchy/dry beats, 1.4× for roomy/spacious beats
-        room_scale  = float(np.interp(reverb_tail, [0.10, 0.60], [0.70, 1.40]))
-        reverb_room = float(np.clip(base_room * room_scale, 0.04, 0.35))
-        reverb_wet  = float(np.clip(base_wet  * room_scale, 0.01, 0.09))
+        # room_scale: 0.85× for punchy/dry beats, 1.25× for roomy/spacious beats
+        room_scale  = float(np.interp(reverb_tail, [0.10, 0.60], [0.85, 1.25]))
+        reverb_room = float(np.clip(base_room * room_scale, 0.06, 0.35))
+        reverb_wet  = float(np.clip(base_wet  * room_scale, 0.08, 0.20))
     else:
         reverb_room = base_room
         reverb_wet  = base_wet
@@ -335,10 +336,10 @@ def _style_params(beat_char: dict, vox_char: dict, beat_fp: dict = None) -> dict
 
         # Presence boost: 3 kHz is the key vocal intelligibility / "cut-through"
         # frequency. Reduced from [2.0, 3.5] → [1.5, 2.5]: listen.py consistently
-        # flags "PRESENCE HARSH" at 2.2+ dB. 1.5 dB adds intelligibility without
-        # making 3-6 kHz jump out. Vocals cut through via spectral carve, not
-        # aggressive presence boost.
-        "presence_db":  float(np.interp(rap, [0, 1], [1.5, 2.5])),
+        # Professional standard: 2-4 dB presence boost at 3 kHz for cut-through.
+        # The scorer's old "PRESENCE HARSH" at 2.2 dB was a miscalibrated threshold.
+        # scorer now uses ±5 dB window; 2.0-3.5 dB is correct professional practice.
+        "presence_db":  float(np.interp(rap, [0, 1], [2.0, 3.5])),
         "presence_hz":  3000.0,  # fixed: 3 kHz is the universal cut-through freq
 
         # Air shelf: compensate for HF stripped by Demucs mask + de-esser.
@@ -629,7 +630,7 @@ def _apply_space_match(
     acoustic space as the instrumental.  Uses psychoacoustic wet scaling so
     a dry punchy beat gets less space than a roomy ambient one.
     """
-    wet = float(np.interp(reverb_tail_score, [0.0, 1.0], [0.025, 0.065]))
+    wet = float(np.interp(reverb_tail_score, [0.0, 1.0], [0.10, 0.18]))
 
     # Wet return processing filters (outside try-block — Python scope rule)
     sos_hpf_wet = butter(4, 450.0 / (sr / 2.0), btype="high", output="sos")
@@ -724,7 +725,7 @@ def _produce_vocal_for_beat(
     # Damping: bright beat → less damped (airy tail), dark → more damped (murky).
     room   = float(np.interp(fp["reverb_tail"],  [0.0, 1.0], [0.06, 0.28]))
     damp   = float(np.interp(fp["brightness"],   [0.0, 1.0], [0.85, 0.40]))
-    wet    = float(np.interp(fp["reverb_tail"],  [0.0, 1.0], [0.02, 0.09]))
+    wet    = float(np.interp(fp["reverb_tail"],  [0.0, 1.0], [0.10, 0.18]))
     rev_board = Pedalboard([Reverb(room_size=room, damping=damp,
                                    wet_level=wet, dry_level=1.0)])
     predelay_samps = int(60000.0 / bpm / 4.0 * SR / 1000)  # 16th-note pre-delay
@@ -1134,41 +1135,10 @@ def _iterative_mix(inst: np.ndarray, vox: np.ndarray,
         ])
         inst_c = _comp_eq(inst_c.T.astype(np.float32), SR).T.astype(np.float32)
 
-        # Vocal-activated bass duck: when the vocal is present, drop the beat's
-        # 20-350 Hz by up to -8 dB. This is the professional mashup technique —
-        # bass drops under the vocal so both can be heard clearly.
-        vox_env = np.abs(_to_mono(vox_scaled))
-        hop_d = 512
-        env_frames = librosa.feature.rms(y=vox_env, frame_length=2048, hop_length=hop_d)[0]
-        # Adaptive threshold: rap has consistent energy (fire on more frames);
-        # singing needs tighter threshold (fire only on peaks).
-        _sc_pct = float(np.interp(style.get("_rap_score", 0.5), [0, 1], [80, 55]))
-        env_thresh = float(np.percentile(env_frames, _sc_pct))
-        # Smooth the gain curve (100ms attack, 200ms release)
-        duck_gain = np.zeros(len(env_frames), dtype=np.float32)
-        for fi in range(len(env_frames)):
-            if env_frames[fi] > env_thresh:
-                duck_gain[fi] = 10**(-6.0/20.0)  # -6 dB when vocal is at peak (was -4 dB — too weak)
-            else:
-                duck_gain[fi] = 1.0
-        # Smooth: simple one-pole IIR
-        a_att = np.exp(-1.0 / (SR * 0.10 / hop_d))
-        a_rel = np.exp(-1.0 / (SR * 0.20 / hop_d))
-        smooth = np.ones(len(duck_gain), dtype=np.float32)
-        for fi in range(1, len(duck_gain)):
-            a = a_att if duck_gain[fi] < smooth[fi-1] else a_rel
-            smooth[fi] = a * smooth[fi-1] + (1.0 - a) * duck_gain[fi]
-        # Interpolate to sample resolution
-        n_samp = inst_c.shape[0]
-        x_f = np.arange(len(smooth)) * hop_d
-        x_s = np.arange(n_samp)
-        gain_samp = np.interp(x_s, x_f, smooth).astype(np.float32)
-        # Apply only to bass band
-        sos_bass_d = butter(4, 350.0 / nyq_m, btype="low",  output="sos")
-        sos_rest_d = butter(4, 350.0 / nyq_m, btype="high", output="sos")
-        bass_d  = sosfilt(sos_bass_d, inst_c, axis=0).astype(np.float32)
-        rest_d  = sosfilt(sos_rest_d, inst_c, axis=0).astype(np.float32)
-        inst_c = (bass_d * gain_samp[:, np.newaxis] + rest_d).astype(np.float32)
+        # Vocal-activated bass duck removed: the sidechain below already handles
+        # ducking with sub-bass preservation. Running both simultaneously causes
+        # double-ducking that collapses LRA and creates audible pumping on rap vocals.
+        # The _sidechain() call (below) is the single gain authority for beat ducking.
 
         # attack_gain_db restored: _transient_shape detects via kick(60-200Hz)+snare(150-6kHz)
         # bands only — hi-hats are NOT in the detection signal so the old +9.6dB HF issue
@@ -4123,7 +4093,7 @@ def _autotune_to_key(vox_mono: np.ndarray, key_root: int, key_mode: str,
 
 
 def _bpm_delay(vox_ch: np.ndarray, bpm: float,
-               wet: float = 0.18, feedback: float = 0.28) -> np.ndarray:
+               wet: float = 0.18, feedback: float = 0.12) -> np.ndarray:
     """
     Tempo-synced dotted-eighth delay (3/16 note = 1.5 × 1/8 note).
 
@@ -4432,7 +4402,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     post_eq = Pedalboard([
         PeakFilter(cutoff_frequency_hz=style["presence_hz"],
                    gain_db=style["presence_db"], q=1.5),
-        HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=style["air_db"]),
+        HighShelfFilter(cutoff_frequency_hz=12000.0, gain_db=style["air_db"]),  # true "air" shelf at 12kHz
     ])
     vox_ch = post_eq(vox_ch, SR).astype(np.float32)
 
@@ -4443,7 +4413,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     ])
     reverb_wet = reverb_board(vox_ch, SR).astype(np.float32)
     reverb_wet = _hpf_signal(reverb_wet, cutoff_hz=500.0, order=4)
-    wet = float(np.clip(style["reverb_wet"], 0.01, 0.09))
+    wet = float(np.clip(style["reverb_wet"], 0.08, 0.20))
     vox_ch = (vox_ch + reverb_wet * wet).astype(np.float32)
 
     # Stage 8: auto-tune — frame-by-frame pitch snap to scale of the beat.
@@ -4490,6 +4460,16 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # Must run AFTER auto-tune (WORLD resynth can introduce very quiet end-frames
     # that look like breaths but are synthesis artefacts — gate catches them too).
     vox_ch = _debreath(vox_ch.T, threshold_db=-42.0, attenuation_db=-18.0).T
+
+    # Stage 9b: NY parallel compression on vocal.
+    # Foundational professional technique: dry path preserves transients and attack;
+    # crushed path fills in quiet gaps between syllables, adding density and sustain.
+    # This does NOT smear transients — that is the entire point of the parallel approach.
+    # rap_score drives blend 25% (singing) → 38% (rap).
+    rap_score_pc = style.get("_rap_score", 0.5)
+    vox_ch = _parallel_compress_vocal(vox_ch, rap_score=rap_score_pc)
+    print(f"      [Stage 9b] Parallel compression applied (blend={int(np.interp(rap_score_pc,[0,1],[25,38]))}%)",
+          flush=True)
 
     # Stage 10: BPM-synced dotted-eighth delay (the Drake/Future echo effect).
     # SKIP for direct_vocal: 437ms echo at 18% wet/28% feedback makes syllables
@@ -4700,15 +4680,17 @@ def _parallel_compress(inst: np.ndarray) -> np.ndarray:
     """
     inst_ch = inst.T.astype(np.float32)
     from pedalboard import Gain
+    # 4:1 at -18 dBFS with makeup: compresses dynamically rather than flatly.
+    # 8:1 at -24 dB was crushing to a completely flat signal — 8% of flat is
+    # audibly useless. 4:1 at -18 dB compresses 3-4 dB on peaks, leaving
+    # some dynamics for the dry path to blend with.
     crush = Pedalboard([
-        Compressor(threshold_db=-24.0, ratio=8.0, attack_ms=30.0, release_ms=200.0),
-        Gain(gain_db=9.0),   # makeup: bring crushed level up to match dry
+        Compressor(threshold_db=-18.0, ratio=4.0, attack_ms=30.0, release_ms=200.0),
+        Gain(gain_db=6.0),   # makeup to match dry RMS
     ])
     crushed = crush(inst_ch, SR).T.astype(np.float32)
-    # 8% wet: was 20% which sounds dense at low volume but "smashed together" loud.
-    # The crushed signal fills in transient gaps — at high SPL this makes every
-    # hit blend into the next. 8% adds just enough glue without destroying punch.
-    return (0.92 * inst + 0.08 * crushed).astype(np.float32)
+    # 25% wet: professional glue compression standard. Adds density without smearing.
+    return (0.75 * inst + 0.25 * crushed).astype(np.float32)
 
 
 def _parallel_compress_vocal(vox_ch: np.ndarray, rap_score: float = 0.5) -> np.ndarray:
@@ -5193,50 +5175,38 @@ def _master(mix: np.ndarray, bpm: float = 120.0, sub_cut_db: float = 0.0,
     # A -1.5 dB cut at 3.2kHz dramatically reduces fatigue without perceived loudness loss,
     # freeing headroom for the limiter to work 0.5-1 dB harder.
     master_eq = Pedalboard([
-        LowShelfFilter(cutoff_frequency_hz=200.0,  gain_db=-4.0),       # cut excess upper-bass (band_bass z=+1.15)
-        PeakFilter(cutoff_frequency_hz=140.0,  gain_db=-2.5,  q=0.8),  # cut 80-200Hz band_bass body
-        PeakFilter(cutoff_frequency_hz=300.0,  gain_db=-2.0,  q=0.9),  # mud/boxiness cut
-        PeakFilter(cutoff_frequency_hz=500.0,  gain_db=-1.5,  q=0.8),  # lo-mid warmth control
+        # Low-mid stacking audit: total cut in 150-300 Hz must not exceed -3 dB.
+        # The old -4 dB shelf + -2.5 dB peak + -2.0 dB peak = -8.5 dB was
+        # hollowing the kick body and making the mix sound thin and phoney.
+        LowShelfFilter(cutoff_frequency_hz=200.0,  gain_db=-2.0),       # gentle upper-bass taming
+        PeakFilter(cutoff_frequency_hz=300.0,  gain_db=-1.0,  q=0.9),  # mild mud/boxiness cut
+        PeakFilter(cutoff_frequency_hz=500.0,  gain_db=-1.0,  q=0.8),  # lo-mid warmth control
         PeakFilter(cutoff_frequency_hz=900.0,  gain_db=+2.5,  q=0.8),  # lift 500-1200Hz mid body
-        PeakFilter(cutoff_frequency_hz=1200.0, gain_db=+1.5,  q=0.8),  # lift 1000-1600Hz mid upper (band_mid z=-0.91)
+        PeakFilter(cutoff_frequency_hz=1200.0, gain_db=+1.5,  q=0.8),  # lift 1000-1600Hz mid upper
         PeakFilter(cutoff_frequency_hz=1500.0, gain_db=+1.5,  q=0.7),  # lift 1200-2000Hz mid top
-        PeakFilter(cutoff_frequency_hz=2500.0, gain_db=-5.0,  q=0.7),  # deep cut highmid (band_highmid z=+0.90)
-        PeakFilter(cutoff_frequency_hz=4000.0, gain_db=-2.0,  q=0.8),  # cut upper highmid 3-5kHz (highmid_mid_ratio z=+2.59)
+        # 2.5 kHz is the primary vocal intelligibility zone — -5 dB was counteracting
+        # the presence boost in the vocal chain. Max -2 dB here.
+        PeakFilter(cutoff_frequency_hz=2500.0, gain_db=-2.0,  q=0.7),  # controlled highmid cut
+        PeakFilter(cutoff_frequency_hz=4000.0, gain_db=-1.5,  q=0.8),  # upper highmid tame
         PeakFilter(cutoff_frequency_hz=3200.0, gain_db=-1.5,  q=2.5),  # ear-fatigue notch
         PeakFilter(cutoff_frequency_hz=6500.0, gain_db=-2.0,  q=1.5),  # tame presence harshness (band_presence z=+1.10)
         HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=+0.5),      # restore air
     ])
     mix = master_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
 
-    # Sub-cut correction EQ — two-stage:
-    # 1. Auto-detect: measure sub/mid ratio NOW and cut immediately (don't wait for loop)
-    # 2. Loop correction: apply accumulated sub_cut_db from listen.py correction passes
-    _auto_sub_cut = 0.0
-    try:
-        _sos_sub  = butter(4, [20.0/(SR/2), 80.0/(SR/2)],  btype="band", output="sos")
-        _sos_mid4 = butter(4, [500.0/(SR/2), 4000.0/(SR/2)], btype="band", output="sos")
-        _m = _to_mono(mix)
-        _sub_r  = float(np.sqrt(np.mean(sosfilt(_sos_sub,  _m) ** 2)) + 1e-9)
-        _mid4_r = float(np.sqrt(np.mean(sosfilt(_sos_mid4, _m) ** 2)) + 1e-9)
-        _sub_mid_ratio = _sub_r / (_mid4_r + 1e-9)
-        # Target sub/mid linear ratio ≤ 1.8 (≈ 18 in the proportional scorer).
-        # Above 1.8: apply a shelf cut proportional to the excess.
-        if _sub_mid_ratio > 1.8:
-            _excess_db = 20.0 * np.log10(_sub_mid_ratio / 1.8)
-            _auto_sub_cut = float(np.clip(_excess_db * 0.7, 0.0, 6.0))  # 70% of excess, max 6 dB
-            print(f"      [Auto sub-cut] sub/mid={_sub_mid_ratio:.2f} → auto-cut {_auto_sub_cut:.1f} dB @80Hz",
-                  flush=True)
-    except Exception:
-        pass
-
-    _total_sub_cut = sub_cut_db + _auto_sub_cut
-    if _total_sub_cut > 0.1:
+    # Sub-cut correction EQ — single stage from listen.py QC loop only.
+    # The auto-detect stage has been removed: it was stacking with the sub-bass
+    # limiter below and the _kick_sub_sidechain in the iterative mixer, creating
+    # up to 20+ dB of accumulated sub attenuation across the chain. The sub-bass
+    # limiter (below, at -3 dBFS) is the single authoritative sub control.
+    # Only apply explicit correction-loop adjustments from listen.py QC passes.
+    if sub_cut_db > 0.1:
         _sub_eq = Pedalboard([
-            LowShelfFilter(cutoff_frequency_hz=80.0, gain_db=-float(_total_sub_cut)),
+            LowShelfFilter(cutoff_frequency_hz=80.0, gain_db=-float(sub_cut_db)),
         ])
         mix = _sub_eq(mix.T.astype(np.float32), SR).T.astype(np.float32)
-        print(f"      [Sub correction EQ] -{_total_sub_cut:.1f} dB shelf @80Hz "
-              f"(loop={sub_cut_db:.1f} + auto={_auto_sub_cut:.1f})", flush=True)
+        print(f"      [Sub correction EQ] -{sub_cut_db:.1f} dB shelf @80Hz (from QC loop)",
+              flush=True)
 
     # 4-band mastering compression: gentle tonal balance (1-3 dB GR per band)
     # Placed after mastering EQ so it controls, not changes, the tonal balance
@@ -5248,10 +5218,12 @@ def _master(mix: np.ndarray, bpm: float = 120.0, sub_cut_db: float = 0.0,
         print("[master:radio] Reference corrective EQ applied", flush=True)
     # ───────────────────────────────────────────────────────────────────────
 
-    # Maxx Bass, tanh saturation, and harmonic exciter all REMOVED from mastering.
-    # These three nonlinear stages were stacking intermodulation distortion and
-    # combined with the Chebyshev soft-clip to produce static/harshness artifacts.
-    # The Chebyshev soft-clip below is sufficient for peak control without IMD.
+    # Maxx Bass: psychoacoustic bass synthesis for consumer speaker compatibility.
+    # Sub-bass (40-80 Hz) is inaudible on earbuds, laptop speakers, and phone speakers.
+    # Synthesizes 2nd/3rd harmonics (80-300 Hz) so bass is "felt" on any playback system.
+    # blend=0.20 — conservative to avoid IMD. Placed before soft-clip, alone without
+    # tanh/harmonic exciter (those were the IMD source; this stage alone is clean).
+    mix = _maxx_bass(mix, fundamental_lo=50.0, fundamental_hi=90.0, blend=0.20)
 
     # Soft clip: Chebyshev 3rd-order (1.5x - 0.5x³) — gentler than tanh,
     # preserves low-level signal shape, clips peaks without hardness
