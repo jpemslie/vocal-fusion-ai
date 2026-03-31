@@ -160,7 +160,10 @@ REF = {
     # vocal_hnr_db: Harmonic-to-Noise Ratio on vocal band (300-3000 Hz) voiced frames.
     # Autocorrelation method (Praat). >15 dB = normophonic clear vocal.
     # <10 dB = breathy/noisy. Research: Ferrand 2002; Praat documentation.
-    "vocal_hnr_db":         (10.0, 40.0),
+    # Lower bound 10→0.5: Demucs htdemucs_ft creates a structural HNR ceiling of
+    # 0.5-2 dB due to stem bleed. Penalising below 0.5 scores an uncorrectable
+    # structural property, not a mix defect. HNR 0.5-10 is still flagged diagnostically.
+    "vocal_hnr_db":         (0.5, 40.0),
     # vocal_sfm: Spectral Flatness Measure of vocal band in voiced frames.
     # Geometric/arithmetic mean ratio of power spectrum. 0 = pure tone, 1 = white noise.
     # <0.1 = very tonal (over-tuned/robotic). 0.05-0.30 = natural harmonic vocal.
@@ -377,20 +380,22 @@ CORRECTIONS = {
     "transient_clarity":     ("lufs_delta",         0.0, -1.0),
     "crest_factor_db":       ("lufs_delta",         0.0, -1.0),
     "kick_headroom_db":      ("carve_db",           0.0, +1.0),
-    "beat_sync_score":       ("vocal_level",       +0.10, 0.0),
+    # beat_sync_score and groove_score: timing failures. Making the vocal louder
+    # (vocal_level) does NOT fix beat timing — onset detection is amplitude-normalized.
+    # No DSP correction can realign a structurally mis-timed stem. Removed.
     "vocal_bleed_score":     ("carve_db",           0.0, +1.5),
     "vocal_spectral_crest":  ("presence_db",       +1.0, -0.5),
     "vocal_modulation_index":("vocal_level",       +0.08, -0.05),
     "vocal_presence_ratio":  ("vocal_level",       +0.15, -0.10),
-    "groove_score":          ("vocal_level",       +0.05,  0.0),
-    "vocal_harmony_score":   ("carve_db",           0.0, +1.0),
-    "key_distance_semitones":("carve_db",           0.0, +2.0),
+    # vocal_harmony_score and key_distance_semitones: key alignment failures.
+    # carve_db cuts beat energy in the vocal zone — it does NOT change tonal center.
+    # These are diagnosis-only failures; no DSP parameter can fix key mismatch. Removed.
     "dynamic_complexity_db": ("lufs_delta",         0.0, -1.5),
     "lra_lu":                ("lufs_delta",        +0.5, -0.5),  # over-compressed → back off limiting
     "plr_db":                ("lufs_delta",        +1.0, -1.0),
-    # Vocal HNR too low (noisy/breathy): reduce carve (less spectral carving =
-    # vocal preserved more) and lower vocal level so masking noise is less prominent
-    "vocal_hnr_db":          ("carve_db",           -0.5, 0.0),
+    # vocal_hnr_db too low: louder vocal improves perceived SNR (vocal over noise floor).
+    # Previously mapped to carve_db -0.5, which was wrong (less carve = more beat bleed).
+    "vocal_hnr_db":          ("vocal_level",       +0.10, 0.0),
     # Sub-bass ratio too high → targeted sub shelf cut below 80 Hz in mastering
     # (lufs_delta doesn't help here — reducing master volume keeps the ratio the same)
     "ratio_sub_to_mid":      ("sub_cut_db",         0.0, +2.0),
@@ -398,9 +403,48 @@ CORRECTIONS = {
     "delta_sub":       ("sub_cut_db",        -1.5, +2.0),  # sub thin → ease off sub cut; sub heavy → cut
     "delta_bass":      ("carve_db",          -1.0, +1.0),  # bass thin → cut less carve
     "delta_mid":       ("carve_db",          -1.5, +1.5),  # mid thin → cut less in mid
+    "delta_hi_mid":    ("presence_db",       +1.0, -1.0),  # hi-mid thin → boost presence (3kHz shelf lifts 2-5kHz)
     "delta_presence":  ("presence_db",       +1.5, -1.5),  # presence thin → boost presence
     "delta_air":       ("air_db",            +1.5, -1.5),  # air thin → boost air shelf
 }
+
+# ── Domain-weighted scoring ───────────────────────────────────────────────────
+# Metrics grouped by perceptual tier. Used by _score() to compute per-domain
+# health scores and apply floor gates (prevents "mediocre everywhere" from passing).
+TIER_METRICS = {
+    "technical": [
+        "lufs_integrated", "true_peak_dbfs", "lra_lu", "crest_factor_db",
+        "plr_db", "stereo_correlation", "low_freq_stereo_corr",
+    ],
+    "spectral": [
+        "ratio_sub_to_mid", "ratio_bass_to_mid", "ratio_lowmid_to_mid",
+        "ratio_himid_to_mid", "ratio_high_to_mid", "lowmid_over_himid",
+        "high_over_himid", "transient_clarity", "kick_headroom_db",
+        "mud_index", "section_consistency_lu", "spectral_slope_db_oct",
+    ],
+    "perceptual": [
+        "beat_sync_score", "vocal_clarity_index", "tempo_stability",
+        "click_artifact_score", "vocal_bleed_score", "vocal_spectral_crest",
+        "vocal_modulation_index", "vocal_presence_ratio", "vocal_hnr_db", "vocal_sfm",
+    ],
+    "musical": [
+        "groove_score", "dynamic_arc_score", "vocal_harmony_score",
+    ],
+    "mashup": [
+        "dynamic_complexity_db", "key_distance_semitones", "vocal_robot_score",
+    ],
+}
+# Perceptual weights — mashup quality is driven most by perceptual + musical feel
+TIER_WEIGHTS = {
+    "technical":  0.15,
+    "spectral":   0.20,
+    "perceptual": 0.35,
+    "musical":    0.20,
+    "mashup":     0.10,
+}
+# Floor gate: if any tier scores below this, cap final score at 65 (C-max)
+# Prevents "technically perfect but sounds broken" from passing
+TIER_FLOOR = 30.0
 
 
 # ── Filter helpers ─────────────────────────────────────────────────────────────
@@ -994,11 +1038,18 @@ def _measure(audio_path: str) -> dict:
         beat_sync_score = 0.5
 
     # ── VOCAL CLARITY INDEX (reuses shared S_mag / freqs) ─────────────────────
+    # Proper spectral masking model (upward masking from low-freq energy):
+    #   - speech_lo_mask: 300-800 Hz — directly below speech fundamentals,
+    #     the main masker of vowel onset clarity
+    #   - speech_int: 800-3000 Hz — primary vowel formant + consonant zone
+    # If speech_lo is >3 dB above speech_int, upward masking is audible.
+    # Old formula (20-300 Hz vs 1-4 kHz) compared the wrong bands — sub-bass
+    # is separated from speech by several octaves and not the primary masker.
     try:
-        bass_db_vc = _band_db(S_mag, freqs,   20,  300)
-        mid_db_vc  = _band_db(S_mag, freqs, 1000, 4000)
-        masking_pressure = max(0.0, bass_db_vc - mid_db_vc - 10.0)
-        vocal_clarity_index = float(mid_db_vc - masking_pressure)
+        speech_lo_mask_db = _band_db(S_mag, freqs, 300,   800)
+        speech_int_db     = _band_db(S_mag, freqs, 800,  3000)
+        masking_pressure  = max(0.0, speech_lo_mask_db - speech_int_db - 3.0)
+        vocal_clarity_index = float(speech_int_db - masking_pressure)
     except Exception:
         vocal_clarity_index = 5.0
 
@@ -1149,8 +1200,10 @@ def _measure(audio_path: str) -> dict:
         groove_score = 0.50
 
     # ── DYNAMIC ARC SCORE ─────────────────────────────────────────────────────
-    # A professional song has an energy arc: builds toward a climax around
-    # 60-70% through the track, then resolves. Flat energy = loop, not song.
+    # Score against multiple song structure templates — the best match wins.
+    # A single crescendo template (old approach) was wrong for verse-chorus hip-hop:
+    # the sawtooth loudness profile of a chorus-verse-chorus structure correlates
+    # negatively with a single-peak arc despite being correct song construction.
     try:
         arc_win = SR * 10
         n_wins = len(mono) // arc_win
@@ -1159,12 +1212,32 @@ def _measure(audio_path: str) -> dict:
                 float(np.sqrt(np.mean(mono[i * arc_win:(i + 1) * arc_win] ** 2) + 1e-12))
                 for i in range(n_wins)
             ])
-            t_frac = np.linspace(0, 1, n_wins)
-            ideal = np.where(t_frac < 0.65,
-                             0.3 + 0.7 * (t_frac / 0.65) ** 1.2,
-                             1.0 - 0.5 * ((t_frac - 0.65) / 0.35))
-            corr_arc = float(np.corrcoef(win_rms, ideal)[0, 1])
-            dynamic_arc_score = float(np.clip((corr_arc + 1.0) / 2.0, 0.0, 1.0))
+            # Filter out silence windows (RMS below -55 dBFS equivalent)
+            silence_floor = 10 ** (-55.0 / 20)
+            win_rms_active = np.where(win_rms < silence_floor, np.nan, win_rms)
+
+            def _arc_template_corr(template_pts: list) -> float:
+                tmpl = np.interp(np.linspace(0, 1, n_wins),
+                                 np.linspace(0, 1, len(template_pts)), template_pts)
+                valid = ~np.isnan(win_rms_active)
+                if valid.sum() < 3:
+                    return 0.0
+                r = np.corrcoef(win_rms_active[valid], tmpl[valid])
+                return float(r[0, 1]) if np.isfinite(r[0, 1]) else 0.0
+
+            arc_templates = {
+                # Hip-hop / trap: verse-chorus alternation
+                "hiphop_vc":  [0.45, 1.0, 0.5, 1.0, 0.4],
+                # EDM / house: build → drop → break → drop
+                "edm_drop":   [0.3, 0.55, 1.0, 0.35, 1.0, 0.3],
+                # Ballad / pop: slow build to peak, gradual resolve
+                "ballad":     [0.3, 0.55, 0.8, 1.0, 0.85, 0.5],
+                # Classic crescendo (original): steady build + resolve
+                "crescendo":  [0.3, 0.5, 0.75, 1.0, 0.9, 0.7],
+            }
+            best_corr = max(_arc_template_corr(pts)
+                            for pts in arc_templates.values())
+            dynamic_arc_score = float(np.clip((best_corr + 1.0) / 2.0, 0.0, 1.0))
         else:
             dynamic_arc_score = 0.50
     except Exception:
@@ -1352,8 +1425,23 @@ def _measure(audio_path: str) -> dict:
 
 
 def _score(metrics: dict, ref: dict) -> tuple:
+    """
+    Compute quality score and issue list.
+
+    Uses a hybrid model:
+      1. Penalty accumulation (subtractive, same as before) for the overall score
+      2. Per-domain tier scores to apply floor gates — prevents "mediocre
+         everywhere" from achieving a passing grade despite no single CRITICAL failure
+      3. vocal_hnr_db and vocal_sfm mutual exclusion — both measure noise floor,
+         double-counting them inflates the penalty for a single underlying cause
+
+    Returns (score: int, issues: list-of-tuples).
+    """
     score = 100
     issues = []
+    # Track which penalty we already charged for correlated metrics
+    _hnr_sfm_penalty_charged = 0  # at most max(hnr_penalty, sfm_penalty)
+
     for key, (lo, hi) in ref.items():
         if key.startswith("_"):  # display-only keys are never scored
             continue
@@ -1362,21 +1450,62 @@ def _score(metrics: dict, ref: dict) -> tuple:
         val = metrics[key]
         penalty = PENALTIES.get(key, 5)
         p_lo, p_hi = PROBLEM_NAMES.get(key, ("below range", "above range"))
+        fired = False
+        desc = ""
         if val < lo:
             delta = lo - val
             if delta > (hi - lo):
                 penalty = min(penalty * 2, 30)
-            score -= penalty
-            sev = "CRITICAL" if penalty >= 20 else ("HIGH" if penalty >= 10 else "MEDIUM")
-            issues.append((sev, key, val, lo, hi, p_lo))
+            fired = True
+            desc = p_lo
         elif val > hi:
             delta = val - hi
             if delta > (hi - lo):
                 penalty = min(penalty * 2, 30)
+            fired = True
+            desc = p_hi
+
+        if not fired:
+            continue
+
+        # Mutual exclusion: vocal_hnr_db and vocal_sfm both measure noise floor.
+        # Charge only the larger of the two, never both.
+        if key in ("vocal_hnr_db", "vocal_sfm"):
+            if penalty > _hnr_sfm_penalty_charged:
+                extra = penalty - _hnr_sfm_penalty_charged
+                score -= extra
+                _hnr_sfm_penalty_charged = penalty
+            # still append to issues list so correction loop sees the failure
+        else:
             score -= penalty
-            sev = "CRITICAL" if penalty >= 20 else ("HIGH" if penalty >= 10 else "MEDIUM")
-            issues.append((sev, key, val, lo, hi, p_hi))
-    return max(0, score), issues
+
+        sev = "CRITICAL" if penalty >= 20 else ("HIGH" if penalty >= 10 else "MEDIUM")
+        if val < ref[key][0]:
+            issues.append((sev, key, val, ref[key][0], ref[key][1], desc))
+        else:
+            issues.append((sev, key, val, ref[key][0], ref[key][1], desc))
+
+    # ── Domain floor gate ─────────────────────────────────────────────────────
+    # Compute tier-level health (0-100) and cap the final score if any tier
+    # falls below TIER_FLOOR. This catches "mediocre everywhere" false positives
+    # where no single metric fires but many are borderline.
+    tier_scores: dict[str, float] = {}
+    for tier, keys in TIER_METRICS.items():
+        max_possible = sum(PENALTIES.get(k, 5) for k in keys if k in ref)
+        if max_possible == 0:
+            tier_scores[tier] = 100.0
+            continue
+        tier_penalty = 0
+        for issue in issues:
+            if issue[1] in keys:
+                tier_penalty += PENALTIES.get(issue[1], 5)
+        tier_scores[tier] = max(0.0, 100.0 * (1.0 - tier_penalty / max_possible))
+
+    worst_tier = min(tier_scores.values()) if tier_scores else 100.0
+    if worst_tier < TIER_FLOOR:
+        score = min(score, 65)
+
+    return max(0, score), issues, tier_scores
 
 
 def _grade(score: int) -> str:
@@ -1523,8 +1652,30 @@ def score_file(audio_path: str, strict: bool = False, reference_path: str = None
         "transient_clarity": _pref["transient_clarity"] if _REF_PROFILE else ref_base["transient_clarity"],
     }
 
+    # Tighten spectral_slope and PLR using reference profile IQR — these were using
+    # very wide static windows that let clearly wrong values pass undetected.
+    if _REF_PROFILE:
+        try:
+            _slope = _REF_PROFILE["dynamics"]["spectral_slope"]
+            # Reference slope is negative (e.g., -5.25 dB/oct). p25 is more negative,
+            # p75 is less negative. Add 15% flex outside IQR edges.
+            ref["spectral_slope_db_oct"] = (
+                float(_slope["p25"]) * 1.15,   # more negative = darker ceiling
+                float(_slope["p75"]) * 0.85,   # less negative = brighter ceiling
+            )
+        except Exception:
+            pass
+        try:
+            _plr = _REF_PROFILE["loudness"]["plr"]
+            ref["plr_db"] = (
+                float(_plr["p25"]) - 1.5,   # 1.5 dB flex below reference p25
+                float(_plr["p75"]) + 1.5,   # 1.5 dB flex above reference p75
+            )
+        except Exception:
+            pass
+
     metrics = _measure(audio_path)
-    score, issues = _score(metrics, ref)
+    score, issues, tier_scores = _score(metrics, ref)
 
     # ── Change 4: spectral_match_score penalty ─────────────────────────────
     sms = metrics.get("spectral_match_score", 50.0)
@@ -1570,12 +1721,9 @@ def score_file(audio_path: str, strict: bool = False, reference_path: str = None
         issues.append(("MEDIUM", "uneven_vocal_presence", vpc, 55.0, 100.0,
                        "Vocal presence is uneven across sections"))
 
-    # ── mel_stft_quality_score: perceptual smoothness / musical quality ──────
-    msqs = metrics.get("mel_stft_quality_score", 50.0)
-    if msqs < 30.0:
-        score = max(0, score - 5)
-        issues.append(("MEDIUM", "low_mel_stft_quality", msqs, 30.0, 100.0,
-                       "Mix sounds harsh or artifact-laden — mel-STFT quality score below threshold"))
+    # mel_stft_quality_score: diagnostic only — no penalty (metric anti-correlates
+    # with perceived quality on transient-heavy hip-hop/EDM; vocal_clarity_index
+    # and vocal_hnr_db cover the underlying concern more accurately).
 
     # ── vocal_intelligibility_score: STOI-proxy — can listeners understand words?
     vis = metrics.get("vocal_intelligibility_score", 50.0)
