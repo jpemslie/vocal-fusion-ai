@@ -4564,14 +4564,18 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
           flush=True)
 
     # Stage 10: BPM-synced dotted-eighth delay (the Drake/Future echo effect).
-    # SKIP for direct_vocal: 437ms echo at 18% wet/28% feedback makes syllables
-    # overlap on phone recordings — speech becomes completely unintelligible.
-    if not style.get("_direct_vocal", False):
+    # Only applied to rap vocals (rap_score > 0.55). Melodic/singing vocals have
+    # flowing phrases with no inter-word gaps for the echo to sit in — at 350ms
+    # the delay smears every word into the next syllable, destroying intelligibility.
+    # Same problem as direct_vocal but the old gate only checked _direct_vocal.
+    _delay_rap_score = style.get("_rap_score", 0.5)
+    if not style.get("_direct_vocal", False) and _delay_rap_score > 0.55:
         vox_ch = _bpm_delay(vox_ch, bpm=bpm)
         print(f"      [Stage 10] BPM delay applied ({bpm:.0f} BPM, dotted-8th)",
               flush=True)
     else:
-        print("      [Stage 10] BPM delay skipped (direct vocal — no echo on speech).",
+        _why = "direct vocal" if style.get("_direct_vocal", False) else f"melodic vocal (rap_score={_delay_rap_score:.2f})"
+        print(f"      [Stage 10] BPM delay skipped ({_why} — delay smears words).",
               flush=True)
 
     # Stage 11: auto harmony — diatonic third above.
@@ -6223,8 +6227,37 @@ def fuse(song_a: str, song_b: str, out_path: str,
               f"stem-detected {_NOTES[stem_key_a_root]} {stem_key_a_mode}", flush=True)
         print(f"      B: was {_NOTES[key_b_root]} {key_b_mode} → "
               f"stem-detected {_NOTES[stem_key_b_root]} {stem_key_b_mode}", flush=True)
-        key_a_root, key_a_mode = stem_key_a_root, stem_key_a_mode
-        key_b_root, key_b_mode = stem_key_b_root, stem_key_b_mode
+        # Sanity-check stem re-detection against whole-file detection.
+        # When Demucs removes vocals, the remaining harmonic content can mislead
+        # key detection by 3-5 semitones (e.g. F minor → G# major on a no-vocals stem).
+        # A root shift >2 semitones is almost always a detection error — the melodic
+        # context that anchors the key is missing from the stem. Only accept the
+        # stem-detected key if it agrees with the file-level detection within 2st.
+        def _key_drift(orig_root, new_root):
+            diff = abs(orig_root - new_root)
+            return min(diff, 12 - diff)
+
+        # Accept stem key only if root is within 2 semitones AND mode matches.
+        # Mode flips (major↔minor on same root) are also detection errors — a solo
+        # vocal stem often reads as the parallel major/minor depending on which notes
+        # sustain longest. A mode flip alone changes the Camelot wheel path enough to
+        # cause a 3-4 semitone pitch shift that sounds like a "dying robot" on processed vocals.
+        def _stem_key_ok(orig_root, orig_mode, new_root, new_mode):
+            return _key_drift(orig_root, new_root) <= 2 and orig_mode == new_mode
+
+        if _stem_key_ok(key_a_root, key_a_mode, stem_key_a_root, stem_key_a_mode):
+            key_a_root, key_a_mode = stem_key_a_root, stem_key_a_mode
+        else:
+            print(f"      Stem key A rejected ({_NOTES[stem_key_a_root]} {stem_key_a_mode} "
+                  f"vs original {_NOTES[key_a_root]} {key_a_mode}) — "
+                  f"keeping original", flush=True)
+
+        if _stem_key_ok(key_b_root, key_b_mode, stem_key_b_root, stem_key_b_mode):
+            key_b_root, key_b_mode = stem_key_b_root, stem_key_b_mode
+        else:
+            print(f"      Stem key B rejected ({_NOTES[stem_key_b_root]} {stem_key_b_mode} "
+                  f"vs original {_NOTES[key_b_root]} {key_b_mode}) — "
+                  f"keeping original", flush=True)
 
     if not direct_vocal:
         # ── System 2: Assess stem quality BEFORE bleed removal to set adaptive params ──
