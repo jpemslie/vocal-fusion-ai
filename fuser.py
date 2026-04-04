@@ -113,8 +113,8 @@ SR = 44100
 # ---------------------------------------------------------------------------
 _PARAM_OVERRIDE: dict = {}
 
-_MBR_VOCAL      = "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt"  # Mel-Band RoFormer vocal (SDR ~11.4) — primary
-_BS_ROFORMER    = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"         # BS-Roformer vocal (SDR ~12.97) — secondary fallback
+_MBR_VOCAL      = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"         # BS-RoFormer vocal (SDR ~12.97) — primary (community best for clean acapella)
+_BS_ROFORMER    = "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt"  # Mel-Band RoFormer vocal (SDR ~11.4) — fallback
 _MDX_VOCAL      = "Kim_Vocal_2.onnx"          # MDX-Net vocal (SDR ~9.5, ONNX fast on CPU)
 _MDX23C_VOCAL   = "MDX23C-8KFFT-InstVoc_HQ.ckpt"  # MDX23C vocal (SDR ~12+, better quality)
 _DENOISE_MODEL  = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"          # post-sep denoiser (SDR 27.99)
@@ -854,6 +854,32 @@ def _deepfilter_clean(vox_mono: np.ndarray, wet: float = 0.20) -> np.ndarray:
     except Exception as e:
         print(f"      [DeepFilter failed ({e}), using noisereduce]", flush=True)
         return _clean_vocal(vox_mono)
+
+
+def _harmonic_exciter(y: np.ndarray, hpf_hz: float = 4500.0,
+                      drive: float = 1.8, wet: float = 0.12) -> np.ndarray:
+    """
+    Aural exciter: parallel high-frequency saturation to restore air and presence
+    stripped by stem separation and DeepFilterNet processing.
+
+    Architecture (based on Aphex Aural Exciter patent):
+      1. HPF above crossover to isolate upper harmonics region
+      2. Asymmetric soft clip (tanh with small DC offset) — generates even + odd harmonics
+      3. Attenuate 60%, mix parallel with dry signal
+
+    This adds upper harmonics the separator smears rather than boosting existing ones
+    (unlike a shelf EQ). The vocal "cuts through" without a loudness increase.
+
+    For auto-tuned/melodic vocals (Don Toliver style): hpf_hz=5500, wet=0.08.
+    For drier/darker vocals: hpf_hz=4000, wet=0.15.
+    """
+    from scipy.signal import butter, sosfilt as _sosfilt
+    sos = butter(4, hpf_hz / (SR / 2.0), btype='high', output='sos')
+    hi = _sosfilt(sos, y.astype(np.float64))
+    # Asymmetric clip: DC offset before tanh generates even harmonics (warmth)
+    dc = 0.08
+    excited = np.tanh(hi * drive + dc) - np.tanh(dc)
+    return (y + wet * excited * 0.4).astype(np.float32)
 
 
 def _phrase_gain_rider(vox: np.ndarray, inst: np.ndarray,
@@ -3622,9 +3648,12 @@ def _pitch_correct(vox_mono: np.ndarray, target_root: int, target_mode: str,
                 e = min(j * frame_samples, len(out))
                 segment = out[s:e].astype(np.float32)
 
-                # Apply micro pitch shift to this segment
+                # Apply micro pitch shift to this segment.
+                # -c 1: low crispness — reduces phasiness on sustained auto-tuned notes.
+                # --no-transients: don't insert phantom transients on vowels (common on
+                # heavily processed trap/auto-tune vocals where onset positions are ambiguous).
                 corrected = rb.pitch_shift(segment, SR, correction_semitones,
-                                           rbargs={'-3': ''})
+                                           rbargs={'-3': '', '-c': '1', '--no-transients': ''})
                 out[s:e] = corrected[:e - s].astype(np.float32)
 
             i = j
@@ -3801,7 +3830,7 @@ def _crepe_pitch_correct(vox_ch: np.ndarray) -> np.ndarray:
               flush=True)
         if HAS_PYRUBBERBAND:
             return rb.pitch_shift(vox_ch.astype(np.float32), SR, shift_st,
-                                   rbargs={'-3': ''}).astype(np.float32)
+                                   rbargs={'-3': '', '-c': '1', '--no-transients': ''}).astype(np.float32)
         return None
 
     # ── Try CREPE first (needs tensorflow; silent fallback if unavailable) ─────
@@ -4336,6 +4365,21 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         ], axis=0)
     print("      [Stage 0] DeepFilterNet vocal cleaning applied.", flush=True)
 
+    # Stage 0.1: Harmonic exciter — restores upper-harmonic air stripped by separation + DeepFilter.
+    # Stem separation smears high-frequency harmonics (HNR degrades). The exciter synthesises
+    # new harmonics from existing signal via asymmetric saturation — adds presence without loudness.
+    # For melodic/auto-tuned vocals (Don Toliver): hpf at 5500 Hz, wet=0.08 (already bright).
+    # For rap/drier vocals: hpf at 4000 Hz, wet=0.14 (needs more restoration).
+    _ex_rap = style.get("_rap_score", 0.5)
+    _ex_hpf = float(np.interp(_ex_rap, [0.0, 1.0], [5500.0, 4000.0]))
+    _ex_wet = float(np.interp(_ex_rap, [0.0, 1.0], [0.08, 0.14]))
+    vox_ch = np.stack([
+        _harmonic_exciter(vox_ch[c], hpf_hz=_ex_hpf, drive=1.8, wet=_ex_wet)
+        for c in range(vox_ch.shape[0])
+    ], axis=0).astype(np.float32)
+    print(f"      [Stage 0.1] Harmonic exciter: hpf={_ex_hpf:.0f} Hz wet={_ex_wet:.2f} "
+          f"(rap={_ex_rap:.2f})", flush=True)
+
     # Stage 0.5: HPSS harmonic masking — removes hi-hat/percussive bleed.
     # SKIP for direct_vocal: phone recordings have no hi-hat bleed. HPSS at 90%
     # blend removes consonants (t, k, p, d) making speech completely unintelligible.
@@ -4402,16 +4446,23 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
         ], axis=0)
 
     if HAS_PYRUBBERBAND and (abs(ratio - 1.0) > 0.005 or n_semitones != 0):
+        # Build rubberband flags based on vocal style.
+        # Melodic/auto-tuned vocals (rap_score < 0.55):
+        #   -c 1: low crispness — reduces phasiness on sustained notes. The default
+        #         crispness=5 inserts transients at spectrally uncertain positions,
+        #         creating a "warbling" or "robot" artifact on held auto-tuned vowels.
+        #   --no-transients: disables transient detection entirely. Auto-tuned vocals
+        #         have no reliable natural transients — rubberband's transient detector
+        #         fires on pitch-correction artifacts, making them worse.
+        # Rap vocals (rap_score >= 0.55): keep default crispness (5) — rap consonants
+        #         are real transients that benefit from sharp transient preservation.
+        _is_melodic = style.get("_rap_score", 0.5) < 0.55
+        _rb_base = {'-3': '', '-c': '1', '--no-transients': ''} if _is_melodic else {'-3': ''}
         stretched = []
         for c in range(vox_ch.shape[0]):
-            y_s = rb.time_stretch(vox_ch[c], SR, ratio, rbargs={'-3': ''})
+            y_s = rb.time_stretch(vox_ch[c], SR, ratio, rbargs=_rb_base)
             if n_semitones != 0:
-                # Preserve formants on any pitch shift to prevent "honky" artifacts.
-                # --formant tells rubberband to use a separate formant envelope during pitch shift.
-                _rb_args = {'-3': ''}
-                if abs(n_semitones) > 0:
-                    _rb_args['--formant'] = ''
-                y_s = rb.pitch_shift(y_s, SR, n_semitones, rbargs=_rb_args)
+                y_s = rb.pitch_shift(y_s, SR, n_semitones, rbargs=_rb_base)
             stretched.append(y_s)
         vox_ch = np.stack(stretched, axis=0).astype(np.float32)
     elif abs(ratio - 1.0) > 0.005 or n_semitones != 0:
