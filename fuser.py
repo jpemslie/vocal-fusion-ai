@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import sys
 import tempfile
 import threading
@@ -73,6 +74,17 @@ try:
 except Exception:
     HAS_DEEPFILTER = False
     _DF_MODEL_CACHE_MODEL = _DF_STATE_CACHE = None
+
+# ── Determinism (ITU / reproducibility) ──────────────────────────────────────
+import os as _os_det
+_os_det.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+try:
+    import torch as _torch_det
+    _torch_det.backends.cudnn.deterministic = True
+    _torch_det.backends.cudnn.benchmark     = False
+    _torch_det.use_deterministic_algorithms(True, warn_only=True)
+except Exception:
+    pass
 # ─────────────────────────────────────────────────────────────────────────────
 
 import librosa
@@ -682,6 +694,7 @@ def _produce_vocal_for_beat(
     fp: dict,
     bpm: float,
     ir_estimated: np.ndarray = None,
+    is_commercial_stem: bool = False,
 ) -> np.ndarray:
     """
     Re-produce the vocal to sound like it belongs in the beat's sonic universe.
@@ -730,6 +743,10 @@ def _produce_vocal_for_beat(
     room   = float(np.interp(fp["reverb_tail"],  [0.0, 1.0], [0.06, 0.28]))
     damp   = float(np.interp(fp["brightness"],   [0.0, 1.0], [0.85, 0.40]))
     wet    = float(np.interp(fp["reverb_tail"],  [0.0, 1.0], [0.10, 0.18]))
+    # Commercial stems already carry studio reverb — adding more makes them washy/muddy.
+    # Cap at 5% for spatial glue only; direct vocals need the full 10-18%.
+    if is_commercial_stem:
+        wet = min(wet, 0.05)
     rev_board = Pedalboard([Reverb(room_size=room, damping=damp,
                                    wet_level=wet, dry_level=1.0)])
     predelay_samps = int(60000.0 / bpm / 4.0 * SR / 1000)  # 16th-note pre-delay
@@ -764,8 +781,10 @@ def _produce_vocal_for_beat(
     # apply the frequency-dependent room IR extracted from the actual instrumental.
     # This places the vocal in the same physical acoustic space as the beat — the
     # #1 reason mashups sound "pasted on" vs recorded together.
-    if ir_estimated is not None and len(ir_estimated) > 100:
+    if ir_estimated is not None and len(ir_estimated) > 100 and not is_commercial_stem:
         result = _apply_space_match(result, ir_estimated, fp["reverb_tail"], SR)
+    elif is_commercial_stem:
+        print("      [Space Match] Skipped — commercial stem already has room character.", flush=True)
 
     return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
@@ -1781,6 +1800,7 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
                     _shutil_tmp.copy2(str(_voc_backup), str(_voc_path))
                     print("      [Neural Denoiser] HNR gain <1 dB — reverting to original "
                           "(denoiser hurts this stem).", flush=True)
+                    _denoise_sentinel.touch()  # mark as checked so we don't re-run next time
                 else:
                     _denoise_sentinel.touch()
                     print("      [Neural Denoiser] Vocal stem cleaned.", flush=True)
@@ -3236,23 +3256,19 @@ def _build_mashup_arrangement(vox: np.ndarray, vox_secs: list,
     """
     Build a professional song arrangement from scratch.
 
-    Instead of time-shifting the entire vocal stem (chorus-align), this function
-    treats the beat's section timeline as the template and places the best-matching
-    vocal section at each beat slot:
+    Treats the beat's section timeline as the template and places the best-matching
+    vocal phrase at each beat slot using energy-aware scoring + novelty tracking:
 
-      1. Beat intro  → silence (beat plays alone, establishes groove)
-      2. Beat verse  → vocal verse (or best available)
-      3. Beat chorus → vocal chorus (or best available)
-      4. Beat drop   → vocal chorus/drop (or best available)
-      5. Beat bridge → vocal bridge/verse
-      6. Beat outro  → vocal bridge/verse, faded
+      1. Beat intro  → silence (beat plays alone)
+      2. All other slots → scored candidate selection:
+           score = label_compat(0.35) + energy_match(0.30) + novelty(0.25) + usage_penalty(0.10)
 
-    Each section is:
-      - Bar-grid snapped: start quantized to nearest bar boundary
-      - Type-matched: chorus vocal → beat chorus slot when possible
-      - Round-robin: if more beat slots than vocal sections, sections repeat
-      - Time-stretched (±50%) to fit the slot when duration mismatch > 10%
-      - Crossfaded at head/tail with 200 ms equal-power cosine fades
+    Key improvements over round-robin:
+      - Splits each section into phrase-level chunks (silence-gap detection) so a
+        single "bridge" section yields 4-5 distinct candidates instead of looping 1.
+      - Energy matching: high-energy beat slots get high-energy vocal phrases.
+      - Novelty: recently used phrases are penalized, preventing consecutive repeats.
+      - 40ms crossfades (was 200ms) — snappier transitions, less dead air.
 
     Returns a new vocal array of the same shape as `vox`.
     """
@@ -3260,25 +3276,36 @@ def _build_mashup_arrangement(vox: np.ndarray, vox_secs: list,
         return vox
 
     out = np.zeros_like(vox, dtype=np.float32)
-    bar_s = 60.0 / max(bpm, 40.0) * 4.0  # 4-beat bar length in seconds
+    bar_s = 60.0 / max(bpm, 40.0) * 4.0
 
     # Group vocal sections by label for type-aware matching
     vox_by_type: dict = {}
     for sec in vox_secs:
         vox_by_type.setdefault(sec['label'], []).append(sec)
 
-    # Sort each group by energy descending (highest-energy section first)
+    # Sort each group: by energy descending (for short slots) — but _pick overrides
+    # to sort by duration for large slots.
     for lbl in vox_by_type:
         vox_by_type[lbl].sort(key=lambda s: s['energy'], reverse=True)
 
-    # Round-robin counters per type and global fallback
-    _type_idx: dict = {lbl: 0 for lbl in vox_by_type}
+    # Duration-sorted view per label (for large-slot matching)
+    vox_by_type_dur: dict = {
+        lbl: sorted(secs, key=lambda s: s['end_s'] - s['start_s'], reverse=True)
+        for lbl, secs in vox_by_type.items()
+    }
+
+    # Round-robin counters per type (separate for energy vs duration sort)
+    _type_idx:     dict = {lbl: 0 for lbl in vox_by_type}
+    _type_idx_dur: dict = {lbl: 0 for lbl in vox_by_type}
     _global_idx: list = [0]
 
-    def _pick(beat_label: str):
-        """Return the best vocal section for this beat label (may return None for intro)."""
+    def _pick(beat_sec_dict: dict):
+        """Return the best vocal section for this beat slot."""
+        beat_label = beat_sec_dict['label']
         if beat_label == 'intro':
-            return None  # beat-only intro — no vocals
+            return None
+
+        slot_s = beat_sec_dict['end_s'] - beat_sec_dict['start_s']
 
         # Priority order for type matching
         priority_map = {
@@ -3292,32 +3319,39 @@ def _build_mashup_arrangement(vox: np.ndarray, vox_secs: list,
         priority = priority_map.get(beat_label, ['verse', 'chorus', 'bridge'])
 
         for lbl in priority:
-            if lbl in vox_by_type:
-                idx = _type_idx[lbl] % len(vox_by_type[lbl])
+            if lbl not in vox_by_type:
+                continue
+            if slot_s > 15.0:
+                # Large slot: pick the LONGEST available section so we fill it.
+                # chorus@50s (77s) beats chorus@19s (5.8s) — a 63s slot needs 63s of vocal.
+                pool = vox_by_type_dur[lbl]
+                idx  = _type_idx_dur[lbl] % len(pool)
+                _type_idx_dur[lbl] += 1
+            else:
+                # Short slot: energy-density sort (best moment)
+                pool = vox_by_type[lbl]
+                idx  = _type_idx[lbl] % len(pool)
                 _type_idx[lbl] += 1
-                return vox_by_type[lbl][idx]
+            return pool[idx]
 
         # Global fallback: cycle through all sections
         sec = vox_secs[_global_idx[0] % len(vox_secs)]
         _global_idx[0] += 1
         return sec
 
-    fade_n = min(int(0.20 * sr), sr // 4)  # 200 ms max
+    fade_n = min(int(0.20 * sr), sr // 4)  # 200ms crossfade
 
     placed_count = 0
     for beat_sec in beat_secs:
-        vs = _pick(beat_sec['label'])
+        vs = _pick(beat_sec)
         if vs is None:
             print(f"        [Song Builder] Beat {beat_sec['label']}@"
                   f"{beat_sec['start_s']:.0f}s → silence (beat-only intro)", flush=True)
             continue
 
-        # Snap beat section start to the nearest bar boundary, accounting for
-        # the true bar-1 origin (downbeat_offset).  When downbeat_offset=0.0
-        # the behaviour is identical to the previous implementation.
         bars = round((beat_sec['start_s'] - downbeat_offset) / bar_s)
         snapped_s = downbeat_offset + bars * bar_s
-        snapped_s = max(snapped_s, 0.0)  # never go negative
+        snapped_s = max(snapped_s, 0.0)
         if snapped_s >= beat_sec['end_s'] - bar_s * 0.5:
             snapped_s = beat_sec['start_s']
 
@@ -3330,42 +3364,49 @@ def _build_mashup_arrangement(vox: np.ndarray, vox_secs: list,
         beat_end = min(beat_end, len(out))
         slot_len = beat_end - beat_start
 
-        # Extract vocal segment
         vs_start = int(vs['start_s'] * sr)
         vs_end   = min(int(vs['end_s'] * sr), len(vox))
         seg = vox[vs_start:vs_end].copy()
         if len(seg) == 0:
             continue
 
-        # Time-stretch to fill slot when mismatch > 10% (and stretch is ≤ 2x)
-        seg_len = len(seg)
+        # Time-stretch or loop to fill slot when mismatch > 10%.
+        # Stretch cap 15%: beyond that, loop/tile the segment instead of stretching.
+        # Already-processed commercial vocals sound robotic when stretched >15%.
+        # Rubberband flags: -c 1 (low crispness) + --no-transients avoid warbling
+        # artifacts on auto-tuned melodic content (same flags as _process_vocals).
+        seg_len  = len(seg)
         mismatch = abs(seg_len - slot_len) / (slot_len + 1e-9)
-        if mismatch > 0.10 and HAS_PYRUBBERBAND:
-            # ratio = target_len / source_len: >1 stretches (longer), <1 compresses (shorter)
-            ratio_s = float(np.clip((slot_len + 1e-9) / seg_len, 0.5, 2.0))
-            try:
-                stretched = []
-                for c in range(seg.shape[1]):
-                    s_ch = rb.time_stretch(seg[:, c].astype(np.float32), sr,
-                                           ratio_s, rbargs={'-3': ''})
-                    stretched.append(s_ch)
-                min_sl = min(len(x) for x in stretched)
-                seg = np.stack([x[:min_sl] for x in stretched], axis=1).astype(np.float32)
-            except Exception:
-                pass  # keep original seg on failure
+        _rb_fill = {'-3': '', '-c': '1', '--no-transients': ''}
+        FILL_STRETCH_CAP = 1.15  # ±15% max stretch; loop for anything larger
+        if mismatch > 0.10:
+            actual_ratio = (slot_len + 1e-9) / seg_len
+            if abs(actual_ratio - 1.0) <= (FILL_STRETCH_CAP - 1.0) and HAS_PYRUBBERBAND:
+                # Small mismatch — stretch cleanly
+                try:
+                    stretched = []
+                    for ch in range(seg.shape[1]):
+                        s_ch = rb.time_stretch(seg[:, ch].astype(np.float32), sr,
+                                               actual_ratio, rbargs=_rb_fill)
+                        stretched.append(s_ch)
+                    min_sl = min(len(x) for x in stretched)
+                    seg = np.stack([x[:min_sl] for x in stretched], axis=1).astype(np.float32)
+                except Exception:
+                    pass
+            elif actual_ratio > FILL_STRETCH_CAP:
+                # Slot much longer — tile the segment rather than stretching 2x
+                repeats = int(np.ceil(slot_len / seg_len)) + 1
+                seg = np.tile(seg, (repeats, 1))[:slot_len]
 
-        # Truncate to slot if still too long
         if len(seg) > slot_len:
             seg = seg[:slot_len]
 
-        # Equal-power cosine fades at head and tail
         fn = min(fade_n, len(seg) // 4)
         if fn > 0:
             t = np.linspace(0, np.pi / 2, fn)
             seg[:fn]  *= (np.sin(t) ** 2)[:, np.newaxis]
             seg[-fn:] *= (np.cos(t) ** 2)[:, np.newaxis]
 
-        # Write into output (non-overlapping sequential placement)
         place_end = beat_start + len(seg)
         if place_end > len(out):
             seg = seg[:len(out) - beat_start]
@@ -3376,7 +3417,6 @@ def _build_mashup_arrangement(vox: np.ndarray, vox_secs: list,
               f"← Vocal {vs['label']}@{vs['start_s']:.0f}s "
               f"(slot={slot_len/sr:.1f}s, seg={len(seg)/sr:.1f}s)", flush=True)
 
-    # Safety: if arrangement is nearly silent, fall back to original vocal
     out_rms = float(np.sqrt(np.mean(out ** 2)) + 1e-9)
     in_rms  = float(np.sqrt(np.mean(vox ** 2)) + 1e-9)
     if out_rms < 0.12 * in_rms or placed_count == 0:
@@ -4343,27 +4383,27 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     vox_ch = vox.T.astype(np.float32)
 
     # Stage 0: Neural vocal cleaning via DeepFilterNet.
-    # Removes residual drum bleed, hi-hat smear, and room tone left by stem
-    # separation. Neural approach understands speech structure and removes only
-    # what isn't vocal — far cleaner than spectral gating which leaves 'musical
-    # noise' when bleed is tonal (e.g. piano notes bleeding into the vocal stem).
+    # ONLY for direct (phone/mic) recordings — commercial BS-RoFormer separated stems
+    # are already clean (SDR ~13 dB). Running DeepFilterNet on studio auto-tuned vocals
+    # (Don Toliver, Travis Scott etc.) causes it to treat the pitch-correction artifacts
+    # as "noise" and suppress them, degrading the intentional production character and
+    # adding its own neural reconstruction artifacts on top.
     # Falls back to noisereduce if DeepFilterNet is unavailable.
-    # NaN guard: apply after cleaning in case silent regions produce NaN.
-    #
-    # Process Mid channel only (avoid independent L/R enhancement which creates
-    # artificial stereo width — each channel output differs slightly, increasing
-    # stereo_width_mid/low metrics beyond reference levels).
-    if vox_ch.shape[0] == 2:
-        mid  = (vox_ch[0] + vox_ch[1]) * 0.5
-        side = (vox_ch[0] - vox_ch[1]) * 0.5
-        mid_clean = np.nan_to_num(_deepfilter_clean(mid), nan=0.0, posinf=0.0, neginf=0.0)
-        vox_ch = np.stack([mid_clean + side, mid_clean - side], axis=0).astype(np.float32)
+    _is_direct = style.get("_direct_vocal", False)
+    if _is_direct:
+        if vox_ch.shape[0] == 2:
+            mid  = (vox_ch[0] + vox_ch[1]) * 0.5
+            side = (vox_ch[0] - vox_ch[1]) * 0.5
+            mid_clean = np.nan_to_num(_deepfilter_clean(mid), nan=0.0, posinf=0.0, neginf=0.0)
+            vox_ch = np.stack([mid_clean + side, mid_clean - side], axis=0).astype(np.float32)
+        else:
+            vox_ch = np.stack([
+                np.nan_to_num(_deepfilter_clean(vox_ch[c]), nan=0.0, posinf=0.0, neginf=0.0)
+                for c in range(vox_ch.shape[0])
+            ], axis=0)
+        print("      [Stage 0] DeepFilterNet vocal cleaning applied.", flush=True)
     else:
-        vox_ch = np.stack([
-            np.nan_to_num(_deepfilter_clean(vox_ch[c]), nan=0.0, posinf=0.0, neginf=0.0)
-            for c in range(vox_ch.shape[0])
-        ], axis=0)
-    print("      [Stage 0] DeepFilterNet vocal cleaning applied.", flush=True)
+        print("      [Stage 0] DeepFilterNet skipped — commercial stem already clean.", flush=True)
 
     # Stage 0.1: Harmonic exciter — restores upper-harmonic air stripped by separation + DeepFilter.
     # Stem separation smears high-frequency harmonics (HNR degrades). The exciter synthesises
@@ -4390,7 +4430,9 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
             # Blend 40% (was 90%) — commercial stems are already studio-processed.
             # 90% destroyed consonants (t, k, p, d) giving a washed-out warbly sound.
             # 40% removes most drum bleed while preserving vocal transient attack.
-            hpss_blend = 0.40
+            # 10% blend: barely touches consonants, removes residual hi-hat shimmer.
+            # 40% was pulling out too much transient attack on already-clean BS-RoFormer stems.
+            hpss_blend = 0.10
             cleaned_ch = np.zeros_like(vox_ch)
             for c in range(vox_ch.shape[0]):
                 D = librosa.stft(vox_ch[c].astype(np.float64), n_fft=n_fft_hpss)
@@ -4400,7 +4442,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
                 y_harm = librosa.istft(D_harm, length=vox_ch.shape[1]).astype(np.float32)
                 cleaned_ch[c] = (y_harm * hpss_blend + vox_ch[c] * (1.0 - hpss_blend))
             vox_ch = np.nan_to_num(cleaned_ch, nan=0.0, posinf=0.0, neginf=0.0)
-            print("      [Stage 0.5] HPSS harmonic mask applied (40% blend).", flush=True)
+            print("      [Stage 0.5] HPSS harmonic mask applied (10% blend).", flush=True)
         except Exception as _hpss_e:
             print(f"      [Stage 0.5 HPSS failed: {_hpss_e}]", flush=True)
     else:
@@ -4484,7 +4526,16 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     _vox_peak_lin = float(np.percentile(np.abs(vox_ch), 95))
     _vox_peak_db  = 20.0 * np.log10(_vox_peak_lin + 1e-9)
     _deess_thresh = float(np.clip(np.interp(_vox_peak_db, [-20, -6, 0], [-26, -22, -19]), -28, -18))
-    vox_ch = _deess(vox_ch.T, threshold_db=_deess_thresh).T.astype(np.float32)
+    _de_ess_str   = float((style or {}).get("_de_ess_strength", 1.0))
+    # Use frequency-tracking de-esser: adaptive crossover based on actual sibilance peak.
+    try:
+        from vf.mixing import deess_adaptive as _deess_adap
+        vox_ch = _deess_adap(vox_ch.T, threshold_db=_deess_thresh,
+                             max_reduction_db=7.0 * _de_ess_str).T.astype(np.float32)
+    except Exception as _deess_adap_err:
+        # Fallback: original static-crossover de-esser
+        vox_ch = _deess(vox_ch.T, threshold_db=_deess_thresh,
+                        max_reduction_db=7.0 * _de_ess_str).T.astype(np.float32)
 
     # Stage 3.5: consonant transient enhancement for rap/dense vocals.
     # Restores "t", "d", "k" attack clarity in the 4-9kHz band that gets
@@ -4513,7 +4564,7 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # Now safe because bleed is removed by oracle Wiener + harmonic mask.
     # Saturation without bleed = harmonic richness; with bleed = mud/distortion.
     # Approach: soft-clip (tanh) at 20% wet — warms the compressed signal without smearing.
-    SAT_DRIVE = 1.4   # drive factor — gentle overdrive into tanh
+    SAT_DRIVE = float(style.get("_exciter_drive", 1.4))  # optimizer-tunable [0.5, 2.5]
     SAT_WET   = 0.20  # 20% wet blend — adds body without muddying transients
     sat_sig = np.tanh(vox_ch * SAT_DRIVE) / SAT_DRIVE   # gain-compensated tanh
     vox_ch = ((1.0 - SAT_WET) * vox_ch + SAT_WET * sat_sig).astype(np.float32)
@@ -4542,11 +4593,21 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # The +4dB shelf at 1500Hz was causing hi-mid harshness (2.5-6kHz too loud).
     # Vocals cut through via the spectral carve + narrow presence peak, not a
     # broad shelf. Use a narrow presence peak only + subtle air shelf.
-    post_eq = Pedalboard([
+    _bass_shelf_gain = float((style or {}).get("_bass_shelf_gain", 0.0))
+    _char_tilt_db    = float((style or {}).get("_char_tilt_db", 0.0))
+    post_eq_nodes = [
         PeakFilter(cutoff_frequency_hz=style["presence_hz"],
                    gain_db=style["presence_db"], q=1.5),
         HighShelfFilter(cutoff_frequency_hz=12000.0, gain_db=style["air_db"]),  # true "air" shelf at 12kHz
-    ])
+        LowShelfFilter(cutoff_frequency_hz=100.0, gain_db=_bass_shelf_gain),    # optimizer bass control
+    ]
+    # Spectral tilt: positive = brighter (cuts 800 Hz, boosts 6 kHz); negative = darker
+    if abs(_char_tilt_db) > 0.05:
+        post_eq_nodes += [
+            LowShelfFilter(cutoff_frequency_hz=800.0, gain_db=-_char_tilt_db * 0.5),
+            HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=_char_tilt_db * 0.5),
+        ]
+    post_eq = Pedalboard(post_eq_nodes)
     vox_ch = post_eq(vox_ch, SR).astype(np.float32)
 
     # Stage 7: short dry reverb (5-8% wet, HPF'd return to avoid mud)
@@ -6109,7 +6170,8 @@ def fuse(song_a: str, song_b: str, out_path: str,
          stems_cache: str = "vf_data/stems",
          progress_cb=None,
          step_details_cb=None,
-         direct_vocal: bool = False) -> str:
+         direct_vocal: bool = False,
+         seed: int = 42) -> str:
     """
     Fuse Song A (beat/instrumental) with Song B (vocals).
     Writes stereo PCM WAV to out_path and returns the path.
@@ -6119,10 +6181,28 @@ def fuse(song_a: str, song_b: str, out_path: str,
       Handles M4A/AAC iPhone files, mono recordings, and 48 kHz sample rates.
       Use this when recording your own vocals.
 
+    seed — RNG seed for full reproducibility. Same seed + same inputs = identical
+      output every run. Change the seed to explore alternative arrangements.
+
     step_details_cb(n, data) — called after each of the 9 steps with a dict
       of plain-English facts discovered in that step (BPM, key, settings, etc.).
       Used by the UI pipeline viewer.
     """
+    # ── Deterministic seed ────────────────────────────────────────────────────
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch as _torch_seed
+        _torch_seed.manual_seed(seed)
+        if _torch_seed.cuda.is_available():
+            _torch_seed.cuda.manual_seed_all(seed)
+            _torch_seed.backends.cudnn.deterministic = True
+            _torch_seed.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+    print(f"[fuse] seed={seed} — all RNG sources seeded for reproducibility", flush=True)
+    # ─────────────────────────────────────────────────────────────────────────
+
     def step(n, total, msg):
         print(f"[{n}/{total}] {msg}", flush=True)
         if progress_cb:
@@ -6687,9 +6767,26 @@ def fuse(song_a: str, song_b: str, out_path: str,
             sidechain_depth = float(_PARAM_OVERRIDE["sidechain_depth"])
         if "at_strength_cap" in _PARAM_OVERRIDE:
             style["_at_strength_cap"] = float(_PARAM_OVERRIDE["at_strength_cap"])
+        if "de_ess_strength" in _PARAM_OVERRIDE:
+            style["_de_ess_strength"] = float(_PARAM_OVERRIDE["de_ess_strength"])
+        if "bass_shelf_gain" in _PARAM_OVERRIDE:
+            style["_bass_shelf_gain"] = float(_PARAM_OVERRIDE["bass_shelf_gain"])
+        if "air_boost" in _PARAM_OVERRIDE:
+            style["air_db"] = style.get("air_db", 0.0) + float(_PARAM_OVERRIDE["air_boost"])
+        # ── v2 params ──────────────────────────────────────────────────────────
+        if "comp_attack_ms" in _PARAM_OVERRIDE:
+            style["fet_attack"] = float(_PARAM_OVERRIDE["comp_attack_ms"])
+        if "comp_release_ms" in _PARAM_OVERRIDE:
+            style["fet_release"] = float(_PARAM_OVERRIDE["comp_release_ms"])
+        if "exciter_drive" in _PARAM_OVERRIDE:
+            style["_exciter_drive"] = float(_PARAM_OVERRIDE["exciter_drive"])
+        if "char_tilt_db" in _PARAM_OVERRIDE:
+            style["_char_tilt_db"] = float(_PARAM_OVERRIDE["char_tilt_db"])
         print(f"      [ML override] vocal_level={style['vocal_level']:.2f}  "
-              f"carve={style['carve_db']:.1f}dB  reverb_wet={style['reverb_wet']:.3f}  "
-              f"sidechain={sidechain_depth:.2f}", flush=True)
+              f"carve={style['carve_db']:.1f}dB  reverb_wet={style.get('reverb_wet',0):.3f}  "
+              f"sidechain={sidechain_depth:.2f}  de_ess={style.get('_de_ess_strength',1):.2f}  "
+              f"bass_shelf={style.get('_bass_shelf_gain',0):+.1f}dB  "
+              f"air_boost={_PARAM_OVERRIDE.get('air_boost',0):+.1f}dB", flush=True)
 
     # direct_vocal: cap auto-tune at 0.25 (light correction only — heavy tuning
     # sounds robotic on casual rap/spoken delivery and destroys vocal character).
@@ -6704,11 +6801,16 @@ def fuse(song_a: str, song_b: str, out_path: str,
     # onsets land consistently behind the beat. Start at 0.45 so the first mix pass
     # already has meaningful quantization, bypassing the wasted 0.30→0.45 escalation step.
     _groove_strength = 0.45 if style.get("_rap_score", 0.5) < 0.3 else 0.30
-    if not _PARAM_OVERRIDE.get("skip_groove_quantize", False):
+    # Commercial melodic stems are already professionally timed. Groove quantizing them
+    # to a different beat's grid warps natural phrasing and causes timing artifacts.
+    # Only quantize: (a) direct vocals (user recordings) or (b) rap/high-BPM commercial stems.
+    _is_commercial_melodic = (not direct_vocal) and (style.get("_rap_score", 0.5) < 0.55)
+    if _PARAM_OVERRIDE.get("skip_groove_quantize", False) or _is_commercial_melodic:
+        _why = "ML override" if _PARAM_OVERRIDE.get("skip_groove_quantize", False) else "commercial melodic stem — preserving original phrasing"
+        print(f"      Groove quantize skipped ({_why}).", flush=True)
+    else:
         vox = _groove_quantize(vox, _to_mono(inst), bpm_a, strength=_groove_strength)
         print("      Groove quantize applied", flush=True)
-    else:
-        print("      [ML override] Groove quantize skipped.", flush=True)
     vox = _check(vox, "post-vocal-chain")
 
     # ── Vocal Production for Beat ──────────────────────────────────────────────
@@ -6733,7 +6835,8 @@ def fuse(song_a: str, song_b: str, out_path: str,
               flush=True)
         _room_ir = None
 
-    vox = _produce_vocal_for_beat(vox, fp, bpm_a, ir_estimated=_room_ir)
+    vox = _produce_vocal_for_beat(vox, fp, bpm_a, ir_estimated=_room_ir,
+                                  is_commercial_stem=not direct_vocal)
     vox = _check(vox, "post-vocal-production")
 
     step(8, TOTAL, "Mixing (song construction + spectral carve + M/S + sidechain)…")

@@ -860,6 +860,33 @@ def _spectral_band_deltas(y_mix: np.ndarray, sr: int) -> dict:
     return deltas
 
 
+def _sibilance_ratio(mono: np.ndarray) -> float:
+    """Sibilance ratio: median(RMS 5-8kHz / RMS 1-4kHz) over active frames.
+
+    Measures how much high-frequency sibilance energy is present relative to
+    the vocal/mid presence zone. Chart-ready tracks are professionally de-essed:
+      0.10-0.15 = over de-essed / dark / muffled
+      0.15-0.40 = professional sweet spot (chart target)
+      0.40-0.60 = borderline harsh, could use light de-essing
+      > 0.60    = harsh sibilance, audibly unpleasant
+    """
+    try:
+        sib_sig = _bp(mono, 5000.0, 8000.0)
+        ref_sig = _bp(mono, 1000.0, 4000.0)
+        hop = 512
+        sib_rms = librosa.feature.rms(y=sib_sig, frame_length=1024, hop_length=hop)[0]
+        ref_rms = librosa.feature.rms(y=ref_sig, frame_length=1024, hop_length=hop)[0]
+        n = min(len(sib_rms), len(ref_rms))
+        thresh = float(np.percentile(ref_rms[:n], 20))
+        active = ref_rms[:n] > max(thresh, 1e-9)
+        if active.sum() < 10:
+            return 0.25
+        ratio = float(np.median(sib_rms[:n][active] / (ref_rms[:n][active] + 1e-12)))
+        return float(np.clip(ratio, 0.0, 2.0))
+    except Exception:
+        return 0.25
+
+
 def _compute_spectral_match(y_mix: np.ndarray, sr: int) -> float:
     """
     Compute spectral match score (0-100) against reference profile.
@@ -1532,6 +1559,9 @@ def _measure(audio_path: str) -> dict:
     except Exception:
         key_distance_semitones = 2.0
 
+    # ── SIBILANCE RATIO ───────────────────────────────────────────────────────
+    sibilance_ratio = _sibilance_ratio(mono)
+
     # ── SPECTRAL CONTRAST SCORE ───────────────────────────────────────────────
     spectral_contrast_sc = _spectral_contrast_score(mono, SR)
 
@@ -1608,6 +1638,8 @@ def _measure(audio_path: str) -> dict:
         # TIER 6: Reference learning
         "spectral_match_score":    spectral_match_score,
         "stereo_width_score":      stereo_width_score,
+        # Sibilance ratio (5-8kHz / 1-4kHz): chart target 0.15-0.40
+        "sibilance_ratio":          sibilance_ratio,
         # Spectral contrast (diagnostic only — not scored, high value = good structure)
         "_spectral_contrast_score": spectral_contrast_sc,
         # Per-band spectral deltas vs reference (dB, + = too loud, - = too quiet)
@@ -1825,6 +1857,175 @@ def corrections(issues: list, history: list | None = None) -> dict:
     return scaled
 
 
+# ── Chart-Readiness Discriminator ─────────────────────────────────────────────
+
+def _chart_readiness_score(metrics: dict) -> tuple:
+    """Score how chart-ready a track sounds vs the 70-track reference profile.
+
+    Uses IQR-based comparison: within [p25, p75] = 100 pts, degrades proportionally
+    outside (each IQR-width of deviation costs ~70 pts).
+
+    Dimensions:
+      Spectral Balance  (38%) — per-band energy vs reference medians (7 bands)
+      Loudness Profile  (25%) — LUFS, PLR, crest factor vs reference IQR
+      Dynamics/Texture  (22%) — spectral slope, transient clarity, sibilance
+      Perceptual Quality(15%) — stereo health, vocal clarity, crest
+
+    Returns (chart_score: float, grade: str, details: dict).
+    """
+    if _REF_PROFILE is None:
+        return 50.0, "? — No reference profile loaded", {}
+
+    def _iqr_score(value: float, p25: float, p75: float) -> float:
+        lo, hi = min(p25, p75), max(p25, p75)
+        iqr = max(hi - lo, 1e-6)
+        if lo <= value <= hi:
+            return 100.0
+        over = (lo - value) / iqr if value < lo else (value - hi) / iqr
+        return float(max(0.0, 100.0 - over * 70.0))
+
+    details: dict = {}
+
+    # ── 1. Spectral Balance (38%) ─────────────────────────────────────────────
+    bands_ref = _REF_PROFILE.get("bands", {})
+    band_weights = {
+        "sub": 1.0, "bass": 1.5, "lo_mid": 1.2,
+        "mid": 2.0, "hi_mid": 1.5, "presence": 1.2, "air": 0.8,
+    }
+    band_scores = []
+    for band, w in band_weights.items():
+        delta_key = f"delta_{band}"
+        if delta_key not in metrics or band not in bands_ref:
+            continue
+        delta = float(metrics[delta_key])
+        iqr = float(bands_ref[band]["p75"]) - float(bands_ref[band]["p25"])
+        # Accept ±half-IQR around the reference median (delta=0) as "within target"
+        half = max(iqr / 2.0, 1.5)
+        if abs(delta) <= half:
+            s = 100.0
+        else:
+            over = (abs(delta) - half) / max(half, 1e-6)
+            s = max(0.0, 100.0 - over * 70.0)
+        band_scores.append((s, w))
+
+    spectral_score = (
+        sum(s * w for s, w in band_scores) / sum(w for _, w in band_scores)
+        if band_scores else 50.0
+    )
+
+    # Spectral shape similarity (cosine): catches overall tilt even with level offset
+    bands_order = ["sub", "bass", "lo_mid", "mid", "hi_mid", "presence", "air"]
+    ref_meds, our_vals = [], []
+    for b in bands_order:
+        if b in bands_ref and f"delta_{b}" in metrics:
+            ref_med = float(bands_ref[b]["median"])
+            ref_meds.append(ref_med)
+            our_vals.append(ref_med + float(metrics[f"delta_{b}"]))
+    if len(ref_meds) >= 4:
+        rv, ov = np.array(ref_meds), np.array(our_vals)
+        cos_sim = float(np.dot(rv, ov) / (np.linalg.norm(rv) * np.linalg.norm(ov) + 1e-9))
+        cos_sim = float(np.clip(cos_sim, -1.0, 1.0))
+        details["spectral_shape_similarity"] = round(cos_sim, 3)
+        # Small bonus when shape is right even if level is slightly off
+        if cos_sim > 0.95:
+            spectral_score = min(100.0, spectral_score + (cos_sim - 0.95) * 200.0)
+    else:
+        details["spectral_shape_similarity"] = 0.90
+    details["spectral_balance"] = round(spectral_score, 1)
+
+    # ── 2. Loudness Profile (25%) ─────────────────────────────────────────────
+    loudness_ref = _REF_PROFILE.get("loudness", {})
+    lscores = []
+    for ref_key, metric_key, w in [
+        ("lufs_i",   "lufs_integrated",  2.0),
+        ("plr",      "plr_db",           1.5),
+        ("crest_db", "crest_factor_db",  1.0),
+    ]:
+        if ref_key in loudness_ref and metric_key in metrics:
+            s = _iqr_score(
+                float(metrics[metric_key]),
+                float(loudness_ref[ref_key]["p25"]),
+                float(loudness_ref[ref_key]["p75"]),
+            )
+            lscores.append((s, w))
+    loudness_score = (
+        sum(s * w for s, w in lscores) / sum(w for _, w in lscores)
+        if lscores else 50.0
+    )
+    details["loudness_profile"] = round(loudness_score, 1)
+
+    # ── 3. Dynamics & Texture (22%) ───────────────────────────────────────────
+    dyn_ref = _REF_PROFILE.get("dynamics", {})
+    dscores = []
+    for ref_key, metric_key, w in [
+        ("spectral_slope",    "spectral_slope_db_oct", 1.0),
+        ("transient_clarity", "transient_clarity",     1.5),
+    ]:
+        if ref_key in dyn_ref and metric_key in metrics:
+            s = _iqr_score(
+                float(metrics[metric_key]),
+                float(dyn_ref[ref_key]["p25"]),
+                float(dyn_ref[ref_key]["p75"]),
+            )
+            dscores.append((s, w))
+    # Sibilance ratio — professional de-essing target 0.15-0.40
+    sib = float(metrics.get("sibilance_ratio", 0.25))
+    sib_s = _iqr_score(sib, 0.15, 0.40)
+    dscores.append((sib_s, 1.0))
+    details["sibilance_match"] = round(sib_s, 1)
+    dynamics_score = (
+        sum(s * w for s, w in dscores) / sum(w for _, w in dscores)
+        if dscores else 50.0
+    )
+    details["dynamics_quality"] = round(dynamics_score, 1)
+
+    # ── 4. Perceptual Quality (15%) ───────────────────────────────────────────
+    perc_checks = [
+        ("vocal_clarity_index",  -8.0, 10.0, 1.5),
+        ("transient_clarity",     8.0, 28.0, 1.0),
+        ("stereo_correlation",    0.4, 0.99, 0.8),
+        ("low_freq_stereo_corr", 0.85,  1.0, 1.0),
+        ("crest_factor_db",       6.0, 16.0, 1.0),
+    ]
+    pscores = []
+    for mk, lo, hi, w in perc_checks:
+        if mk not in metrics:
+            continue
+        val = float(metrics[mk])
+        rng = max(hi - lo, 1e-6)
+        if lo <= val <= hi:
+            s = 100.0
+        elif val < lo:
+            s = max(0.0, 100.0 - (lo - val) / rng * 100.0)
+        else:
+            s = max(0.0, 100.0 - (val - hi) / rng * 100.0)
+        pscores.append((s, w))
+    perceptual_score = (
+        sum(s * w for s, w in pscores) / sum(w for _, w in pscores)
+        if pscores else 50.0
+    )
+    details["perceptual_quality"] = round(perceptual_score, 1)
+
+    # ── Weighted overall ───────────────────────────────────────────────────────
+    chart_score = float(np.clip(
+        spectral_score   * 0.38 +
+        loudness_score   * 0.25 +
+        dynamics_score   * 0.22 +
+        perceptual_score * 0.15,
+        0.0, 100.0,
+    ))
+    details["overall"] = round(chart_score, 1)
+
+    if chart_score >= 85:   grade = "S — Chart-ready"
+    elif chart_score >= 72: grade = "A — Pro quality"
+    elif chart_score >= 58: grade = "B — Good production"
+    elif chart_score >= 42: grade = "C — Needs work"
+    elif chart_score >= 25: grade = "D — Amateur"
+    else:                   grade = "F — Not competitive"
+
+    return chart_score, grade, details
+
+
 def score_file(audio_path: str, strict: bool = False, reference_path: str = None,
                print_report: bool = True) -> tuple:
     ref_base = REF_STRICT if strict else REF
@@ -1937,9 +2138,17 @@ def score_file(audio_path: str, strict: bool = False, reference_path: str = None
         issues.append(("MEDIUM", "stereo_width_mismatch", sws, 40.0, 100.0,
                        "Stereo width deviates significantly from reference profile target"))
 
+    # ── Chart-readiness discriminator ────────────────────────────────────────
+    chart_score, chart_grade, chart_details = _chart_readiness_score(metrics)
+    metrics["_chart_score"] = chart_score
+    metrics["_chart_grade"] = chart_grade
+    metrics["_chart_details"] = chart_details
+
     grade = _grade(score)
     if print_report:
-        _print_report(audio_path, metrics, score, grade, issues, reference_path, ref)
+        _print_report(audio_path, metrics, score, grade, issues, reference_path, ref,
+                      chart_score=chart_score, chart_grade=chart_grade,
+                      chart_details=chart_details)
     return score, issues, metrics
 
 
@@ -1948,7 +2157,9 @@ def _flag(val: float, lo: float, hi: float) -> str:
 
 
 def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
-                  ref_path: str = None, ref: dict = None):
+                  ref_path: str = None, ref: dict = None,
+                  chart_score: float = None, chart_grade: str = None,
+                  chart_details: dict = None):
     if ref is None:
         ref = REF
     width = 70
@@ -1956,6 +2167,35 @@ def _print_report(path: str, m: dict, score: int, grade: str, issues: list,
     print(f"  VocalFusion Quality Report — {Path(path).name}")
     print("═" * width)
     print(f"\n  SCORE: {score}/100   GRADE: {grade}")
+
+    # ── CHART READINESS section ───────────────────────────────────────────────
+    if chart_score is not None and chart_grade is not None:
+        cs_int = int(round(chart_score))
+        print(f"\n  ── CHART READINESS (vs 70-track reference) ───────────────────────")
+        print(f"  {'Chart Score':<28} {cs_int}/100   {chart_grade}")
+        if chart_details:
+            d = chart_details
+            # Per-dimension breakdown
+            print(f"  {'  Spectral Balance':<28} {d.get('spectral_balance', 0.0):.0f}/100", end="")
+            cos = d.get('spectral_shape_similarity', 0.9)
+            print(f"   (shape similarity: {cos:.3f})")
+            print(f"  {'  Loudness Profile':<28} {d.get('loudness_profile', 0.0):.0f}/100")
+            print(f"  {'  Dynamics / Texture':<28} {d.get('dynamics_quality', 0.0):.0f}/100", end="")
+            sib = m.get("sibilance_ratio", 0.25)
+            sib_flag = " ✗ (too harsh)" if sib > 0.50 else (" ✗ (over de-essed)" if sib < 0.10 else "")
+            print(f"   (sibilance: {sib:.3f}{sib_flag})")
+            print(f"  {'  Perceptual Quality':<28} {d.get('perceptual_quality', 0.0):.0f}/100")
+        # Plain-English verdict
+        if chart_score >= 85:
+            print(f"\n  ✓ VERDICT: This track sounds CHART-READY — competitive with commercial releases.")
+        elif chart_score >= 72:
+            print(f"\n  ✓ VERDICT: Pro quality — sounds like a polished release, minor refinements possible.")
+        elif chart_score >= 58:
+            print(f"\n  △ VERDICT: Good production — listenable but below chart standard. See issues above.")
+        elif chart_score >= 42:
+            print(f"\n  ✗ VERDICT: Needs work — audibly below professional level. Mix or master issues present.")
+        else:
+            print(f"\n  ✗✗ VERDICT: Not competitive — significant production problems detected.")
 
     diags = _musical_diagnosis(m)
     if diags:
@@ -2094,8 +2334,11 @@ def auto_score(audio_path: str, strict: bool = False) -> tuple:
     # onset_density from sparse trap records). 75 = genuinely good output.
     passed  = score >= 75 and not critical and groove >= 0.25 and harmony >= 0.25
 
+    chart_score = metrics.get("_chart_score", 50.0)
+    chart_grade = metrics.get("_chart_grade", "")
+
     if passed:
-        summary = f"PASS ({score}/100) — {_grade(score)}"
+        summary = f"PASS ({score}/100) — {_grade(score)}  |  Chart: {int(round(chart_score))}/100 {chart_grade}"
     elif critical:
         summary = f"FAIL ({score}/100) — CRITICAL: {critical[0][5]}"
     elif groove < 0.25:
@@ -2103,9 +2346,80 @@ def auto_score(audio_path: str, strict: bool = False) -> tuple:
     elif harmony < 0.25:
         summary = f"FAIL ({score}/100) — key clash"
     else:
-        summary = f"FAIL ({score}/100) — {len(issues)} issues"
+        summary = f"FAIL ({score}/100) — {len(issues)} issues  |  Chart: {int(round(chart_score))}/100 {chart_grade}"
 
     return passed, score, summary, issues
+
+
+def score_any(audio_path: str) -> tuple:
+    """Score any audio file for chart-readiness (not just VocalFusion mashups).
+
+    Simpler entry point: skip mashup-specific penalties (key_distance, vocal_robot)
+    and focus on universal production quality vs the 70-track reference profile.
+    Prints a clean chart-readiness report.
+
+    Returns (chart_score, chart_grade, details).
+    """
+    metrics = _measure(audio_path)
+    chart_score, chart_grade, details = _chart_readiness_score(metrics)
+    cs_int = int(round(chart_score))
+
+    width = 70
+    fname = Path(audio_path).name
+    print("\n" + "═" * width)
+    print(f"  Chart Readiness Analysis — {fname}")
+    print("═" * width)
+    print(f"\n  SCORE: {cs_int}/100   GRADE: {chart_grade}")
+    if _REF_PROFILE:
+        print(f"  (Compared against {_REF_PROFILE.get('n_tracks', '?')}-track reference profile)")
+
+    print(f"\n  ── DIMENSION SCORES ──────────────────────────────────────────────")
+    print(f"  {'Spectral Balance':<28} {details.get('spectral_balance', 0.0):.0f}/100")
+    cos = details.get('spectral_shape_similarity', 0.9)
+    print(f"  {'  Spectral Shape Similarity':<28} {cos:.3f}  (1.0 = identical to ref)")
+    print(f"  {'Loudness Profile':<28} {details.get('loudness_profile', 0.0):.0f}/100")
+    print(f"  {'Dynamics / Texture':<28} {details.get('dynamics_quality', 0.0):.0f}/100")
+    sib = metrics.get("sibilance_ratio", 0.25)
+    sib_verdict = "✓ professional" if 0.15 <= sib <= 0.40 else ("✗ too harsh" if sib > 0.40 else "✗ over de-essed")
+    print(f"  {'  Sibilance Ratio':<28} {sib:.3f}  ({sib_verdict}, target 0.15-0.40)")
+    print(f"  {'Perceptual Quality':<28} {details.get('perceptual_quality', 0.0):.0f}/100")
+
+    # Per-band breakdown (if profile loaded)
+    if _REF_PROFILE:
+        print(f"\n  ── SPECTRAL BALANCE vs REFERENCE ─────────────────────────────────")
+        bands_ref = _REF_PROFILE.get("bands", {})
+        for band_name, label in [
+            ("sub", "Sub 20-60Hz"), ("bass", "Bass 60-250Hz"), ("lo_mid", "Lo-Mid 250-500Hz"),
+            ("mid", "Mid 500-2kHz"), ("hi_mid", "Hi-Mid 2-6kHz"),
+            ("presence", "Presence 6-10kHz"), ("air", "Air 10-20kHz"),
+        ]:
+            delta_key = f"delta_{band_name}"
+            if delta_key not in metrics or band_name not in bands_ref:
+                continue
+            delta = float(metrics[delta_key])
+            iqr = float(bands_ref[band_name]["p75"]) - float(bands_ref[band_name]["p25"])
+            half = max(iqr / 2.0, 1.5)
+            flag = "" if abs(delta) <= half else f" ✗ ({'+' if delta > 0 else ''}{delta:.1f} dB from ref)"
+            print(f"  {label:<28} {delta:>+6.1f} dB  (IQR ±{half:.1f} dB){flag}")
+
+    # Verdict
+    print(f"\n  {'─' * (width - 2)}")
+    if chart_score >= 85:
+        print(f"  ✓ CHART-READY — This track is competitive with commercial releases.")
+        print(f"    Spectral balance, loudness, and dynamics match professional reference.")
+    elif chart_score >= 72:
+        print(f"  ✓ PRO QUALITY — Sounds polished and professional. Minor refinements possible.")
+    elif chart_score >= 58:
+        print(f"  △ GOOD PRODUCTION — Listenable but below chart standard.")
+        print(f"    Check the lowest-scoring dimensions above.")
+    elif chart_score >= 42:
+        print(f"  ✗ NEEDS WORK — Audibly below professional level.")
+        print(f"    Significant mix or master issues detected.")
+    else:
+        print(f"  ✗✗ NOT COMPETITIVE — Major production problems. Compare against reference tracks.")
+
+    print("\n" + "═" * width + "\n")
+    return chart_score, chart_grade, details
 
 
 if __name__ == "__main__":
@@ -2113,7 +2427,13 @@ if __name__ == "__main__":
     parser.add_argument("audio")
     parser.add_argument("reference", nargs="?")
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--chart", action="store_true",
+                        help="Chart-readiness mode: score any song vs reference profile")
     args = parser.parse_args()
-    score, issues, metrics = score_file(args.audio, strict=args.strict,
-                                        reference_path=args.reference)
-    sys.exit(0 if score >= 82 and not any(i[0] == "CRITICAL" for i in issues) else 1)
+    if args.chart:
+        chart_score, chart_grade, _ = score_any(args.audio)
+        sys.exit(0 if chart_score >= 72 else 1)
+    else:
+        score, issues, metrics = score_file(args.audio, strict=args.strict,
+                                            reference_path=args.reference)
+        sys.exit(0 if score >= 82 and not any(i[0] == "CRITICAL" for i in issues) else 1)
