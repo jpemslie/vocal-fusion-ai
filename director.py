@@ -535,8 +535,13 @@ def _causal_corrections(metrics: dict, issues: list, current_params: dict,
         adj["carve_db"]    = adj.get("carve_db", p.get("carve_db", 6.0)) + 1.5
     if delta_presence < -3.0:  # presence band too quiet
         adj["presence_db"] = adj.get("presence_db", p.get("presence_db", 1.5)) + 1.0
-    if delta_mid > 3.0:   # mid too loud — reduce carving to let beat breathe
-        adj["carve_db"]    = adj.get("carve_db", p.get("carve_db", 6.0)) - 1.0
+    if delta_mid > 3.0:   # mid too loud — reduce vocal level slightly
+        # IMPORTANT: do NOT reduce carve_db here. Reducing carve lets MORE beat energy
+        # into the vocal zone, making the mid louder not quieter, and degrading groove
+        # measurement (beat energy masks vocal onset detection in the mixed audio).
+        # The right lever is vocal_level: bringing the vocal down 0.1x preserves the
+        # spectral carve that protects groove while reducing the mid-band excess.
+        adj["vocal_level"] = adj.get("vocal_level", p.get("vocal_level", 1.6)) - 0.1
 
     # ── Harmonic clarity low (vocal buried in speech band) ──────────────────
     if m.get("harmonic_clarity_score", 50) < 50:

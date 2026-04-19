@@ -1,0 +1,84 @@
+version: "3.9"
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - VF_TARGET_SCORE=85
+      - VF_MAX_ATTEMPTS=5
+    volumes:
+      - vf_data:/app/vf_data
+      - ./reference_profile.json:/app/reference_profile.json:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  celery_worker:
+    build: .
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - celery_app
+      - worker
+      - --loglevel=info
+      - --concurrency=1   # GPU-bound: one task at a time
+      - -Q
+      - celery
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - vf_data:/app/vf_data
+      - ./reference_profile.json:/app/reference_profile.json:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  ui:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run build && npm start"
+    ports:
+      - "3000:3000"
+    environment:
+      - BACKEND_URL=http://api:8000
+      - PORT=3000
+    volumes:
+      - ./ui:/app
+    depends_on:
+      - api
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+      - ui
+
+volumes:
+  vf_data:

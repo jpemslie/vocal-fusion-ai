@@ -13,8 +13,15 @@ demucs>=4.0.0
 audio-separator>=0.24.0
 onnxruntime>=1.19.0
 
-# Web server
+# Web servers
 flask>=2.0.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+
+# Background task queue (optional — needed for docker/production mode)
+celery>=5.3.0
+redis>=5.0.0
 
 # Professional audio effects + time-stretch + pitch-shift (Spotify/JUCE engine)
 pedalboard>=0.9.0
