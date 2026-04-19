@@ -132,6 +132,12 @@ _MDX23C_VOCAL   = "MDX23C-8KFFT-InstVoc_HQ.ckpt"  # MDX23C vocal (SDR ~12+, bett
 _DENOISE_MODEL  = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"          # post-sep denoiser (SDR 27.99)
 _DEVERB_MODEL   = "deverb_bs_roformer_8_384dim_10depth.ckpt"                   # BS-Roformer de-reverb
 
+# Phase 1A primary separation model — BSRoformer ep_368 (SDR ~12.96 dB, target 12+ dB)
+_BSROFORMER_PRIMARY = "model_bs_roformer_ep_368_sdr_12.9628.ckpt"
+
+# Module-level flag — set VF_USE_BSROFORMER=0 to force Demucs-only path.
+USE_BSROFORMER: bool = os.environ.get("VF_USE_BSROFORMER", "1") != "0"
+
 # ---------------------------------------------------------------------------
 # Reference profile for reference-matched mastering
 # ---------------------------------------------------------------------------
@@ -301,19 +307,51 @@ def _style_params(beat_char: dict, vox_char: dict, beat_fp: dict = None) -> dict
     bass = beat_char["bass_weight"]      # 0–1
     rap  = vox_char["rap_score"]         # 0–1
 
-    # ── Reverb: match beat's acoustic space ───────────────────────────────────
-    # Professional standard: 10-18% wet on a short room reverb (HPF'd at 500 Hz).
-    # The HPF prevents mud — the wet level can be higher because low-mid energy
-    # is removed from the return. Below 10% the vocal sounds superimposed; above
-    # 20% it washes out in a dense hip-hop mix.
-    base_room = float(np.interp(rap, [0, 1], [0.18, 0.10]))
-    base_wet  = float(np.interp(rap, [0, 1], [0.14, 0.10]))
+    # ── Genre detection for reverb conditioning ───────────────────────────────
+    # Derive edm_score and classical_score from the beat's spectral/rhythm features
+    # so that reverb_wet is appropriate for the genre, not just the vocal style.
+    beat_bpm       = float(beat_char.get("bpm", 120.0))
+    beat_centroid  = float(beat_char.get("centroid_hz", 2000.0))
+    # EDM: fast tempo (BPM > 120) + bright/energetic centroid (> 2500 Hz)
+    edm_score      = float(np.clip(
+        ((beat_bpm - 120.0) / 50.0) * 0.5 + ((beat_centroid - 2500.0) / 2500.0) * 0.5,
+        0.0, 1.0
+    ))
+    # Classical: slow tempo (BPM < 90) + warm centroid (< 2000 Hz)
+    classical_score = float(np.clip(
+        ((90.0 - beat_bpm) / 50.0) * 0.5 + ((2000.0 - beat_centroid) / 2000.0) * 0.5,
+        0.0, 1.0
+    ))
+
+    # ── Reverb: genre-aware baseline → match beat's acoustic space ────────────
+    # Genre lookup table for reverb_wet base:
+    #   rap/trap (rap_score > 0.6):             0.08–0.15  tight, present
+    #   edm (BPM > 120, high centroid):         0.20–0.35  spacious
+    #   classical (low BPM, low centroid):      0.35–0.50  hall reverb
+    #   default/pop:                            0.15–0.25
+    if rap > 0.6:
+        # Rap/trap: tight, dry, present
+        base_wet  = float(np.interp(rap,            [0.6, 1.0], [0.15, 0.08]))
+        base_room = float(np.interp(rap,            [0.6, 1.0], [0.16, 0.10]))
+    elif edm_score > 0.5:
+        # EDM: spacious, wide reverb
+        base_wet  = float(np.interp(edm_score,      [0.5, 1.0], [0.20, 0.35]))
+        base_room = float(np.interp(edm_score,      [0.5, 1.0], [0.22, 0.32]))
+    elif classical_score > 0.5:
+        # Classical: long hall reverb
+        base_wet  = float(np.interp(classical_score,[0.5, 1.0], [0.35, 0.50]))
+        base_room = float(np.interp(classical_score,[0.5, 1.0], [0.30, 0.40]))
+    else:
+        # Default / pop: moderate room
+        base_wet  = float(np.interp(rap,            [0, 1],     [0.20, 0.15]))
+        base_room = float(np.interp(rap,            [0, 1],     [0.18, 0.12]))
+
     if beat_fp is not None:
         reverb_tail = float(beat_fp.get("reverb_tail", 0.3))
         # room_scale: 0.85× for punchy/dry beats, 1.25× for roomy/spacious beats
         room_scale  = float(np.interp(reverb_tail, [0.10, 0.60], [0.85, 1.25]))
-        reverb_room = float(np.clip(base_room * room_scale, 0.06, 0.35))
-        reverb_wet  = float(np.clip(base_wet  * room_scale, 0.08, 0.20))
+        reverb_room = float(np.clip(base_room * room_scale, 0.06, 0.50))
+        reverb_wet  = float(np.clip(base_wet  * room_scale, 0.06, 0.50))
     else:
         reverb_room = base_room
         reverb_wet  = base_wet
@@ -2517,8 +2555,24 @@ def _detect_section_start(y_mono: np.ndarray, section: str = "chorus") -> int:
         hop = 512
         mfcc = librosa.feature.mfcc(y=y_mono, sr=SR, n_mfcc=13, hop_length=hop)
 
-        # Agglomerative segmentation — aim for ~6-8 sections
-        n_sections = 7
+        # Dynamic k: use novelty curve peaks on the beat-synchronous SSM diagonal
+        # to estimate the number of structural sections, then clamp to [3, 12].
+        # Falls back to k=7 if peak detection yields 0 peaks (e.g. ambient/drone).
+        try:
+            _, beat_frames = librosa.beat.beat_track(y=y_mono, sr=SR, hop_length=hop)
+            mfcc_sync = librosa.util.sync(mfcc, beat_frames, aggregate=np.median)
+            ssm = librosa.segment.recurrence_matrix(
+                mfcc_sync, mode="affinity", sym=True, sparse=False
+            )
+            novelty = librosa.onset.onset_strength(S=ssm.diagonal()[np.newaxis, :],
+                                                   sr=SR, hop_length=1)
+            peaks = librosa.util.peak_pick(
+                novelty, pre_max=2, post_max=2, pre_avg=4, post_avg=4,
+                delta=0.05, wait=2
+            )
+            n_sections = int(np.clip(len(peaks), 3, 12)) if len(peaks) > 0 else 7
+        except Exception:
+            n_sections = 7
         boundaries = librosa.segment.agglomerative(mfcc, k=n_sections)
 
         if len(boundaries) < 2:
