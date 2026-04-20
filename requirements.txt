@@ -37,3 +37,7 @@ anthropic>=0.20.0
 
 # Neural vocal restoration (perceptual enhancer trained on speech/music)
 # resemble-enhance>=0.0.1  # optional — large download (~600MB), enables neural vocal enhancement
+
+# Genre-agnostic BPM/beat detection (neural onset, no lognormal prior)
+# Phase 5A: madmom TempoEstimationProcessor replaces librosa lognormal prior bias
+madmom>=0.16.1
