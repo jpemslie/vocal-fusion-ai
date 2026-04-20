@@ -2404,6 +2404,16 @@ def score_any(audio_path: str) -> tuple:
             flag = "" if abs(delta) <= half else f" ✗ ({'+' if delta > 0 else ''}{delta:.1f} dB from ref)"
             print(f"  {label:<28} {delta:>+6.1f} dB  (IQR ±{half:.1f} dB){flag}")
 
+    # ── CLAP perceptual scorer (Phase 4A/4C) ──────────────────────────────────
+    try:
+        from ml import clap_scorer as _clap_scorer
+        _clap_score = _clap_scorer.score_clap(audio_path)
+        if _clap_score is not None:
+            details["clap_score"] = _clap_score
+            print(f"  {'CLAP Perceptual Score':<28} {_clap_score:.1f}/100  (genre-agnostic)")
+    except Exception:
+        pass
+
     # Verdict
     print(f"\n  {'─' * (width - 2)}")
     if chart_score >= 85:

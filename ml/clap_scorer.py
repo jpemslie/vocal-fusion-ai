@@ -40,6 +40,97 @@ from pathlib import Path
 import numpy as np
 
 
+# ── Module-level singleton for score_clap() ──────────────────────────────────
+_CLAP_SINGLETON = None   # (model, backend) tuple once loaded
+_CLAP_LOAD_FAILED = False  # set True after a permanent load failure
+
+_POSITIVE_PROMPTS = [
+    "professional mastered song",
+    "top chart hit",
+    "radio quality music",
+    "clear vocals with professional mix",
+]
+_NEGATIVE_PROMPTS = [
+    "low quality audio",
+    "amateur recording",
+    "bad mix",
+]
+
+
+def score_clap(audio_path: str) -> "float | None":
+    """
+    Score an audio file using CLAP text-audio similarity.
+
+    Measures how closely the audio matches professional/polished descriptions
+    vs low-quality descriptions, without needing a reference embedding set.
+
+    Returns a float in [0, 100], or None if CLAP is not installed / fails.
+    """
+    global _CLAP_SINGLETON, _CLAP_LOAD_FAILED
+
+    if _CLAP_LOAD_FAILED:
+        return None
+
+    try:
+        # Load model once and cache
+        if _CLAP_SINGLETON is None:
+            try:
+                from msclap import CLAP as _MSCLAP
+                _model = _MSCLAP(version="2023", use_cuda=False)
+                _CLAP_SINGLETON = (_model, "msclap")
+            except ImportError:
+                try:
+                    import laion_clap as _laion_clap
+                    _model = _laion_clap.CLAP_Module(enable_fusion=False)
+                    _model.load_ckpt()
+                    _CLAP_SINGLETON = (_model, "laion")
+                except ImportError:
+                    _CLAP_LOAD_FAILED = True
+                    return None
+
+        model, backend = _CLAP_SINGLETON
+
+        # Embed the audio file
+        emb_audio = embed_file(audio_path, model, backend, duration=60.0)
+        emb_audio_norm = emb_audio / (np.linalg.norm(emb_audio) + 1e-8)
+
+        # Get text embeddings for positive and negative prompts
+        if backend == "msclap":
+            pos_text_embs = model.get_text_embeddings(_POSITIVE_PROMPTS)
+            neg_text_embs = model.get_text_embeddings(_NEGATIVE_PROMPTS)
+        elif backend == "laion":
+            pos_text_embs = model.get_text_embedding(_POSITIVE_PROMPTS, use_tensor=False)
+            neg_text_embs = model.get_text_embedding(_NEGATIVE_PROMPTS, use_tensor=False)
+        else:
+            return None
+
+        pos_embs = np.array(pos_text_embs, dtype=np.float32)
+        neg_embs = np.array(neg_text_embs, dtype=np.float32)
+
+        # Cosine similarities: audio vs each text prompt
+        pos_sims = []
+        for te in pos_embs:
+            te_norm = te / (np.linalg.norm(te) + 1e-8)
+            pos_sims.append(float(np.dot(emb_audio_norm, te_norm)))
+
+        neg_sims = []
+        for te in neg_embs:
+            te_norm = te / (np.linalg.norm(te) + 1e-8)
+            neg_sims.append(float(np.dot(emb_audio_norm, te_norm)))
+
+        mean_pos = float(np.mean(pos_sims))
+        mean_neg = float(np.mean(neg_sims))
+
+        # Raw contrast score: range roughly [-1, 1] in cosine space
+        # Scale to [0, 100]: assume contrast of +0.3 = 100, -0.3 = 0
+        raw = mean_pos - mean_neg
+        score = float(np.clip((raw + 0.3) / 0.6 * 100.0, 0.0, 100.0))
+        return round(score, 1)
+
+    except Exception:
+        return None
+
+
 GRADES = [
     (85, "A"),
     (70, "B"),

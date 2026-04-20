@@ -41,3 +41,7 @@ anthropic>=0.20.0
 # Genre-agnostic BPM/beat detection (neural onset, no lognormal prior)
 # Phase 5A: madmom TempoEstimationProcessor replaces librosa lognormal prior bias
 madmom>=0.16.1
+
+# CLAP perceptual quality scorer (Phase 4A/4C) — genre-agnostic audio-text similarity
+# laion-clap is the fallback alternative: pip install laion-clap
+msclap>=1.3.0
