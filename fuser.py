@@ -1700,80 +1700,89 @@ def separate(audio_path: str, cache_dir: str = "vf_data/stems",
     if not (cached / "vocals.wav").exists():
         cached.mkdir(exist_ok=True)
 
-        if _has_gpu():
-            # GPU path: try Mel-Band RoFormer first, then BS-RoFormer, then Demucs.
-            tmp_dir = Path(tempfile.mkdtemp(dir=cache_dir))
-            try:
-                from audio_separator.separator import Separator
+        # Phase 1A: BSRoformer primary path (USE_BSROFORMER=True by default).
+        # _separate_stems_bsroformer() returns False on any failure; we then fall
+        # through to the existing GPU RoFormer / CPU Demucs paths unchanged.
+        _bsr_ok = False
+        if USE_BSROFORMER:
+            print(f"      [Phase 1A] Trying BSRoformer ({_BSROFORMER_PRIMARY})…", flush=True)
+            _bsr_ok = _separate_stems_bsroformer(audio_path, cached, cache_dir)
 
-                # Determine which model to use: prefer Mel-Band RoFormer.
-                _sep_model = _MBR_VOCAL
-                _sep_label = f"Mel-Band RoFormer ({_MBR_VOCAL})"
+        if not _bsr_ok:
+            if _has_gpu():
+                # GPU path: try Mel-Band RoFormer first, then BS-RoFormer, then Demucs.
+                tmp_dir = Path(tempfile.mkdtemp(dir=cache_dir))
                 try:
-                    _probe = Separator(log_level=logging.WARNING,
-                                       model_file_dir=str(Path(cache_dir) / "_models"))
-                    supported = _probe.list_supported_model_files()
-                    _all_ckpts = set()
-                    for _cat_entries in supported.values():
-                        if isinstance(_cat_entries, dict):
-                            for _info in _cat_entries.values():
-                                if isinstance(_info, dict):
-                                    _all_ckpts.update(_info.keys())
-                                elif isinstance(_info, str):
-                                    _all_ckpts.add(_info)
-                    if _MBR_VOCAL not in _all_ckpts:
-                        _sep_model = _BS_ROFORMER
-                        _sep_label = f"BS-RoFormer ({_BS_ROFORMER}) [MBR not in model list]"
-                except Exception:
-                    pass  # keep _sep_model = _MBR_VOCAL; let load_model surface any real error
+                    from audio_separator.separator import Separator
 
-                print(f"      [Separator] Using {_sep_label}", flush=True)
-                sep = Separator(
-                    log_level=logging.WARNING,
-                    output_dir=str(tmp_dir),
-                    output_format="WAV",
-                    sample_rate=SR,
-                    model_file_dir=str(Path(cache_dir) / "_models"),
-                )
-                try:
-                    sep.load_model(_sep_model)
-                except Exception as _load_err:
-                    if _sep_model != _BS_ROFORMER:
-                        print(f"      [Mel-Band RoFormer load failed ({_load_err}), trying BS-RoFormer]",
-                              flush=True)
-                        sep.load_model(_BS_ROFORMER)
+                    # Determine which model to use: prefer Mel-Band RoFormer.
+                    _sep_model = _MBR_VOCAL
+                    _sep_label = f"Mel-Band RoFormer ({_MBR_VOCAL})"
+                    try:
+                        _probe = Separator(log_level=logging.WARNING,
+                                           model_file_dir=str(Path(cache_dir) / "_models"))
+                        supported = _probe.list_supported_model_files()
+                        _all_ckpts = set()
+                        for _cat_entries in supported.values():
+                            if isinstance(_cat_entries, dict):
+                                for _info in _cat_entries.values():
+                                    if isinstance(_info, dict):
+                                        _all_ckpts.update(_info.keys())
+                                    elif isinstance(_info, str):
+                                        _all_ckpts.add(_info)
+                        if _MBR_VOCAL not in _all_ckpts:
+                            _sep_model = _BS_ROFORMER
+                            _sep_label = f"BS-RoFormer ({_BS_ROFORMER}) [MBR not in model list]"
+                    except Exception:
+                        pass  # keep _sep_model = _MBR_VOCAL; let load_model surface any real error
+
+                    print(f"      [Separator] Using {_sep_label}", flush=True)
+                    sep = Separator(
+                        log_level=logging.WARNING,
+                        output_dir=str(tmp_dir),
+                        output_format="WAV",
+                        sample_rate=SR,
+                        model_file_dir=str(Path(cache_dir) / "_models"),
+                    )
+                    try:
+                        sep.load_model(_sep_model)
+                    except Exception as _load_err:
+                        if _sep_model != _BS_ROFORMER:
+                            print(f"      [Mel-Band RoFormer load failed ({_load_err}), trying BS-RoFormer]",
+                                  flush=True)
+                            sep.load_model(_BS_ROFORMER)
+                        else:
+                            raise
+                    sep.separate(audio_path)
+
+                    vox_src = inst_src = None
+                    for p in tmp_dir.iterdir():
+                        lname = p.name.lower()
+                        if "(vocals)" in lname and "(instrumental)" not in lname:
+                            vox_src = p
+                        elif "(instrumental)" in lname or "(no_vocals)" in lname:
+                            inst_src = p
+
+                    if vox_src and inst_src:
+                        shutil.move(str(vox_src),  str(cached / "vocals.wav"))
+                        shutil.move(str(inst_src), str(cached / "no_vocals.wav"))
                     else:
-                        raise
-                sep.separate(audio_path)
-
-                vox_src = inst_src = None
-                for p in tmp_dir.iterdir():
-                    lname = p.name.lower()
-                    if "(vocals)" in lname and "(instrumental)" not in lname:
-                        vox_src = p
-                    elif "(instrumental)" in lname or "(no_vocals)" in lname:
-                        inst_src = p
-
-                if vox_src and inst_src:
-                    shutil.move(str(vox_src),  str(cached / "vocals.wav"))
-                    shutil.move(str(inst_src), str(cached / "no_vocals.wav"))
-                else:
-                    wavs = sorted(tmp_dir.glob("*.wav"))
-                    if len(wavs) >= 2:
-                        shutil.move(str(wavs[0]), str(cached / "vocals.wav"))
-                        shutil.move(str(wavs[1]), str(cached / "no_vocals.wav"))
-                    else:
-                        raise RuntimeError("audio-separator produced no output")
-            except Exception as e:
-                print(f"      [RoFormer failed ({e}), falling back to Demucs htdemucs_ft]",
-                      flush=True)
+                        wavs = sorted(tmp_dir.glob("*.wav"))
+                        if len(wavs) >= 2:
+                            shutil.move(str(wavs[0]), str(cached / "vocals.wav"))
+                            shutil.move(str(wavs[1]), str(cached / "no_vocals.wav"))
+                        else:
+                            raise RuntimeError("audio-separator produced no output")
+                except Exception as e:
+                    print(f"      [RoFormer failed ({e}), falling back to Demucs htdemucs_ft]",
+                          flush=True)
+                    _separate_demucs(audio_path, cached)
+                finally:
+                    shutil.rmtree(str(tmp_dir), ignore_errors=True)
+            else:
+                # CPU path: Demucs htdemucs_ft 4-stem for oracle stems.
+                print("      CPU path: Demucs htdemucs_ft 4-stem (oracle stems)…", flush=True)
                 _separate_demucs(audio_path, cached)
-            finally:
-                shutil.rmtree(str(tmp_dir), ignore_errors=True)
-        else:
-            # CPU path: Demucs htdemucs_ft 4-stem for oracle stems.
-            print("      CPU path: Demucs htdemucs_ft 4-stem (oracle stems)…", flush=True)
-            _separate_demucs(audio_path, cached)
 
     # MDX-Net vocal upgrade runs AFTER the cache check so it applies even when
     # vocals.wav was already cached from a previous (non-upgraded) Demucs run.
@@ -1920,6 +1929,72 @@ def _separate_demucs(audio_path: str, out_dir: Path) -> None:
     finally:
         if tmp.exists():
             tmp.unlink()
+
+
+def _separate_stems_bsroformer(audio_path: str, out_dir: Path, cache_dir: str) -> bool:
+    """
+    Phase 1A: Separate vocals/instrumental using BSRoformer ep_368 (SDR ~12.96 dB).
+
+    Writes vocals.wav and no_vocals.wav into out_dir, exactly like _separate_demucs().
+    Returns True on success, False on any failure (caller falls back to Demucs).
+
+    Handles gracefully:
+      - audio_separator not installed (ImportError -> warning, return False)
+      - model download / load failure (Exception -> warning, return False)
+    """
+    try:
+        from audio_separator.separator import Separator
+    except ImportError:
+        print("      [BSRoformer] audio_separator not installed — falling back to Demucs.",
+              flush=True)
+        return False
+
+    tmp_dir = Path(tempfile.mkdtemp(dir=cache_dir))
+    try:
+        sep = Separator(
+            log_level=logging.WARNING,
+            output_dir=str(tmp_dir),
+            output_format="WAV",
+            sample_rate=SR,
+            model_file_dir=str(Path(cache_dir) / "_models"),
+        )
+        print(f"      [BSRoformer] Loading {_BSROFORMER_PRIMARY}…", flush=True)
+        try:
+            sep.load_model(_BSROFORMER_PRIMARY)
+        except Exception as _load_err:
+            print(f"      [BSRoformer] Model load failed ({_load_err}) — falling back to Demucs.",
+                  flush=True)
+            return False
+
+        sep.separate(audio_path)
+
+        vox_src = inst_src = None
+        for p in tmp_dir.iterdir():
+            lname = p.name.lower()
+            if "(vocals)" in lname and "(instrumental)" not in lname:
+                vox_src = p
+            elif "(instrumental)" in lname or "(no_vocals)" in lname:
+                inst_src = p
+
+        if not (vox_src and inst_src):
+            wavs = sorted(tmp_dir.glob("*.wav"))
+            if len(wavs) >= 2:
+                vox_src, inst_src = wavs[0], wavs[1]
+            else:
+                print("      [BSRoformer] Separator produced no output — falling back to Demucs.",
+                      flush=True)
+                return False
+
+        shutil.move(str(vox_src),  str(out_dir / "vocals.wav"))
+        shutil.move(str(inst_src), str(out_dir / "no_vocals.wav"))
+        print("      [BSRoformer] Separation complete (SDR target 12+ dB).", flush=True)
+        return True
+
+    except Exception as e:
+        print(f"      [BSRoformer] Unexpected error ({e}) — falling back to Demucs.", flush=True)
+        return False
+    finally:
+        shutil.rmtree(str(tmp_dir), ignore_errors=True)
 
 
 _MDX_VOCAL_2 = "UVR-MDX-NET-Voc_FT.onnx"   # second model for ensemble (SDR ~10.5)
@@ -2357,16 +2432,55 @@ def _detect_beats(y_mono: np.ndarray, sr: int) -> tuple[float, np.ndarray]:
     return float(bpm), beat_samples.astype(np.int64)
 
 
-def detect_bpm(y_mono: np.ndarray) -> float:
+def _detect_bpm_madmom(audio_path: str):
+    """
+    Genre-agnostic BPM detection using madmom's TempoEstimationProcessor.
+
+    madmom uses neural onset detection with no lognormal prior, making it
+    accurate across the full genre spectrum (ballads ~75 BPM, EDM ~140 BPM,
+    hip-hop ~90-130 BPM) without half/double-time bias.
+
+    Returns float BPM, or None on ImportError or any processing failure.
+    """
+    try:
+        from madmom.features.tempo import TempoEstimationProcessor
+        from madmom.features.beats import RNNBeatProcessor
+        act = RNNBeatProcessor()(audio_path)
+        proc = TempoEstimationProcessor(fps=100)
+        tempos = proc(act)  # array of (bpm, strength) pairs, sorted by strength
+        if tempos is not None and len(tempos) > 0:
+            bpm = float(tempos[0][0])
+            if 40.0 <= bpm <= 300.0:
+                return bpm
+        return None
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
+def detect_bpm(y_mono: np.ndarray, audio_path: str = None) -> float:
     """
     Genre-agnostic BPM detection using multi-prior consensus + spectral fingerprint.
 
     Covers the full musical tempo range: 55-220 BPM.
+    When audio_path is provided, tries madmom's TempoEstimationProcessor first
+    (neural onset detection, no lognormal prior — genre-agnostic for ballads,
+    EDM, hip-hop, and everything in between). Falls back to librosa multi-prior
+    consensus when madmom is unavailable or returns an out-of-range result.
     Spectral content (centroid, sub ratio, onset density) is used to weight
     tempo priors toward the likely zone without hard-coding a genre assumption.
     Consensus voting across all priors picks the most-agreed-upon candidate.
     Half/double tempo correction is onset-rate driven (not genre-hardcoded).
     """
+    # ── Method 0: madmom TempoEstimationProcessor (genre-agnostic, no prior) ──
+    if audio_path is not None:
+        madmom_bpm = _detect_bpm_madmom(audio_path)
+        if madmom_bpm is not None:
+            print(f"      [BPM] madmom TempoEstimationProcessor: {madmom_bpm:.1f} BPM",
+                  flush=True)
+            return float(madmom_bpm)
+
     from scipy.stats import lognorm as _lognorm
     hop    = 512
     clip30 = y_mono[:SR * 30]
@@ -4845,6 +4959,35 @@ def _adaptive_spectral_carve(inst: np.ndarray, vox: np.ndarray,
     n_fft, hop = 2048, 512
     inst_mono = _to_mono(inst)
     vox_mono  = _to_mono(vox)
+
+    # ── Phase 5B: Adaptive carve range from vocal F0 ──────────────────────────
+    # Detect vocal fundamental frequency using librosa.pyin (probabilistic YIN).
+    # This overrides any caller-supplied carve_lo_hz / carve_hi_hz so the carve
+    # window is always centred on the actual vocal register:
+    #   carve_low  = max(80,     F0 * 0.5)  — one octave below fundamental
+    #   carve_high = min(12000,  F0 * 8.0)  — three octaves above fundamental
+    # Bass vocalists (F0 ~80 Hz): window [80, 640] Hz — covers fundamentals.
+    # Sopranos (F0 ~800 Hz):      window [400, 6400] Hz — captures all harmonics.
+    # Falls back to caller-supplied values (300-5000 Hz default) on failure.
+    try:
+        _f0, _voiced_flag, _voiced_prob = librosa.pyin(
+            vox_mono,
+            fmin=float(librosa.note_to_hz("C2")),   # ~65 Hz
+            fmax=float(librosa.note_to_hz("C7")),   # ~2093 Hz
+            sr=SR,
+            hop_length=hop,
+        )
+        # Use only voiced frames with reasonable probability
+        _voiced_f0 = _f0[(_voiced_flag == 1) & (_voiced_prob > 0.5)]
+        if _voiced_f0 is not None and len(_voiced_f0) >= 5:
+            median_f0 = float(np.nanmedian(_voiced_f0))
+            if np.isfinite(median_f0) and median_f0 > 0:
+                carve_lo_hz = max(80.0,     median_f0 * 0.5)
+                carve_hi_hz = min(12000.0,  median_f0 * 8.0)
+                print(f"      [SpectralCarve] F0={median_f0:.0f} Hz -> "
+                      f"carve [{carve_lo_hz:.0f}-{carve_hi_hz:.0f}] Hz", flush=True)
+    except Exception:
+        pass  # retain caller-supplied carve_lo_hz / carve_hi_hz as fallback
 
     # Compute STFTs
     inst_stft = librosa.stft(inst_mono, n_fft=n_fft, hop_length=hop)
