@@ -423,6 +423,11 @@ def _style_params(beat_char: dict, vox_char: dict, beat_fp: dict = None) -> dict
         # Research: male F0 body 200-350 Hz → cut at 280 Hz; female → 380 Hz.
         # This is a fixed reciprocal cut complementing the dynamic Wiener carve.
         "comp_eq_hz":   380.0 if vox_char.get("gender") == "female" else 280.0,
+
+        # DeepFilter wet/dry blend for HNR correction (Phase 6C).
+        # Sweet spot is 0.20 — more wet smears harmonics (reduces HNR), less leaves noise.
+        # Adjusted per-pass by the correction loop when vocal_hnr_db fails.
+        "deepfilter_wet": 0.20,
     }
 
 
@@ -4558,18 +4563,24 @@ def _process_vocals(vox: np.ndarray, ratio: float, n_semitones: int,
     # adding its own neural reconstruction artifacts on top.
     # Falls back to noisereduce if DeepFilterNet is unavailable.
     _is_direct = style.get("_direct_vocal", False)
+    # Phase 6C: deepfilter_wet is a correctable param; read from style (default 0.20).
+    _df_wet = float(style.get("deepfilter_wet", 0.20)) if style is not None else 0.20
     if _is_direct:
         if vox_ch.shape[0] == 2:
             mid  = (vox_ch[0] + vox_ch[1]) * 0.5
             side = (vox_ch[0] - vox_ch[1]) * 0.5
-            mid_clean = np.nan_to_num(_deepfilter_clean(mid), nan=0.0, posinf=0.0, neginf=0.0)
+            mid_clean = np.nan_to_num(
+                _deepfilter_clean(mid, wet=_df_wet), nan=0.0, posinf=0.0, neginf=0.0)
             vox_ch = np.stack([mid_clean + side, mid_clean - side], axis=0).astype(np.float32)
         else:
             vox_ch = np.stack([
-                np.nan_to_num(_deepfilter_clean(vox_ch[c]), nan=0.0, posinf=0.0, neginf=0.0)
+                np.nan_to_num(
+                    _deepfilter_clean(vox_ch[c], wet=_df_wet),
+                    nan=0.0, posinf=0.0, neginf=0.0)
                 for c in range(vox_ch.shape[0])
             ], axis=0)
-        print("      [Stage 0] DeepFilterNet vocal cleaning applied.", flush=True)
+        print(f"      [Stage 0] DeepFilterNet vocal cleaning applied (wet={_df_wet:.2f}).",
+              flush=True)
     else:
         print("      [Stage 0] DeepFilterNet skipped — commercial stem already clean.", flush=True)
 
@@ -6990,6 +7001,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     if direct_vocal:
         style = dict(style)   # don't mutate the original
         style["_direct_vocal"] = True
+    _vox_pre_process = vox.copy()   # Phase 6C: saved before _process_vocals for deepfilter_wet re-runs
     vox = _process_vocals(vox, stretch_vocal, n_semi, vox_params, style,
                           target_root=key_a_root, target_mode=key_a_mode,
                           bpm=bpm_a)
@@ -7117,6 +7129,34 @@ def fuse(song_a: str, song_b: str, out_path: str,
     inst_remix = inst.copy()
     vox_remix  = vox.copy()
 
+    # ── Phase 6B: Auto-gain staging ───────────────────────────────────────────
+    # Measure vocal RMS in the mix context. If the vocal would be buried (< -25 dBFS)
+    # before the correction loop even starts, raise vocal_level pre-emptively so
+    # the loop has a fighting chance of converging. Capped at +6 dB raise.
+    try:
+        _vox_mono_ag = _to_mono(vox)
+        _inst_mono_ag = _to_mono(inst)
+        _mix_preview_ag = (_inst_mono_ag + style["vocal_level"] * _vox_mono_ag).astype(np.float32)
+        _mix_rms_ag = float(np.sqrt(np.mean(_mix_preview_ag ** 2) + 1e-12))
+        _vox_in_mix_ag = style["vocal_level"] * _vox_mono_ag
+        _vox_rms_ag = float(np.sqrt(np.mean(_vox_in_mix_ag ** 2) + 1e-12))
+        _vox_rms_dbfs_ag = float(20.0 * np.log10(_vox_rms_ag + 1e-12))
+        if _vox_rms_dbfs_ag < -25.0:
+            _deficit_db = -25.0 - _vox_rms_dbfs_ag
+            _raise_db = float(np.clip(_deficit_db, 0.0, 6.0))
+            _raise_lin = float(10.0 ** (_raise_db / 20.0))
+            _old_level = style["vocal_level"]
+            style["vocal_level"] = float(np.clip(style["vocal_level"] * _raise_lin, 1.0, 4.0))
+            print(f"  [Phase 6B] Vocal RMS in mix context: {_vox_rms_dbfs_ag:.1f} dBFS "
+                  f"< -25 dBFS — raising vocal_level {_old_level:.2f} → "
+                  f"{style['vocal_level']:.2f} (+{_raise_db:.1f} dB, capped at +6 dB)",
+                  flush=True)
+        else:
+            print(f"  [Phase 6B] Vocal RMS in mix context: {_vox_rms_dbfs_ag:.1f} dBFS "
+                  f"— no auto-gain needed.", flush=True)
+    except Exception as _ag_err:
+        print(f"  [Phase 6B] Auto-gain staging skipped ({_ag_err})", flush=True)
+
     # ── Mix + Master (initial pass) ───────────────────────────────────────────
     mix = _iterative_mix(inst, vox, style, sidechain_depth, bpm_a)
     mix = _check(mix, "post-mix")
@@ -7164,7 +7204,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
     # Score the mix. If it fails, the AI Director (Claude API) reads all 23 metrics,
     # reasons about root causes using causal knowledge of the DSP chain, and outputs
     # specific parameter adjustments. Falls back to lookup table if API unavailable.
-    # Up to 3 passes — re-runs bleed-removal + mix + master on correction iterations.
+    # Up to 8 passes (Phase 6A) — early exit at score ≥ 80 or delta < 0.5 for 2 passes.
     try:
         import os as _os
         _os.environ["LISTEN_FAST"] = "1"   # skip madmom RNN in QC loop — saves 800MB RAM + 10min/pass
@@ -7185,8 +7225,9 @@ def fuse(song_a: str, song_b: str, out_path: str,
         _best_sub_cut = _sub_cut_db
         _correction_history = []   # tracks prior attempts for director context
         _adj = {}              # corrections from previous attempt (empty on first pass)
-        _N_PASSES = 6          # was 3 — more passes = sub cuts accumulate, better convergence
-        _score_history = []    # for oscillation detection
+        _N_PASSES = 8          # Phase 6A: raised from 6→8 for better convergence
+        _score_history = []    # for oscillation detection and early exit (Phase 6A)
+        _params_history = []   # parallel param snapshots for oscillation averaging (Phase 6A)
 
         for _attempt in range(_N_PASSES):
             print(f"\n── Quality Check (attempt {_attempt + 1}/{_N_PASSES}) {'─' * 33}",
@@ -7204,6 +7245,15 @@ def fuse(song_a: str, song_b: str, out_path: str,
                 _best_sub_cut = _sub_cut_db
 
             _score_history.append(_score)
+            _params_history.append({
+                "carve_db":       style["carve_db"],
+                "vocal_level":    style["vocal_level"],
+                "presence_db":    style.get("presence_db", 2.0),
+                "air_db":         style.get("air_db", 2.5),
+                "deepfilter_wet": style.get("deepfilter_wet", 0.20),
+                "lufs_target":    _lufs_target,
+                "sub_cut_db":     _sub_cut_db,
+            })
 
             # Regression guard: if score dropped >5 pts vs best, revert ALL mutable params
             # then CONTINUE to next QC pass (skip applying new corrections this iteration
@@ -7216,23 +7266,75 @@ def fuse(song_a: str, song_b: str, out_path: str,
                 _sub_cut_db  = _best_sub_cut
                 _reverted    = True
 
+            # Phase 6A early exit: score already excellent (≥ 80)
+            if _score >= 80:
+                print(f"  Score {_score}/100 ≥ 80 — early exit (Phase 6A).", flush=True)
+                break
+
             if _passed:
                 print(f"  ✓ Mix passed QC on attempt {_attempt + 1}.", flush=True)
                 break
 
-            # Oscillation detection: if score is cycling between two values, stop
-            if _attempt >= 3 and len(_score_history) >= 4:
-                _recent = _score_history[-4:]
-                if (abs(_recent[0] - _recent[2]) < 1.0 and
-                        abs(_recent[1] - _recent[3]) < 1.0 and
-                        abs(_recent[0] - _recent[1]) > 2.0):
-                    print(f"  Oscillation detected (scores: {_recent}) — stopping corrections.", flush=True)
+            # Phase 6A early exit: score delta < 0.5 across last 2 consecutive passes
+            if _attempt >= 2:
+                _delta_2pass = abs(_score_history[-1] - _score_history[-2])
+                if _delta_2pass < 0.5:
+                    print(f"  Score delta {_delta_2pass:.2f} < 0.5 across 2 passes — "
+                          f"converged (Phase 6A early exit).", flush=True)
                     break
-            # Also stop if score hasn't improved in 3 consecutive passes
-            if _attempt >= 3 and max(_score_history[-3:]) <= _score_history[-4] + 0.5:
-                print(f"  No improvement in 3 passes (scores: {_score_history[-4:]}) — stopping.",
-                      flush=True)
-                break
+
+            # Phase 6A oscillation detection: score alternates A↔B across 3+ passes →
+            # average the oscillating param pairs and try one recovery pass.
+            if _attempt >= 2 and len(_score_history) >= 3:
+                _s = _score_history
+                _osc_detected = False
+                _osc_pa = _osc_pb = None
+                if (len(_s) >= 4 and
+                        abs(_s[-1] - _s[-3]) < 1.0 and
+                        abs(_s[-2] - _s[-4]) < 1.0 and
+                        abs(_s[-1] - _s[-2]) > 2.0):
+                    _osc_detected = True
+                    _osc_pa = _params_history[-3]
+                    _osc_pb = _params_history[-2]
+                elif (len(_s) >= 3 and
+                        abs(_s[-1] - _s[-3]) < 1.0 and
+                        abs(_s[-1] - _s[-2]) > 2.0):
+                    _osc_detected = True
+                    _osc_pa = _params_history[-3]
+                    _osc_pb = _params_history[-2]
+                if _osc_detected and _osc_pa is not None:
+                    _tail = _score_history[-4:] if len(_score_history) >= 4 else _score_history[-3:]
+                    print(f"  Oscillation detected (scores: {_tail}) — "
+                          f"averaging A/B params for one recovery pass (Phase 6A).", flush=True)
+                    for _pk in _osc_pa:
+                        if _pk in ("lufs_target", "sub_cut_db"):
+                            continue
+                        _avg_v = (_osc_pa[_pk] + _osc_pb[_pk]) / 2.0
+                        if _pk == "carve_db":
+                            style["carve_db"] = float(np.clip(_avg_v, 3.0, 14.0))
+                        elif _pk == "vocal_level":
+                            style["vocal_level"] = float(np.clip(_avg_v, 1.0, 4.0))
+                        elif _pk == "presence_db":
+                            style["presence_db"] = float(np.clip(_avg_v, 0.0, 4.0))
+                        elif _pk == "air_db":
+                            style["air_db"] = float(np.clip(_avg_v, 0.0, 5.0))
+                        elif _pk == "deepfilter_wet":
+                            style["deepfilter_wet"] = float(np.clip(_avg_v, 0.05, 0.40))
+                    _lufs_target = float(np.clip(
+                        (_osc_pa["lufs_target"] + _osc_pb["lufs_target"]) / 2.0, -16.0, -9.0))
+                    _sub_cut_db = float(np.clip(
+                        (_osc_pa["sub_cut_db"] + _osc_pb["sub_cut_db"]) / 2.0, 0.0, 3.5))
+                    print(f"  Averaged params: carve={style['carve_db']:.1f}  "
+                          f"vocal_level={style['vocal_level']:.2f}  lufs={_lufs_target:.1f}",
+                          flush=True)
+                    mix = _iterative_mix(inst_remix, vox_remix, style, sidechain_depth, bpm_a)
+                    mix = _check(mix, f"osc-avg-{_attempt+2}/mix")
+                    mix = _fade(mix, fade_s=2.0)
+                    mix = _master(mix, bpm=bpm_a, sub_cut_db=_sub_cut_db,
+                                  lufs_target=_lufs_target)
+                    mix = _check(mix, f"osc-avg-{_attempt+2}/master")
+                    sf.write(out_path, mix, SR, subtype="PCM_24")
+                    break
 
             if _attempt == _N_PASSES - 1:
                 print("  Max correction attempts reached — running grid search.", flush=True)
@@ -7283,6 +7385,7 @@ def fuse(song_a: str, song_b: str, out_path: str,
                 "air_db": style.get("air_db", 2.5),
                 "vocal_level": style["vocal_level"],
                 "lufs_target": _lufs_target,
+                "deepfilter_wet": style.get("deepfilter_wet", 0.20),  # Phase 6C
                 **_bleed_params,
             }
 
@@ -7331,6 +7434,11 @@ def fuse(song_a: str, song_b: str, out_path: str,
                 if "sub_cut_db" in _adj_raw:
                     _adj["sub_cut_db"] = float(np.clip(
                         _sub_cut_db + _adj_raw["sub_cut_db"], 0.0, 3.5))
+                if "deepfilter_wet" in _adj_raw:
+                    # Phase 6C: deepfilter_wet delta from corrections() → absolute value
+                    _adj["deepfilter_wet"] = float(np.clip(
+                        style.get("deepfilter_wet", 0.20) + _adj_raw["deepfilter_wet"],
+                        0.05, 0.40))
 
             # Apply supplemental sub_cut_db and presence_db from built-in corrections
             # (these are for params the director doesn't know about)
@@ -7340,6 +7448,10 @@ def fuse(song_a: str, song_b: str, out_path: str,
             if "presence_db" in _adj_raw and "presence_db" not in _adj:
                 _adj["presence_db"] = float(np.clip(
                     style.get("presence_db", 1.5) + _adj_raw["presence_db"], 1.5, 3.0))
+            # Phase 6C: supplement deepfilter_wet from built-in corrections when director missed it
+            if "deepfilter_wet" in _adj_raw and "deepfilter_wet" not in _adj and direct_vocal:
+                _adj["deepfilter_wet"] = float(np.clip(
+                    style.get("deepfilter_wet", 0.20) + _adj_raw["deepfilter_wet"], 0.05, 0.40))
 
             # Groove escalation: if groove score is persistently low, increase quantize
             # strength and re-produce the vocal from the pre-quantize snapshot.
@@ -7397,6 +7509,15 @@ def fuse(song_a: str, song_b: str, out_path: str,
                 _lufs_target = float(np.clip(_adj["lufs_target"], -16.0, -9.0))
             if "sub_cut_db" in _adj:
                 _sub_cut_db = float(np.clip(_adj["sub_cut_db"], 0.0, 3.5))
+            # Phase 6C: deepfilter_wet — only meaningful for direct_vocal path
+            _deepfilter_changed = False
+            if "deepfilter_wet" in _adj and direct_vocal:
+                _new_df_wet = float(np.clip(_adj["deepfilter_wet"], 0.05, 0.40))
+                if abs(_new_df_wet - style.get("deepfilter_wet", 0.20)) > 0.01:
+                    style["deepfilter_wet"] = _new_df_wet
+                    _deepfilter_changed = True
+                    print(f"  [Phase 6C] deepfilter_wet → {_new_df_wet:.2f} "
+                          f"(HNR correction via DeepFilter wet/dry)", flush=True)
 
             # Apply bleed-removal parameter adjustments
             for _bp in _bleed_params:
@@ -7407,7 +7528,36 @@ def fuse(song_a: str, song_b: str, out_path: str,
                   f"presence={style.get('presence_db',2.0):.1f}dB  "
                   f"vocal_level={style['vocal_level']:.2f}  "
                   f"lufs={_lufs_target:.1f}  "
-                  f"sub_cut={_sub_cut_db:.1f}dB", flush=True)
+                  f"sub_cut={_sub_cut_db:.1f}dB  "
+                  f"df_wet={style.get('deepfilter_wet',0.20):.2f}", flush=True)
+
+            # Phase 6C: re-run _process_vocals with new deepfilter_wet if it changed
+            if _deepfilter_changed:
+                print("  [Phase 6C] Re-running vocal processing with new deepfilter_wet…",
+                      flush=True)
+                try:
+                    _vox_reprocessed = _process_vocals(
+                        _vox_pre_process, stretch_vocal, n_semi, vox_params, style,
+                        target_root=key_a_root, target_mode=key_a_mode, bpm=bpm_a)
+                    # Re-apply groove quantize at current strength
+                    _vox_reprocessed_gq = _groove_quantize(
+                        _vox_reprocessed, _to_mono(inst_remix), bpm_a,
+                        strength=_groove_strength)
+                    _vox_rpgq = _produce_vocal_for_beat(
+                        _vox_reprocessed_gq, fp, bpm_a, ir_estimated=_room_ir)
+                    _vox_rpgq = _check(_vox_rpgq, f"df-reprocess-{_attempt+2}")
+                    _n_inst_r2 = inst_remix.shape[0]
+                    if _vox_rpgq.shape[0] < _n_inst_r2:
+                        _vox_rpgq = np.pad(_vox_rpgq,
+                                           ((0, _n_inst_r2 - _vox_rpgq.shape[0]), (0, 0)),
+                                           mode='constant').astype(np.float32)
+                    elif _vox_rpgq.shape[0] > _n_inst_r2:
+                        _vox_rpgq = _vox_rpgq[:_n_inst_r2]
+                    vox_remix = _vox_rpgq
+                    print("  [Phase 6C] Vocal reprocessing done.", flush=True)
+                except Exception as _dfe:
+                    print(f"  [Phase 6C] Vocal reprocessing failed ({_dfe}) — "
+                          f"using cached vox_remix.", flush=True)
 
             # If bleed params changed, re-run bleed removal on the original stems
             _vox_for_remix = vox_remix

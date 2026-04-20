@@ -47,6 +47,9 @@ PARAM_BOUNDS = {
     "drum_weight_hh":        (1.0,    5.0),
     "hihat_alpha":           (0.50,   0.95),
     "noisereduce_strength":  (0.05,   0.50),
+    # Phase 6C: DeepFilter wet/dry — corrects vocal_hnr_db failures.
+    # Sweet spot 0.20; above 0.40 causes harmonic smearing.
+    "deepfilter_wet":        (0.05,   0.40),
 }
 
 # ── System prompt ──────────────────────────────────────────────────────────────
@@ -84,6 +87,11 @@ parameter adjustments to make the mix sound more professional.
    - Parallel tape saturation (20% wet tanh)
    - Presence peak (presence_db dB @ 3kHz) + air shelf (air_db @ 10kHz)
    - Short reverb (5-8% wet, HPF'd return)
+6b. DEEPFILTER WET/DRY (deepfilter_wet, only active for direct_vocal=True):
+   - Controls the DeepFilterNet wet/dry blend applied to direct vocal recordings
+   - deepfilter_wet=0.20 is the sweet spot; higher → more noise removed but harmonics smear
+   - Range: 0.05–0.40. Above 0.40 causes audible harmonic smearing (HNR degrades)
+   - Use ONLY for vocal_hnr_db failures (noisy/breathy direct vocal); has no effect on commercial stems
 7. MIXING (_iterative_mix, 2 iterations):
    - Energy match: vocal vs inst mid-RMS → target 45-70% presence
    - vocal_level: level multiplier (1.0-4.0), sets how loud vocal sits in mix
@@ -149,6 +157,16 @@ BEAT_SYNC_SCORE too low (< 0.35):
   → raise vocal_level (if vocal is too quiet, its onsets don't show in the cross-correlation)
   → this is mostly an alignment issue not fixable via EQ/level
 
+VOCAL_HNR_DB too low (< 7.0):
+  High noise floor in the vocal stem — harmonic-to-noise ratio below acceptable threshold.
+  Phase 6C fix: carve_db and vocal_level do NOT fix HNR — carve only affects the beat,
+  and raising vocal_level raises noise alongside the signal (SNR unchanged).
+  The ONLY correct fix is deepfilter_wet (only active for direct_vocal=True recordings):
+  → raise deepfilter_wet by 0.05 (e.g., 0.20 → 0.25 → 0.30)
+  → cap at 0.40 — above 0.40 causes harmonic smearing which makes HNR worse
+  → sweet spot is 0.20; use only up to 0.35 unless HNR is severely low
+  NEVER adjust carve_db or vocal_level to fix vocal_hnr_db.
+
 ═══ KEY RULES ═══
 1. Output ABSOLUTE parameter values, not deltas. The loop applies your values directly.
 2. Only output parameters that need changing. Don't touch working parameters.
@@ -173,7 +191,7 @@ ISSUES DETECTED (severity / metric / value / target range / description):
 CORRECTION HISTORY (this fuse session):
 {history_block}
 
-Attempt {attempt_num} of 3. Score must reach 82/100 to pass.
+Attempt {attempt_num} of 8. Score must reach 82/100 to pass (early exit at ≥ 80).
 
 Diagnose the root cause(s) of the failing metrics and output parameter adjustments.
 Respond ONLY with a JSON object in this exact format:
@@ -466,6 +484,7 @@ def _causal_corrections(metrics: dict, issues: list, current_params: dict,
     clarity = m.get("vocal_clarity_index", 5.0)
     lra    = m.get("lra_lu", 8.0)
     lufs   = m.get("lufs_integrated", -12.0)
+    hnr    = m.get("vocal_hnr_db", 15.0)
 
     # ── Vocal bleed too high ────────────────────────────────────────────────
     if "vocal_bleed_score" in issue_keys:
@@ -494,6 +513,14 @@ def _causal_corrections(metrics: dict, issues: list, current_params: dict,
     if "vocal_modulation_index" in issue_keys and modul > 0.65:
         _set("wiener_mask_floor",  min(0.15, p.get("wiener_mask_floor", 0.08) + 0.03))
         _set("noisereduce_strength", max(0.05, p.get("noisereduce_strength", 0.15) - 0.05))
+
+    # ── Vocal HNR too low (noisy/breathy direct vocal) ────────────────────────
+    # Phase 6C: only deepfilter_wet fixes HNR — carve_db and vocal_level do NOT.
+    # carve_db only affects the beat spectrum; vocal_level raises noise alongside signal.
+    # deepfilter_wet increases the DeepFilterNet wet blend, suppressing the noise floor.
+    # Cap at 0.40 — above that, harmonic smearing reduces HNR further (counterproductive).
+    if "vocal_hnr_db" in issue_keys and hnr < 7.0:
+        _set("deepfilter_wet", min(0.40, p.get("deepfilter_wet", 0.20) + 0.05))
 
     # ── Vocal clarity too low (bass masking voice) ──────────────────────────
     if "vocal_clarity_index" in issue_keys and clarity < -5.0:

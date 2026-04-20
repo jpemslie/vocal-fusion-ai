@@ -421,9 +421,11 @@ CORRECTIONS = {
     "dynamic_complexity_db": ("lufs_delta",         0.0, -1.5),
     "lra_lu":                ("lufs_delta",        +0.5, -0.5),  # over-compressed → back off limiting
     "plr_db":                ("lufs_delta",        +1.0, -1.0),
-    # vocal_hnr_db too low: louder vocal improves perceived SNR (vocal over noise floor).
-    # Previously mapped to carve_db -0.5, which was wrong (less carve = more beat bleed).
-    "vocal_hnr_db":          ("vocal_level",       +0.10, 0.0),
+    # vocal_hnr_db too low: increase deepfilter_wet to suppress noise floor and improve HNR.
+    # Phase 6C fix — carve_db and vocal_level do not affect harmonic-to-noise ratio in the
+    # vocal stem; DeepFilter wet/dry is the correct lever (+0.05 per pass, capped at 0.40
+    # by the loop; sweet spot is 0.20 — above 0.40 causes harmonic smearing).
+    "vocal_hnr_db":          ("deepfilter_wet",    +0.05, 0.0),
     # Sub-bass ratio too high → targeted sub shelf cut below 80 Hz in mastering
     # (lufs_delta doesn't help here — reducing master volume keeps the ratio the same)
     "ratio_sub_to_mid":      ("sub_cut_db",         0.0, +2.0),
